@@ -1,5 +1,7 @@
-# netline itself comes from source, see install.sh. It covers the panel, launcher,
-# Wi-Fi, Bluetooth, wallpaper, power menu and calendar, so no rofi, swaybg or nmcli.
+# netline itself comes from source, see install.sh. It covers the panel, launcher, sound,
+# brightness, battery, Wi-Fi, Bluetooth, wallpaper, power menu and calendar, so no rofi,
+# swaybg or nmcli. brightnessctl is here for its udev rule: the video group may write the
+# backlight directly, and zctl does that without any helper.
 mangowc
 foot
 swaylock

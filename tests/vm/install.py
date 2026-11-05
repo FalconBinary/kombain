@@ -436,6 +436,8 @@ class Run:
 
     def check_mango(self):
         """mango on a real DRM device (virtio-gpu with software rendering) through the guide's own login."""
+        # a sound card for the session's PipeWire to find: the kernel's own test module
+        print(self.out("modprobe snd_dummy 2>&1; ls /proc/asound; true"), flush=True)
         self.sh(
             "cp -R /etc/sv/agetty-tty1 /etc/sv/agetty-autologin-dev-tty1; rm -f /etc/sv/agetty-autologin-dev-tty1/supervise; "
             "echo 'GETTY_ARGS=\"--autologin dev --noclear\"' >> /etc/sv/agetty-autologin-dev-tty1/conf; "
@@ -445,7 +447,13 @@ class Run:
         print(procs, flush=True)
         self.expect("mango: starts from the login on tty1", "mango" in procs, procs)
         self.expect("netline: running under mango", "netline" in procs, procs)
-        self.screenshot("mango-desktop")
+        hidden = self.screenshot("mango-desktop")
+        # the panel's body, clear of its items
+        body = lambda rows: [row[300 * 3:450 * 3] for row in rows[8:38]]
+        self.monitor_cmd("mouse_move 0 -3000")
+        time.sleep(2)
+        shown = self.screenshot("mango-panel")
+        self.expect("netline: hidden, it slides out at the screen edge", body(hidden) != body(shown))
         self.monitor_cmd("sendkey alt-ret")
         time.sleep(5)
         terms = self.out("ps -eo user,comm | grep -E 'foot|fdash' | sort -u")
@@ -461,7 +469,40 @@ class Run:
         tag4 = self.screenshot("mango-tag4")
         strip = lambda rows: [row[40 * 3:210 * 3] for row in rows[12:34]]
         self.expect("netline: follows the tag mango switched to", strip(tag3) != strip(tag4))
+        self.check_panel_modules(body, tag4)
         self.sh("rm -f /etc/runit/runsvdir/default/agetty-autologin-dev-tty1; ln -s /etc/sv/agetty-tty1 /etc/runit/runsvdir/default/")
+
+    def zctl(self, *words):
+        return self.out("su - dev -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) zctl " + " ".join(words) + "' 2>&1; true")
+
+    def check_panel_modules(self, body, hidden_from):
+        items = lambda rows: [row[800 * 3:1270 * 3] for row in rows[8:38]]
+        status = self.zctl("status")
+        print(status, flush=True)
+        self.expect("zctl: finds the sound server mango started", "sound " in status, status)
+
+        before = self.screenshot("mango-modules")
+        self.zctl("vol", "30")
+        time.sleep(0.5)
+        volume = self.out("su - dev -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) wpctl get-volume @DEFAULT_AUDIO_SINK@' 2>&1; true")
+        self.expect("zctl: sets the volume in PipeWire", "0.30" in volume, volume)
+        self.zctl("mute")
+        time.sleep(1)
+        muted = self.screenshot("mango-muted")
+        self.expect("netline: shows mute from the server's event", items(before) != items(muted))
+        self.zctl("mute")
+        time.sleep(1)
+
+        self.monitor_cmd("mouse_move 0 400")
+        time.sleep(2.5)
+        gone = self.screenshot("mango-panel-gone")
+        self.expect("netline: goes back when the pointer leaves", body(gone) != body(hidden_from))
+        self.zctl("vol", "45")
+        time.sleep(0.6)
+        peek = self.screenshot("mango-level")
+        self.expect("netline: comes out for a volume change", body(peek) != body(gone))
+        time.sleep(2.5)
+        self.expect("netline: and goes back", body(self.screenshot("mango-after-peek")) == body(gone))
 
     def check_gaming(self):
         self.sh("sed -i 's/^timeout: 3/timeout: 3\\ndefault_entry: 2/' /boot/limine.conf; grep -n default_entry /boot/limine.conf")

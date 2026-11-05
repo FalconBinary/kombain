@@ -20,7 +20,7 @@ mango, dependencies included, from the Void x86_64 index in November 2026.
 | Interactive shell | [fdash](fdash/) | 0.3 MiB | fish (19.3 MiB) |
 | Prompt, history | built into fdash | 0 | starship (12 MiB), atuin (28 MiB) |
 | Compositor | mangowc | 53.5 MiB, libraries included | |
-| Panel, launcher, Wi-Fi, Bluetooth, wallpaper, power, calendar | [netline](https://github.com/FalconBinary/netline) | 1.3 MiB | waybar, rofi, swaybg, nmcli |
+| Panel, launcher, sound, brightness, battery, Wi-Fi, Bluetooth, wallpaper, power, calendar | [netline](https://github.com/FalconBinary/netline) | 1.7 MiB | waybar, rofi, swaybg, nmcli, pavucontrol |
 | Terminal | foot, as a server | 1 MiB | alacritty (8.6 MiB), kitty (80.5 MiB) |
 | Screen lock | swaylock | 0.1 MiB | |
 | Firewall | nftables, loaded before the network | 25.4 MiB | |
@@ -90,7 +90,8 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
   from the Void ISO, then boots the result through Limine and checks both modes:
   LUKS prompts, the Dev volume locked in Gaming, lockdown, firewall, every sysctl and
   service. It then runs `install.sh` there and starts mango from tty1 with netline
-  and foot running fdash, and checks that netline follows mango's tags.
+  and foot running fdash, and checks that the panel slides out at the screen edge, follows
+  mango's tags and shows the state of the session's PipeWire.
 
 The VM differs from the guide in a few places: `sfdisk` instead of `cfdisk`, a serial
 console, wired network instead of iwd, and mango rendering in software on virtio-gpu.
@@ -102,6 +103,8 @@ Not checked yet:
 - **gamescope and Steam.** The VM has no Vulkan device, so gamescope stops at startup.
   Only that failure is tested: the session reports it and waits instead of restarting.
 - **Wi-Fi through iwd.**
+- **A real battery and backlight.** The VM has neither; netline's own tests use fake ones
+  in /sys, so real hardware, and elogind's path for the brightness, have not run.
 - **Secure Boot**, step 12 of the guide.
 - **zcool on real sensors and fans.** Real drivers and chips differ from the model,
   so start with `--dry-run`. Undervolting has not run on any CPU.
