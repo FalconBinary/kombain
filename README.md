@@ -144,9 +144,19 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
   and foot running fdash, and checks that the panel slides out at the screen edge, follows
   mango's tags, shows the state of the session's PipeWire and a battery from the kernel's test module, and that
   sound still runs in real time.
+- Wi-Fi: a WPA2 access point on the kernel's radio simulator, in a network namespace of its own.
+  iwd joins it with the guide's `iwctl` commands, and after `setup.sh` on its own from the network
+  saved during the install; it gets an address, and netline's icon changes. Void's kernel is built
+  without the simulator, so the test builds it from the kernel's source for the running version and
+  boots Dev once without lockdown, which refuses unsigned modules; then it puts everything back and
+  checks that the disk is the same size as before.
+- Secure Boot: step 12 as written, in OVMF firmware that starts in Setup Mode. After the reboot
+  Secure Boot is on and the kernel reports it, Dev still asks for both passphrases, a copy of Limine
+  without the signature, which booted before step 12, is refused, and a kernel changed by one byte
+  stops at Limine's hash check.
 
 The VM differs from the guide in a few places: `sfdisk` instead of `cfdisk`, a serial
-console, wired network instead of iwd, and mango rendering in software on virtio-gpu.
+console, a wired network for the install, a simulated radio, and mango rendering in software on virtio-gpu.
 
 Not checked yet:
 
@@ -154,10 +164,11 @@ Not checked yet:
 - **mango on a real GPU.**
 - **gamescope and Steam.** The VM has no Vulkan device, so gamescope stops at startup.
   Only that failure is tested: the session reports it and waits instead of restarting.
-- **Wi-Fi through iwd.**
+- **A real Wi-Fi chip**, with its driver and firmware.
 - **A real battery and backlight.** The VM has the kernel's test battery and no backlight; netline's own tests
   use a fake one in /sys, so real hardware, and elogind's path for the brightness, have not run.
-- **Secure Boot**, step 12 of the guide.
+- **Secure Boot on real firmware.** Option ROMs, the BIOS password and vendor menus differ from
+  OVMF's.
 - **Power saving on real devices.** A device that misbehaves when asleep shows up only on real hardware. To
   turn it off: `rm /etc/runit/core-services/91-power-save.sh`.
 - **zcool on real sensors and fans.** Real drivers and chips differ from the model,
