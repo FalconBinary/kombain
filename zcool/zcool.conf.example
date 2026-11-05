@@ -1,0 +1,16 @@
+# /etc/zcool.conf. Run `zcool list` to see the chips on this machine and their defaults.
+# Lines left out use the default, which stays well below each chip's critical point.
+
+# The most each chip may reach, in degrees C. A value above its safe range is lowered.
+# cpu0.max = 85
+# gpu0.max = 80
+# nvme0.max = 65
+
+# Fans zcool must never touch. It already never goes below the speed the firmware
+# had set, so this is for fans you simply want left alone.
+# fan.exclude = nct6798/pwm3
+
+# Undervolting, Intel only, and only with kernel lockdown off: read the README first.
+# In the BIOS is the better place for it, on Intel and on AMD.
+# undervolt.core = -50
+# undervolt.cache = -50

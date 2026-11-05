@@ -1,0 +1,5 @@
+# Starts the session on the first console. Every shell reads this at login.
+export EDITOR=nvi
+if [ "$(tty)" = /dev/tty1 ]; then
+	exec dbus-run-session mango
+fi

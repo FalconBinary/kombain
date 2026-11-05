@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs after any exit, also kill -9 or the OOM killer: fans and power limits go back.
+/usr/local/bin/zcool restore
+sleep 2

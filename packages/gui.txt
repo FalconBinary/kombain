@@ -1,0 +1,17 @@
+# netline itself comes from source, see install.sh. It covers the panel, launcher,
+# Wi-Fi, Bluetooth, wallpaper, power menu and calendar, so no rofi, swaybg or nmcli.
+mangowc
+foot
+swaylock
+dejavu-fonts-ttf
+mesa-dri
+xorg-server-xwayland
+wl-clipboard
+grim
+slurp
+brightnessctl
+dbus
+elogind
+polkit
+pipewire
+wireplumber

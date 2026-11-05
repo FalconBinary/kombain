@@ -1,0 +1,4 @@
+# Heavier, and only worth it when you use them: --extras
+neovim
+ccache
+mold

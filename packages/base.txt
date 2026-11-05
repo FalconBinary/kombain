@@ -1,0 +1,17 @@
+# Build fdash, plus the command line every other layer builds on.
+# Sizes are what a package adds on top of base-system with mangowc, from the Void index.
+nftables
+tar
+util-linux
+gcc
+make
+curl
+xz
+git
+ripgrep
+fd
+fzf
+jq
+tmux
+htop
+nnn
