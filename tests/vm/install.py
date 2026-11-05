@@ -1009,8 +1009,11 @@ class Run:
         """Step 12 of the guide, in a firmware that enforces Secure Boot once it has keys, then two ways
         an attacker with the disk would try: a bootloader of their own, and a changed kernel."""
         self.boot_disk()
+        # a person does step 12 from Dev: the Gaming default from check_gaming goes
+        self.sh("sed -i '/^default_entry:/d' /boot/limine.conf")
         # the control: before step 12 this unsigned copy boots, so the entry itself is fine
         self.expect("Secure Boot off: an unsigned bootloader still boots (the entry works)", self.try_unsigned_loader())
+        self.expect("Secure Boot: Dev has a network for step 12", self.wait_network())
         status = self.out("sbctl status 2>&1; true")
         print(status, flush=True)
         lines = block("doas xbps-install -Sy sbctl").splitlines()
