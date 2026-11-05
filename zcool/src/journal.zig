@@ -27,6 +27,12 @@ pub fn remember(path: [:0]const u8) bool {
     return rememberValue(path, value);
 }
 
+/// Remembers a value already read, so the journal holds exactly what the caller saw.
+pub fn rememberInt(path: [:0]const u8, value: i64) bool {
+    var value_buf: [24]u8 = undefined;
+    return rememberValue(path, std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch return false);
+}
+
 pub fn rememberValue(path: [:0]const u8, value: []const u8) bool {
     var line_buf: [400]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{s}\t{s}\n", .{ path, value }) catch return false;

@@ -104,7 +104,7 @@ python3 tests/sim.py zig-out/bin/zcool        # the real binary against a fake /
 ```
 
 The simulator covers overload, sudden load, recovery, crashes, `kill -9`, dead and
-bogus sensors, stalled and excluded fans, power limits that are refused or ignored, a
+bogus sensors, stalled and excluded fans, a fan that misses a read, power limits that are refused or ignored, a
 sleeping GPU, and a config with mistakes. It proves the logic. It proves nothing
 about any real driver, and a real chip's numbers will differ.
 

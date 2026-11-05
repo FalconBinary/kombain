@@ -78,6 +78,7 @@ class Machine:
         self.energy = 0.0
         self.freq, self.cores = freq, cores
         self.proc = None
+        self.seen = {}
         self.log = os.path.join(self.root, "log")
         r = self.root
         self.cpu_dir = f"{r}/sys/class/hwmon/hwmon0"
@@ -140,6 +141,20 @@ class Machine:
         os.pwrite(fd, f"{int(value):>18}\n".encode(), 0)
         os.close(fd)
 
+    def _write_duty(self, path, value):
+        # one write over the old value, as sysfs: put() truncates first, and zcool could read that empty file
+        fd = os.open(path, os.O_WRONLY)
+        os.pwrite(fd, f"{int(value):>8}\n".encode(), 0)
+        os.close(fd)
+
+    def read(self, path):
+        """Reads a file zcool may be writing as sysfs shows it: the old value or the new, never the
+        empty file between its truncate and write. Only while zcool runs: after that an empty file is a fault."""
+        value = get(path)
+        if value:
+            self.seen[path] = value
+        return self.seen.get(path, value)
+
     def publish(self):
         if self.cpu:
             self._write_temp(f"{self.cpu_dir}/temp1_input", self.cpu.temp)
@@ -151,14 +166,14 @@ class Machine:
         pwm, enable = f"{directory}/pwm{index}", f"{directory}/pwm{index}_enable"
         if not os.path.exists(pwm):
             return 0
-        if get(enable) != "1":
+        if self.read(enable) != "1":
             # firmware's own curve, deliberately lazy
             temp = self.gpu.temp if directory == self.gpu_dir and self.gpu else (self.cpu.temp if self.cpu else 40)
             duty = min(255, max(curve_base, curve_base + (temp - 50) * 1.5))
-            put(pwm, int(duty))
+            self._write_duty(pwm, duty)
             return duty
         try:
-            return int(get(pwm))
+            return int(self.read(pwm))
         except ValueError:
             return 0
 
@@ -174,17 +189,17 @@ class Machine:
                 speed = 1.0
                 if self.rapl and self.rapl_enforced:
                     try:
-                        cap = int(get(self.rapl_path)) / 1e6
+                        cap = int(self.read(self.rapl_path)) / 1e6
                     except ValueError:
                         pass
                 if self.freq:
                     try:
-                        speed = min(int(get(f"{self.root}/sys/devices/system/cpu/cpufreq/policy{i}/scaling_max_freq")) for i in range(self.cores)) / 5000000
+                        speed = min(int(self.read(f"{self.root}/sys/devices/system/cpu/cpufreq/policy{i}/scaling_max_freq")) for i in range(self.cores)) / 5000000
                     except ValueError:
                         pass
                 duty = self.duty(self.board_dir, 1, 70) if self.cpu_fan else 0
-                if self.pump and get(f"{self.board_dir}/pwm2_enable") != "1":
-                    put(f"{self.board_dir}/pwm2", 200)
+                if self.pump and self.read(f"{self.board_dir}/pwm2_enable") != "1":
+                    self._write_duty(f"{self.board_dir}/pwm2", 200)
                 self.cpu.step(dt, cap, speed, duty, limit_cpu)
                 if self.rapl:
                     self.energy += self.cpu.power * dt * 1e6
@@ -192,7 +207,7 @@ class Machine:
             if self.gpu:
                 cap = 1e9
                 try:
-                    cap = int(get(f"{self.gpu_dir}/power1_cap")) / 1e6
+                    cap = int(self.read(f"{self.gpu_dir}/power1_cap")) / 1e6
                 except ValueError:
                     pass
                 self.gpu.step(dt, cap, 1.0, self.duty(self.gpu_dir, 1, 80), limit_gpu)
@@ -254,12 +269,35 @@ def strong_cooling_never_slows_down(r):
     m.start()
     m.advance(35, limit_cpu=85)
     r.check(m.cpu.peak <= 85.5, f"peak {m.cpu.peak:.1f}")
-    r.check(get(m.rapl_path) == "300000000", f"power limit touched: {get(m.rapl_path)}")
+    r.check(m.read(m.rapl_path) == "300000000", f"power limit touched: {m.read(m.rapl_path)}")
     r.check(m.cpu.perf > 0.995, f"perf {m.cpu.perf:.3f}")
-    r.check(get(f"{m.board_dir}/pwm1_enable") == "1", "fan should be managed")
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "1", "fan should be managed")
     r.check("trimming power" not in m.text(), "should not have throttled")
     r.note(f"peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
     m.stop()
+    m.close()
+
+
+@scenario
+def a_fan_that_misses_a_read_is_taken_on_the_next(r):
+    # a driver can fail a read and answer the next one: that must not cost the fan, or speed in its place
+    m = Machine(cpu=Chip(load=180, g_max=4.0, temp=80), config=CONFIG)
+    pwm = f"{m.board_dir}/pwm1"
+    os.chmod(pwm, 0o200)  # the firmware still writes it, reads fail
+    m.start()
+    deadline = time.time() + 10
+    while "did not answer" not in m.text() and time.time() < deadline:
+        m.advance(0.05, limit_cpu=85)
+    os.chmod(pwm, 0o644)
+    m.advance(10, limit_cpu=85)
+    r.check("did not answer" in m.text(), "the first read should have failed")
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "1", "fan should be managed")
+    r.check("cannot be controlled" not in m.text(), "gave the fan up")
+    r.check("trimming power" not in m.text(), "should not have throttled")
+    r.check(m.read(m.rapl_path) == "300000000", f"power limit touched: {m.read(m.rapl_path)}")
+    r.note(f"peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
+    m.stop()
+    r.check(get(f"{m.board_dir}/pwm1_enable") == "2", "fan not returned")
     m.close()
 
 
@@ -279,11 +317,11 @@ def weak_cooling_gives_up_only_what_it_must(r):
     r.check(code is None, f"daemon exited {code}")
     r.check(m.cpu.peak <= 88, f"peak {m.cpu.peak:.1f}")
     r.check(m.cpu.prochot_time == 0, "hit PROCHOT")
-    r.check(float(get(m.rapl_path)) < 300e6, "should cap power")
+    r.check(float(m.read(m.rapl_path)) < 300e6, "should cap power")
     r.check(swing < 3, f"temperature hunts by {swing:.1f} C")
     r.check(max(temps) <= 86 and min(temps) >= 80, f"settled at {min(temps):.1f}..{max(temps):.1f}, limit 85")
     r.note(f"settled within {swing:.1f} C ({min(temps):.1f}..{max(temps):.1f})")
-    r.note(f"peak {m.cpu.peak:.1f} C, settled {m.cpu.temp:.1f} C, speed {m.cpu.perf * 100:.1f}%, cap {int(get(m.rapl_path)) / 1e6:.0f} W")
+    r.note(f"peak {m.cpu.peak:.1f} C, settled {m.cpu.temp:.1f} C, speed {m.cpu.perf * 100:.1f}%, cap {int(m.read(m.rapl_path)) / 1e6:.0f} W")
     m.stop()
     r.check(get(m.rapl_path) == "300000000", "cap not restored on stop")
     m.close()
@@ -324,11 +362,11 @@ def everything_returns_when_the_load_ends(r):
     m = Machine(cpu=Chip(load=280, g_max=3.4), config=CONFIG)
     m.start()
     m.advance(25, limit_cpu=85)
-    r.check(float(get(m.rapl_path)) < 300e6, "should have capped")
+    r.check(float(m.read(m.rapl_path)) < 300e6, "should have capped")
     m.cpu.load = 10
     m.advance(40)
-    r.check(get(m.rapl_path) == "300000000", f"cap not back: {get(m.rapl_path)}")
-    r.check(get(f"{m.board_dir}/pwm1_enable") == "2", "fan not back to firmware")
+    r.check(m.read(m.rapl_path) == "300000000", f"cap not back: {m.read(m.rapl_path)}")
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "2", "fan not back to firmware")
     r.check("full power again" in m.text(), "no log line")
     m.stop()
     m.close()
@@ -352,8 +390,8 @@ def kill_nine_is_undone_by_restore(r):
     m = Machine(cpu=Chip(load=280, g_max=3.4, temp=80), config=CONFIG)
     m.start()
     m.advance(15, limit_cpu=85)
-    r.check(float(get(m.rapl_path)) < 300e6, "should have capped first")
-    r.check(get(f"{m.board_dir}/pwm1_enable") == "1", "should be manual first")
+    r.check(float(m.read(m.rapl_path)) < 300e6, "should have capped first")
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "1", "should be manual first")
     m.proc.kill()
     m.proc.wait()
     r.check(os.path.exists(f"{m.root}/run/zcool/state"), "journal must survive")
@@ -386,13 +424,13 @@ def fans_never_drop_below_firmware(r):
     m = Machine(cpu=Chip(load=200, g_max=4.0, temp=80), pump=True, config=CONFIG)
     m.start()
     lowest = 255
+    taken = False
     for _ in range(40):
         m.advance(0.5, limit_cpu=85)
-        if get(f"{m.board_dir}/pwm2_enable") == "1":
-            # a plain file here, unlike sysfs: it can be read between zcool's truncate and write
-            value = get(f"{m.board_dir}/pwm2")
-            if value:
-                lowest = min(lowest, int(value))
+        if m.read(f"{m.board_dir}/pwm2_enable") == "1":
+            taken = True
+            lowest = min(lowest, int(m.read(f"{m.board_dir}/pwm2")))
+    r.check(taken, "pump never taken over, so nothing was tested")
     r.check(lowest >= 200, f"pump went to {lowest}")
     r.note(f"pump stayed at {lowest}/255 or above")
     m.stop()
@@ -406,8 +444,8 @@ def excluded_fans_are_left_alone(r):
     m = Machine(cpu=Chip(load=280, g_max=3.4, temp=80), pump=True, config=CONFIG + "fan.exclude = nct6798/pwm2\n")
     m.start()
     m.advance(10, limit_cpu=85)
-    r.check(get(f"{m.board_dir}/pwm2_enable") == "2", "touched an excluded fan")
-    r.check(get(f"{m.board_dir}/pwm1_enable") == "1", "should manage the other one")
+    r.check(m.read(f"{m.board_dir}/pwm2_enable") == "2", "touched an excluded fan")
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "1", "should manage the other one")
     m.stop()
     m.close()
 
@@ -434,7 +472,7 @@ def bogus_sensors_do_not_spin_fans(r):
     m = Machine(cpu=Chip(load=5, temp=45), bogus_sensor=True, config=CONFIG)
     m.start()
     m.advance(6, limit_cpu=85)
-    r.check(get(f"{m.board_dir}/pwm1_enable") == "2", "a dead 127 C input took the fans")
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "2", "a dead 127 C input took the fans")
     m.stop()
     m.close()
 
@@ -458,7 +496,7 @@ def a_power_limit_with_no_effect_is_noticed(r):
     m.start()
     m.advance(35, limit_cpu=85)
     r.check("also limiting frequency" in m.text(), "should notice")
-    freq = int(get(f"{m.root}/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"))
+    freq = int(m.read(f"{m.root}/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"))
     r.check(freq < 5000000, "should limit frequency")
     r.check(m.cpu.prochot_time == 0, f"reached PROCHOT, peak {m.cpu.peak:.1f}")
     r.note(f"limit ignored by the chip: peak {m.cpu.peak:.1f} C, settled {m.cpu.temp:.1f} C, {freq / 1e6:.2f} GHz, speed {m.cpu.perf * 100:.1f}%")
@@ -475,7 +513,7 @@ def a_refused_power_limit_falls_back_at_once(r):
     m.advance(30, limit_cpu=85)
     r.check("does not stick" in m.text(), "should notice")
     r.check(m.cpu.peak <= 89, f"peak {m.cpu.peak:.1f}")
-    freq = int(get(f"{m.root}/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"))
+    freq = int(m.read(f"{m.root}/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"))
     r.check(freq < 5000000, "should limit frequency")
     m.stop()
     m.close()
@@ -487,7 +525,7 @@ def a_limit_starts_from_real_power_not_the_rating(r):
     m = Machine(cpu=Chip(load=120, g_min=1.2, g_max=1.2), cpu_fan=False, config=CONFIG)
     m.start()
     m.advance(40, limit_cpu=85)
-    cap = int(get(m.rapl_path)) / 1e6
+    cap = int(m.read(m.rapl_path)) / 1e6
     r.check(cap < 120, f"cap {cap:.0f} W should be below the real 120 W")
     r.check(m.cpu.peak <= 88.5, f"peak {m.cpu.peak:.1f}")
     r.check(m.cpu.prochot_time == 0, "hit PROCHOT")
@@ -516,11 +554,13 @@ def each_chip_has_its_own_limit(r):
     # this model heats at 10 C per second, so one look at the sensors is worth up to 5 C
     r.check(m.gpu.peak <= 80, f"gpu peak {m.gpu.peak:.1f}")
     r.check(m.gpu.prochot_time == 0, "hit PROCHOT")
-    r.check(get(m.rapl_path) == "300000000", "a hot GPU must not throttle the CPU")
-    r.check(get(f"{m.board_dir}/pwm1_enable") == "2", "a GPU with its own fan must not spin the case fan")
-    r.check(int(get(f"{m.gpu_dir}/power1_cap")) < 200000000, "should cap the GPU")
-    r.check(int(get(f"{m.gpu_dir}/power1_cap")) >= 60000000, "cap below the driver minimum")
-    r.note(f"gpu at 75: peak {m.gpu.peak:.1f} C, cap {int(get(f'{m.gpu_dir}/power1_cap')) / 1e6:.0f} W; cpu untouched")
+    # without its fan the cap alone holds the limit, lower and later: the peak check above can miss that
+    r.check(m.read(f"{m.gpu_dir}/pwm1_enable") == "1", "the GPU fan should be managed")
+    r.check(m.read(m.rapl_path) == "300000000", "a hot GPU must not throttle the CPU")
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "2", "a GPU with its own fan must not spin the case fan")
+    r.check(int(m.read(f"{m.gpu_dir}/power1_cap")) < 200000000, "should cap the GPU")
+    r.check(int(m.read(f"{m.gpu_dir}/power1_cap")) >= 60000000, "cap below the driver minimum")
+    r.note(f"gpu at 75: peak {m.gpu.peak:.1f} C, cap {int(m.read(f'{m.gpu_dir}/power1_cap')) / 1e6:.0f} W; cpu untouched")
     m.stop()
     r.check(get(f"{m.gpu_dir}/power1_cap") == "200000000", "gpu cap not restored")
     m.close()
@@ -544,12 +584,12 @@ def a_gpu_going_to_sleep_stops_counting(r):
     m = Machine(cpu=Chip(load=5, temp=45), gpu=Chip(load=300, g_max=3.5, temp=70), config="cpu0.max = 85\ngpu0.max = 75\n")
     m.start()
     m.advance(8, limit_gpu=75)
-    r.check(get(f"{m.gpu_dir}/pwm1_enable") == "1", "should be managing the GPU fan")
+    r.check(m.read(f"{m.gpu_dir}/pwm1_enable") == "1", "should be managing the GPU fan")
     # asleep the sensor is frozen at its last hot value, and must not keep the fan up
     put(f"{m.gpu_dir}/device/power/runtime_status", "suspended")
     m.gpu = None
     m.advance(28)
-    r.check(get(f"{m.gpu_dir}/pwm1_enable") == "2", "a sleeping GPU kept its fan managed")
+    r.check(m.read(f"{m.gpu_dir}/pwm1_enable") == "2", "a sleeping GPU kept its fan managed")
     m.stop()
     m.close()
 
@@ -563,7 +603,7 @@ def a_sleeping_gpu_is_not_woken(r):
     m.gpu = None
     m.start()
     m.advance(6, limit_cpu=85)
-    r.check(get(f"{m.gpu_dir}/pwm1_enable") == "2", "reacted to a chip that sleeps")
+    r.check(m.read(f"{m.gpu_dir}/pwm1_enable") == "2", "reacted to a chip that sleeps")
     r.check(m.proc.poll() is None, "should keep running")
     m.stop()
     m.close()

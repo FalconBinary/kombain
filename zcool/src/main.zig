@@ -45,6 +45,8 @@ const max_sensors = 128;
 const max_fans = 16;
 const max_policies = 256;
 const max_packages = 8;
+/// Failed takeovers before a fan is left to the firmware: about 5 s at the 250 ms tick.
+const take_tries = 20;
 
 const Kind = enum { cpu, gpu, nvme, other };
 
@@ -110,6 +112,7 @@ const Fan = struct {
     managed: bool = false,
     journaled: bool = false,
     unusable: bool = false,
+    take_failures: u8 = 0,
     orig_pwm: i64 = 0,
     orig_enable: i64 = 0,
     floor: f32 = 0,
@@ -436,6 +439,7 @@ fn discover() void {
 
 // ---------------------------------------------------------------- actuators
 
+/// Each value is read once: what the journal keeps is what `releaseFan` writes back.
 fn takeFan(fan: *Fan) bool {
     var pwm_buf: [200]u8 = undefined;
     var enable_buf: [200]u8 = undefined;
@@ -450,10 +454,10 @@ fn takeFan(fan: *Fan) bool {
     if (!fan.journaled) {
         if (fan.enable_len > 0) {
             fan.orig_enable = sys.readInt(fan.enablePath(&enable_buf)) orelse return false;
-            if (!journal.remember(fan.enablePath(&enable_buf))) return false;
+            if (!journal.rememberInt(fan.enablePath(&enable_buf), fan.orig_enable)) return false;
         }
         fan.orig_pwm = current;
-        if (!journal.remember(pwm)) return false;
+        if (!journal.rememberInt(pwm, current)) return false;
         fan.journaled = true;
     }
     if (fan.enable_len > 0 and !sys.writeInt(fan.enablePath(&enable_buf), 1)) return false;
@@ -478,10 +482,16 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
     if (!fan.managed) {
         if (demand <= 0) return;
         if (!takeFan(fan)) {
+            // a driver can fail one read and answer the next; until it is given up the fan
+            // still counts as cooling to come, so power is not taken in its place
+            fan.take_failures +|= 1;
+            if (fan.take_failures == 1) sys.printf("{s}: did not answer, trying again\n", .{fan.name()});
+            if (fan.take_failures < take_tries) return;
             fan.unusable = true;
             sys.printf("{s}: cannot be controlled, leaving it to the firmware\n", .{fan.name()});
             return;
         }
+        fan.take_failures = 0;
         fan.managed = true;
         sys.printf("{s}: taking over from {d:.0}/255\n", .{ fan.name(), fan.floor });
     }
