@@ -101,12 +101,14 @@ it also runs encryption and LVM, which plain Void here doesn't.
 
 | Idle, on the desktop with one terminal open | Before tuning | Now |
 |---|---|---|
-| Memory in use | 486 MiB | 442 MiB |
-| Sum of process memory (RSS) | 419 MiB | 282 MiB |
+| Memory in use | 486 MiB | 442-453 MiB |
+| Sum of process memory (RSS) | 419 MiB | 282-283 MiB |
 | Processes | 63 | 48 |
-| Context switches per second | 56 | 10 |
-| Interrupts per second | 104 | 25 |
+| Context switches per second | 49-56 | 10-41 |
+| Interrupts per second | 89-104 | 25-49 |
 | Files on `/` | 3400 MiB | 2131 MiB |
+
+The ranges are from separate runs. Wakeups differ a lot from run to run, so only the direction is firm.
 
 Most of the desktop's memory is mango rendering in software in this VM (154 MiB): on a real GPU it will
 differ. Real hardware, power draw and frame rates in games have not been measured.
