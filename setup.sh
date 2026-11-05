@@ -640,7 +640,7 @@ prepare_steps() {
 	s_boot=$(block 'xbps-reconfigure -fa')
 	s_verify=$(step_verify)
 	s_desktop=$(step_desktop)
-	s_clean=$(block 'doas xbps-remove -Oy')
+	s_clean=$(block 'doas sh -c')
 	s_clean=${s_clean#doas }
 }
 

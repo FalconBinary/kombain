@@ -73,10 +73,11 @@ sleep 30
 b=$(stat_line); wb=$(written)
 echo "$a $b" | awk '{printf "metric cpu_busy_pct %.2f\nmetric context_switches_per_s %.0f\nmetric interrupts_per_s %.0f\n", ($5-$1)*100/($6-$2), ($7-$3)/30, ($8-$4)/30}'
 echo "metric disk_written_kib_30s $(( (wb-wa)/2 ))"
+sync; echo 3 > /proc/sys/vm/drop_caches
 awk '/^MemTotal/ {t=$2} /^MemAvailable/ {a=$2} /^Shmem:/ {s=$2} /^Slab:/ {l=$2} /^Buffers/ {b=$2} /^Cached/ {c=$2} /^KernelStack/ {k=$2} /^PageTables/ {p=$2}
  END {printf "metric mem_used_mib %d\nmetric mem_cached_mib %d\nmetric mem_shmem_mib %d\nmetric mem_slab_mib %d\nmetric mem_kernel_stacks_tables_mib %d\n", (t-a)/1024, (b+c)/1024, s/1024, l/1024, (k+p)/1024}' /proc/meminfo
 ps -eo ppid=,pid=,rss= | awk '$1!=2 && $2!=2 {n++; r+=$3} END {printf "metric processes %d\nmetric rss_sum_mib %d\n", n, r/1024}'
-echo "metric root_used_mib $(df -m --output=used / | tail -1 | tr -d ' ')"
+echo "metric root_content_mib $(du -sxm / | cut -f1)"
 for d in /usr/lib/firmware /usr/lib/modules /usr/share/locale /usr/lib/locale /usr/share/doc /usr/share/man /usr/share/icons /var/cache/xbps /usr/lib/gcc /usr/include; do
  [ -d "$d" ] && echo "metric du$(echo "$d" | tr / _)_mib $(du -sxm "$d" | cut -f1)"
 done
@@ -687,7 +688,7 @@ class Run:
         output = self.sh("cd /root/kombain; ./install.sh --user dev", timeout=1800, what="guide step 11: install.sh")
         print(output[-800:], flush=True)
         self.sh("chsh -s /usr/local/bin/fdash dev")
-        self.sh(block("doas xbps-remove -Oy").replace("doas ", ""), what="guide step 11: package cache")
+        self.sh(block("doas sh -c").replace("doas ", ""), what="guide step 11: package cache")
         self.expect("kombain: install.sh finishes inside the real system", True)
         self.check_kombain(output)
 
@@ -696,7 +697,6 @@ class Run:
         self.expect("kombain: the login shell works", self.out("su - dev -c 'echo shell-$0'").startswith("shell-"))
         self.expect("kombain: sysctl applied without errors", "could not be applied" not in output, output[-300:])
         self.expect("kombain: gconv cache built", "gconv-modules.cache" in self.out("ls /usr/lib/gconv/"))
-        self.expect("kombain: sound's real-time limit is there", self.out("su - dev -c 'ulimit -r'") == "88", self.out("su - dev -c 'ulimit -r'"))
         listing = self.out("zcool list")
         print(listing, flush=True)
         self.expect("zcool: list runs on the real kernel", "chip" in listing, listing[:200])

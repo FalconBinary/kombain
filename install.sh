@@ -127,6 +127,7 @@ if [ "$gui" -eq 1 ]; then
 	ln -sfn /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/
 	ln -sfn /usr/share/examples/pipewire/20-pipewire-pulse.conf /etc/pipewire/pipewire.conf.d/
 	mkdir -p /etc/wireplumber/wireplumber.conf.d /etc/security/limits.d
+	[ -e /etc/pipewire/pipewire.conf.d/10-kombain.conf ] || install -m 644 "$here/config/pipewire.conf" /etc/pipewire/pipewire.conf.d/10-kombain.conf
 	[ -e /etc/wireplumber/wireplumber.conf.d/10-kombain.conf ] || install -m 644 "$here/config/wireplumber.conf" /etc/wireplumber/wireplumber.conf.d/10-kombain.conf
 	[ -e /etc/security/limits.d/90-audio.conf ] || install -m 644 "$here/config/audio-limits.conf" /etc/security/limits.d/90-audio.conf
 fi

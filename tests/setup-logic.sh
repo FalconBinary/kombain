@@ -115,7 +115,7 @@ guide=$repo/docs/void-install-guide.md
 for start in 'DISK=/dev/nvme0n1|cfdisk' 'REPO=https://' 'DISK=/dev/nvme0n1|echo voidbox' 'xbps-install -y intel-ucode' \
 	'xbps-install -y mesa-dri' 'cat > /etc/fstab' 'mkdir -p /etc/dracut.conf.d' 'mkdir -p /etc/kernel.d/post-install' \
 	'mkdir -p /etc/iwd' 'IF=enp3s0' 'mkdir -p /etc/sysctl.d' 'cat > /etc/nftables.conf' 'mkdir -p /etc/sv/game-tune' \
-	'useradd -m -G wheel' 'xbps-reconfigure -fa' 'cat > /etc/modprobe.d/kombain.conf' 'doas xbps-remove -Oy'; do
+	'useradd -m -G wheel' 'xbps-reconfigure -fa' 'cat > /etc/modprobe.d/kombain.conf' 'doas sh -c'; do
 	first=${start%%|*}
 	second=
 	case $start in *'|'*) second=${start#*|} ;; esac
@@ -226,8 +226,8 @@ has "in Gaming" "ln -sfn /etc/sv/dhcpcd-eth9 /etc/runit/runsvdir/gaming/"
 hasnt "no serial login unasked" "agetty-ttyS0"
 has "the hook's partitions" 'blkid -s UUID -o value "${DISK}2"'
 has "power saving" "/etc/runit/core-services/91-power-save.sh"
-has "the package cache goes" "xbps-remove -Oy"
-hasnt "no doas in the live system's chroot" "doas xbps-remove"
+has "the package cache goes" "sh -c 'rm -f /var/cache/xbps/*'"
+hasnt "no doas in the live system's chroot" "doas sh -c"
 has "no Wi-Fi here, so no iwd" "rm -f /etc/runit/runsvdir/default/iwd"
 has "no AMD here, in the CPU or the GPU" "linux-firmware-amd"
 hasnt "an Intel CPU keeps its firmware" "linux-firmware-intel"

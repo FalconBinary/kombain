@@ -412,11 +412,20 @@ EOF
 
 mkdir -p /etc/cron.weekly
 printf '#!/bin/sh\nfstrim -a\n' > /etc/cron.weekly/fstrim
-chmod +x /etc/cron.weekly/fstrim
+# Downloaded packages are never needed again, and they add up to gigabytes
+printf '#!/bin/sh\nrm -f /var/cache/xbps/*\n' > /etc/cron.weekly/xbps-cache
+chmod +x /etc/cron.weekly/fstrim /etc/cron.weekly/xbps-cache
 
 mkdir -p /etc/pipewire/pipewire.conf.d
 ln -s /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/
 ln -s /usr/share/examples/pipewire/20-pipewire-pulse.conf /etc/pipewire/pipewire.conf.d/
+
+cat > /etc/pipewire/pipewire.conf.d/10-kombain.conf <<'EOF'
+# Its X11 bell module would connect to Xwayland, which starts only for a client and stays for it.
+context.properties = {
+    module.x11.bell = false
+}
+EOF
 
 mkdir -p /etc/wireplumber/wireplumber.conf.d
 cat > /etc/wireplumber/wireplumber.conf.d/10-kombain.conf <<'EOF'
@@ -604,10 +613,10 @@ doas ./install.sh --user dev
 doas chsh -s /usr/local/bin/fdash dev
 ```
 
-Кэш скачанных пакетов занимает больше гигабайта, и в установленной системе он не нужен:
+Кэш скачанных пакетов занимает больше гигабайта. Он не нужен, и дальше раз в неделю система очищает его сама:
 
 ```bash
-doas xbps-remove -Oy
+doas sh -c 'rm -f /var/cache/xbps/*'
 ```
 
 После выхода и нового входа на `tty1` запустится mango. Терминал открывается по `Alt+Return`, приложения по `Super+D`, Wi-Fi по `Super+W`.
