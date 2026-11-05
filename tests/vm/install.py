@@ -771,14 +771,28 @@ class Run:
         time.sleep(1)
 
         self.expect("zctl: finds the battery", "battery 50 " in status, status)
-        # a change in the kernel: through the real udevd and the panel's filter on its broadcast
+        # A change in the kernel, through the real udevd and the panel's filter on its broadcast.
+        # Only the battery's own pixels count: the level bar next to it comes and goes by itself.
+        battery = lambda rows: [row[1085 * 3:1160 * 3] for row in rows[8:38]]
+        time.sleep(2)  # the level bar from the volume change above is gone by now
+        self.sh("(timeout 20 udevadm monitor --kernel --udev --property --subsystem-match=power_supply > /tmp/udev.log 2>&1 &)")
+        time.sleep(1)
         before = self.screenshot("mango-battery-before")
         self.sh("echo 12 > /sys/module/test_power/parameters/battery_capacity")
+        changed = False
         for _ in range(5):
             after = self.screenshot("mango-battery-after")
-            if items(before) != items(after):
+            if battery(before) != battery(after):
+                changed = True
                 break
-        self.expect("netline: a real battery event reaches the icon", items(before) != items(after))
+        time.sleep(3)
+        print(self.out("cat /tmp/udev.log | grep -E '^(KERNEL|UDEV)|SUBSYSTEM|CAPACITY=' | head -20"), flush=True)
+        self.expect("netline: a real battery event reaches the icon", changed)
+        if not changed:
+            # without the event, the clock's minute tick reads the battery anyway: which one is it?
+            time.sleep(62)
+            late = self.screenshot("mango-battery-minute")
+            print(f"after a minute tick the icon changed: {battery(before) != battery(late)}", flush=True)
         self.expect("zctl: reads the new charge", "battery 12 " in self.zctl("status"), self.zctl("status"))
 
         # the menu on mango: it comes out from under the panel by cropping, and takes the keyboard
