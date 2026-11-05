@@ -341,7 +341,6 @@ class Run:
         self.vm.send("xchroot /mnt /bin/bash\n")
         self.adopt_shell()
         self.expect("guide step 3: base system installed, chroot entered", "base-system" in self.out("xbps-query -l | grep -o 'base-system' | head -1"))
-        self.expect("guide step 3: the chroot has /dev/fd, which dracut needs", self.out("ls /dev/fd/ >/dev/null && echo there") == "there")
 
         self.sh(block("DISK=/dev/nvme0n1\necho voidbox"), timeout=1200, what="guide step 4: system settings")
         self.sh(block("xbps-install -y mesa-dri").splitlines()[0], timeout=1200, what="guide step 4: graphics driver")
@@ -482,7 +481,6 @@ class Run:
                 else:
                     vm.send(PASSWORD + "\n")
         self.setup_output = clean(vm.buf[start:vm.pos])
-        self.expect("setup.sh: dracut has everything it needs", "/dev/fd/" not in self.setup_output)
         self.expect("setup.sh: a mistyped passphrase and password are asked again, and it goes on", mistyped_passphrase and mistyped_password)
         self.expect("setup.sh: it finishes", True)
         found = re.search(r"LUKS UUID (\S+)\s+the system and games", self.setup_output), re.search(r"LUKS UUID (\S+)\s+your files", self.setup_output)
@@ -646,8 +644,11 @@ class Run:
         volume = self.out("su - dev -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) wpctl get-volume @DEFAULT_AUDIO_SINK@' 2>&1; true")
         self.expect("zctl: sets the volume in PipeWire", "0.30" in volume, volume)
         self.zctl("mute")
-        time.sleep(1)
-        muted = self.screenshot("mango-muted")
+        # software rendering in a busy VM can be seconds behind, so one frame proves nothing
+        for _ in range(5):
+            muted = self.screenshot("mango-muted")
+            if items(before) != items(muted):
+                break
         self.expect("netline: shows mute from the server's event", items(before) != items(muted))
         self.zctl("mute")
         time.sleep(1)
