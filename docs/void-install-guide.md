@@ -424,11 +424,9 @@ EOF
 cat > /home/gamer/game-session <<'EOF'
 #!/bin/sh
 pipewire >/dev/null 2>&1 &
-pipewire_pid=$!
 started=$(date +%s)
 gamescope -e -f -- flatpak run com.valvesoftware.Steam -gamepadui
 status=$?
-kill "$pipewire_pid" 2>/dev/null
 # Autologin would restart a session that cannot start, forever
 if [ $(($(date +%s) - started)) -lt 30 ]; then
 	echo "The game session ended right away, exit code $status."

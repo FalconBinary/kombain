@@ -6,8 +6,8 @@ package index.
 
 ![fdash in foot under the netline panel](docs/desktop.png)
 
-*fdash in foot under netline. Captured on sway with software rendering, because
-mango needs a real DRM device; see Status below.*
+*fdash in foot under netline, captured on sway with software rendering. mango itself
+is tested in a VM, see Status below.*
 
 ## The stack
 
@@ -77,25 +77,34 @@ afterwards.
 
 ## Status
 
-Checked in Void Linux containers on arm64:
+CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
 
 - fdash: 51 tests through a real pty, also under ASan and UBSan, with scripts
   compared against unmodified dash of the same version.
 - `install.sh`: from a clean image, twice.
-- `mango -p` accepts the config.
-- Firewall: `tests/firewall.sh` sends real traffic between network namespaces, on
-  the Colima kernel (6.8), including a broken config and a missing one.
+- Firewall: `tests/firewall.sh` sends real traffic between network namespaces,
+  including a broken config and a missing one.
 - gconv cache: `tests/gconv-cache.sh`, including a stale and a damaged cache.
-- zcool: unit tests and a thermal simulator, `zcool/tests/sim.py`. It has not touched real hardware.
-- netline and fdash together on a wlroots compositor (sway), as in the screenshot.
+- zcool: unit tests and a thermal simulator, `zcool/tests/sim.py`.
+- The guide itself: `tests/vm/install.py` types its commands into a UEFI VM booted
+  from the Void ISO, then boots the result through Limine and checks both modes:
+  LUKS prompts, the Dev volume locked in Gaming, lockdown, firewall, every sysctl and
+  service. It then runs `install.sh` there and starts mango from tty1 with netline
+  and foot running fdash, and checks that netline follows mango's tags.
+
+The VM differs from the guide in a few places: `sfdisk` instead of `cfdisk`, a serial
+console, wired network instead of iwd, and mango rendering in software on virtio-gpu.
 
 Not checked yet:
 
-- **mango with this config on a real GPU.** It needs a DRM device, which the test VM lacks.
-- **netline's mango integration** (tags, IPC), for the same reason.
-- **fdash on x86_64.** netline cross-compiles for it, but the shell has only run on arm64.
-- **zcool on a real machine.** Real drivers, fans and chips differ from the model. Start with `--dry-run`.
-- Steam and gamescope in the gaming mode from the guide.
+- **A real machine.** Nothing has booted outside a VM or a container.
+- **mango on a real GPU.**
+- **gamescope and Steam.** The VM has no Vulkan device, so gamescope stops at startup.
+  Only that failure is tested: the session reports it and waits instead of restarting.
+- **Wi-Fi through iwd.**
+- **Secure Boot**, step 12 of the guide.
+- **zcool on real sensors and fans.** Real drivers and chips differ from the model,
+  so start with `--dry-run`. Undervolting has not run on any CPU.
 
 ## Licenses
 
