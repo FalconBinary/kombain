@@ -648,7 +648,7 @@ class Run:
         started = time.time()
         answered = None
         while True:
-            index, m = self.vm.wait([r"(?:[Ee]nter passphrase for|Password \(?)[^\n:]*:?\s*$|assphrase[^\n]*: *$", r"login: "], self.o.boot_timeout)
+            index, m = self.vm.wait([r"(?:[Ee]nter passphrase for|Password \(?)[^\n:]*: *$|assphrase[^\n]*: *$", r"login: "], self.o.boot_timeout)
             if index == 1:
                 now = time.time()
                 self.boot_times = {"boot_to_prompt_s": f"{(answered or now) - started:.1f}", "last_passphrase_to_login_s": f"{now - (answered or started):.1f}"}
@@ -656,6 +656,9 @@ class Run:
             count += 1
             prompt = m.group(0)
             word = DEV_PASSPHRASE if self.luks.get("dev", "?") in prompt or self.part(3) in prompt else ROOT_PASSPHRASE
+            # cryptsetup prints the prompt before it turns echo off and flushes the input: an answer
+            # sent at once can be shown on the console and then thrown away
+            time.sleep(1)
             self.vm.send(word + "\n")
             answered = time.time()
             print(f"answered a LUKS prompt: {prompt.strip()[:80]}", flush=True)
@@ -885,7 +888,7 @@ class Run:
         series = re.match(r"\d+\.\d+", kernel).group(0)
         source = f"https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/wireless/virtual/{{}}?h=v{kernel.split('_')[0]}"
         packages = "xbps-query -l | awk '{print $2}' | sed 's/-[^-]*$//' | sort"
-        self.sh(f"{packages} > /root/packages-before; need=; for p in gcc make libelf linux{series}-headers hostapd dnsmasq; do xbps-query $p >/dev/null || need=\"$need $p\"; done; "
+        self.sh(f"du -sxm / | cut -f1 > /root/size-before; {packages} > /root/packages-before; need=; for p in gcc make libelf linux{series}-headers hostapd dnsmasq; do xbps-query $p >/dev/null || need=\"$need $p\"; done; "
                 "[ -z \"$need\" ] || xbps-install -Sy $need >/dev/null", timeout=900, what="test only: tools for a simulated radio and an access point")
         try:
             self.sh(
@@ -912,9 +915,13 @@ class Run:
                     f"rm -f /etc/modules-load.d/test-radio.conf /etc/modprobe.d/test-radio.conf /lib/modules/{kernel}/extra/mac80211_hwsim.ko; depmod {kernel}; "
                     "rm -rf /root/hwsim; [ ! -e /root/limine.conf.saved ] || mv /root/limine.conf.saved /boot/limine.conf; "
                     f"{packages} > /root/packages-after; new=$(comm -13 /root/packages-before /root/packages-after); "
-                    "[ -z \"$new\" ] || xbps-remove -y $new >/dev/null; rm -f /root/packages-before /root/packages-after /var/cache/xbps/*",
+                    "[ -z \"$new\" ] || xbps-remove -y $new >/dev/null; rm -f /root/packages-before /root/packages-after /var/cache/xbps/*; "
+                    # Void's kernel packages keep their files on removal (preserve=yes), the headers too
+                    f"! echo \"$new\" | grep -qx 'linux{series}-headers' || rm -rf /usr/src/kernel-headers-{kernel}",
                     timeout=600, what="test only: everything put back")
                 self.desktop_login(False)
+                size = self.out("echo $(cat /root/size-before) $(du -sxm / | cut -f1); rm -f /root/size-before").split()
+                self.expect("Wi-Fi test: leaves nothing behind on the disk", len(size) == 2 and int(size[1]) - int(size[0]) <= 3, size)
                 self.expect("Wi-Fi test: lockdown is back for the next boot", "lockdown=integrity" in self.out("cat /boot/limine.conf"))
 
     def join_wifi(self):
