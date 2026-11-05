@@ -118,8 +118,11 @@ mkdir -p /mnt/var/db/xbps/keys
 cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
 XBPS_ARCH=x86_64 xbps-install -S -r /mnt -R "$REPO" base-system cryptsetup lvm2 xfsprogs zstd limine efibootmgr iwd openresolv dbus elogind polkit rtkit chrony nftables zramen snooze run-parts opendoas xtools git pipewire wireplumber flatpak gamescope void-repo-nonfree
 cp /etc/resolv.conf /mnt/etc/
+[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
 xchroot /mnt /bin/bash
 ```
+
+На live ISO нет `/dev/fd`, а без него dracut при сборке initramfs молча пропускает часть своих проверок.
 
 ## 4. Настройка системы
 
