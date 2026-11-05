@@ -444,8 +444,12 @@ class Run:
         if lines[-1] != "./setup.sh":
             raise Failed("the guide's setup.sh block changed")
         self.sh(lines[0], what="guide: tools for setup.sh")
-        # test only: a radio, so setup.sh asks for a Wi-Fi network and saves it for the installed system
-        self.live_radio = "hwsim" in self.out("modprobe mac80211_hwsim radios=1 2>&1 && echo hwsim; true")
+        # test only: a radio, so setup.sh asks for a Wi-Fi network and saves it for the installed system.
+        # virt_wifi puts a wireless device on top of the wired one, and a wireless device is all setup.sh
+        # looks for; nothing connects through it here, so the wired network goes on working.
+        radio = self.out("modprobe virt_wifi && for d in /sys/class/net/*; do [ -e $d/device ] && ip link add link ${d##*/} name wlan0 type virt_wifi && break; done; "
+                         "[ -e /sys/class/net/wlan0/wireless ] && echo radio-ready; true")
+        self.live_radio = radio.splitlines()[-1:] == ["radio-ready"]
         print(f"radio in the live system: {self.live_radio}", flush=True)
         self.sh(f"cd /root; rm -rf kombain; git clone -q {self.o.repo} kombain; cd kombain; git checkout -q {self.o.ref}; git log -1 --format=%h", what="clone kombain")
 
@@ -732,11 +736,8 @@ class Run:
         """mango on a real DRM device (virtio-gpu with software rendering) through the guide's own login."""
         # a sound card and a battery for the panel: the kernel's own test modules, so real device events
         print(self.out("modprobe snd_dummy 2>&1; modprobe test_power 2>&1; ls /proc/asound /sys/class/power_supply; true"), flush=True)
-        self.sh(
-            "cp -R /etc/sv/agetty-tty1 /etc/sv/agetty-autologin-dev-tty1; rm -f /etc/sv/agetty-autologin-dev-tty1/supervise; "
-            "echo 'GETTY_ARGS=\"--autologin dev --noclear\"' >> /etc/sv/agetty-autologin-dev-tty1/conf; "
-            "rm -f /etc/runit/runsvdir/default/agetty-tty1; ln -s /etc/sv/agetty-autologin-dev-tty1 /etc/runit/runsvdir/default/; sleep 25"
-        )
+        self.desktop_login(True)
+        time.sleep(25)
         procs = self.out("ps -eo user,comm | grep -E 'mango|netline|zbg|foot' | sort -u")
         print(procs, flush=True)
         self.expect("mango: starts from the login on tty1", "mango" in procs, procs)
@@ -764,7 +765,18 @@ class Run:
         strip = lambda rows: [row[40 * 3:210 * 3] for row in rows[12:34]]
         self.expect("netline: follows the tag mango switched to", strip(tag3) != strip(tag4))
         self.check_panel_modules(body, tag4)
-        self.sh("rm -f /etc/runit/runsvdir/default/agetty-autologin-dev-tty1; ln -s /etc/sv/agetty-tty1 /etc/runit/runsvdir/default/")
+        self.desktop_login(False)
+
+    def desktop_login(self, on):
+        """dev logged in on tty1 by itself, so mango starts the way the guide's own login starts it."""
+        if on:
+            self.sh(
+                "[ -d /etc/sv/agetty-autologin-dev-tty1 ] || { cp -R /etc/sv/agetty-tty1 /etc/sv/agetty-autologin-dev-tty1; rm -f /etc/sv/agetty-autologin-dev-tty1/supervise; "
+                "echo 'GETTY_ARGS=\"--autologin dev --noclear\"' >> /etc/sv/agetty-autologin-dev-tty1/conf; }; "
+                "rm -f /etc/runit/runsvdir/default/agetty-tty1; ln -sf /etc/sv/agetty-autologin-dev-tty1 /etc/runit/runsvdir/default/"
+            )
+        else:
+            self.sh("rm -f /etc/runit/runsvdir/default/agetty-autologin-dev-tty1; ln -sf /etc/sv/agetty-tty1 /etc/runit/runsvdir/default/")
 
     def cursor(self):
         """Where mango says the pointer is. foot runs under mango, so it has mango's address."""
@@ -859,20 +871,76 @@ class Run:
         print(threads, flush=True)
         self.expect("sound still runs in real time, without rtkit", re.search(r"^\s*(RR|FF)\s", threads, flags=re.M), threads)
         self.measure("dev-desktop")
-        self.check_wifi()
 
     def check_wifi(self):
-        """A Wi-Fi network from the kernel's radio simulator, its access point in a network namespace of its
-        own, so iwd here sees only the client side. The guide's way is iwctl; setup.sh's is the file it saved."""
-        if "hwsim" not in self.out("modprobe mac80211_hwsim radios=2 2>&1 && echo hwsim; true"):
-            self.expect("Wi-Fi: the kernel can simulate radios", False)
-            return
-        time.sleep(3)
+        """A WPA2 network from the kernel's radio simulator, its access point in a network namespace of its
+        own, so iwd here sees only the client side. The guide's way to join is iwctl; setup.sh's is the file
+        it saved.
+
+        Void builds its kernel without the simulator, so it is built here from the kernel's own source for
+        the running version: a test tool, like the access point. It is unsigned, and the guide's
+        lockdown=integrity refuses unsigned modules, so this one boot of Dev goes without lockdown. All of
+        it is put back afterwards."""
+        kernel = self.out("uname -r")
+        series = re.match(r"\d+\.\d+", kernel).group(0)
+        source = f"https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/wireless/virtual/{{}}?h=v{kernel.split('_')[0]}"
+        packages = "xbps-query -l | awk '{print $2}' | sed 's/-[^-]*$//' | sort"
+        self.sh(f"{packages} > /root/packages-before; need=; for p in gcc make libelf linux{series}-headers hostapd dnsmasq; do xbps-query $p >/dev/null || need=\"$need $p\"; done; "
+                "[ -z \"$need\" ] || xbps-install -Sy $need >/dev/null", timeout=900, what="test only: tools for a simulated radio and an access point")
+        try:
+            self.sh(
+                "mkdir -p /root/hwsim; cd /root/hwsim; "
+                + "".join(f"xbps-fetch -o {f} '{source.format(f)}' >/dev/null; " for f in ("mac80211_hwsim.c", "mac80211_hwsim.h"))
+                + "echo 'obj-m := mac80211_hwsim.o' > Kbuild; "
+                f"make -s -C /lib/modules/{kernel}/build M=/root/hwsim modules 2>&1 | tail -5; "
+                f"install -D -m 644 mac80211_hwsim.ko /lib/modules/{kernel}/extra/mac80211_hwsim.ko; depmod {kernel}; "
+                "echo mac80211_hwsim > /etc/modules-load.d/test-radio.conf; echo 'options mac80211_hwsim radios=2' > /etc/modprobe.d/test-radio.conf; "
+                "cp /boot/limine.conf /root/limine.conf.saved; sed -i 's/ lockdown=integrity//' /boot/limine.conf",
+                timeout=900, what="test only: the radio simulator, built from the kernel's source")
+            self.desktop_login(True)
+            self.vm.send("reboot\n")
+            self.vm.wait_exit(180)
+            self.vm = None
+            self.boot_disk()
+            print(self.out("cat /sys/kernel/security/lockdown"), flush=True)
+            self.join_wifi()
+        finally:
+            if self.vm:
+                self.sh(
+                    "pkill -x hostapd || true; pkill -x dnsmasq || true; ip netns del ap 2>/dev/null || true; "
+                    f"rm -f /etc/modules-load.d/test-radio.conf /etc/modprobe.d/test-radio.conf /lib/modules/{kernel}/extra/mac80211_hwsim.ko; depmod {kernel}; "
+                    "rm -rf /root/hwsim; [ ! -e /root/limine.conf.saved ] || mv /root/limine.conf.saved /boot/limine.conf; "
+                    f"{packages} > /root/packages-after; new=$(comm -13 /root/packages-before /root/packages-after); "
+                    "[ -z \"$new\" ] || xbps-remove -y $new >/dev/null; rm -f /root/packages-before /root/packages-after /var/cache/xbps/*",
+                    timeout=600, what="test only: everything put back")
+                self.desktop_login(False)
+                self.expect("Wi-Fi test: lockdown is back for the next boot", "lockdown=integrity" in self.out("cat /boot/limine.conf"))
+
+    def join_wifi(self):
         phys = self.out("ls /sys/class/ieee80211").split()
         print(f"radios: {phys}", flush=True)
+        if len(phys) < 2:
+            self.expect("Wi-Fi: the simulated radios are there", False, self.out("dmesg | grep -iE 'hwsim|lockdown' | tail -5; true"))
+            return
+        procs = ""
+        for _ in range(30):
+            procs = self.out("pgrep -x netline; true")
+            if procs:
+                break
+            time.sleep(3)
+        self.expect("Wi-Fi test: the desktop is back after the reboot", procs != "")
+        time.sleep(5)
+        # the panel stays out while the pointer is against the top edge, so its items can be seen
+        body = lambda rows: [row[300 * 3:450 * 3] for row in rows[8:38]]
+        hidden = self.screenshot("wifi-desktop")
+        self.monitor_cmd("mouse_move 0 -3000")
+        before = hidden
+        for _ in range(5):
+            time.sleep(2)
+            before = self.screenshot("wifi-before")
+            if body(before) != body(hidden):
+                break
         icon = lambda rows: [row[1150 * 3:1186 * 3] for row in rows[8:38]]
-        before = self.screenshot("wifi-before")
-        self.sh("xbps-install -Sy hostapd dnsmasq iw >/dev/null", timeout=600, what="test only: an access point")
         self.sh(
             f"ip netns add ap; iw phy {phys[-1]} set netns name ap; sleep 1; "
             "dev=$(ip netns exec ap ls /sys/class/net | grep -v lo | head -1); "
@@ -887,7 +955,8 @@ class Run:
             # what the guide tells a person to type after the first boot
             self.sh(f"iwctl station {dev} scan; sleep 4; iwctl station {dev} get-networks; iwctl --passphrase '{WIFI_PASSPHRASE}' station {dev} connect {WIFI_SSID}; true")
         state = ""
-        for _ in range(30):
+        # on its own, iwd finds a network at its next periodic scan, and their interval grows to 5 minutes
+        for _ in range(170):
             state = self.out(f"iw dev {dev} link; true")
             if f"SSID: {WIFI_SSID}" in state:
                 break
@@ -903,7 +972,7 @@ class Run:
             time.sleep(2)
         self.expect("Wi-Fi: iwd gets an address on its own", address.startswith("10.42.0."), address)
         self.expect("Wi-Fi: the network answers", "1 received" in self.out("ping -c1 -W3 10.42.0.1; true"))
-        after = None
+        after = before
         for _ in range(5):
             after = self.screenshot("wifi-connected")
             if icon(before) != icon(after):
@@ -1028,6 +1097,7 @@ class Run:
                     self.check_dev()
                     self.install_kombain()
                 self.check_mango()
+                self.check_wifi()
                 self.check_gaming()
                 if self.o.secure_boot:
                     self.check_secure_boot()
