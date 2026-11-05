@@ -108,6 +108,7 @@ jobs:
         include:
           - { title: by the guide, flow: guide, bus: nvme, size: 600G, artifact: vm-install }
           - { title: by setup.sh, flow: setup, bus: virtio, size: 200G, artifact: vm-setup }
+          - { title: of plain Void to compare with, flow: stock, bus: nvme, size: 200G, artifact: vm-stock }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: QEMU with KVM
@@ -135,5 +136,6 @@ jobs:
           path: |
             ${{ runner.temp }}/vm/serial.log
             ${{ runner.temp }}/vm/summary.md
+            ${{ runner.temp }}/vm/metrics.txt
             ${{ runner.temp }}/vm/*.png
           if-no-files-found: warn

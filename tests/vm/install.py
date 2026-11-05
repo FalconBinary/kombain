@@ -15,6 +15,10 @@ with wrong answers first, on a disk with other device names, and then makes the 
 plus the sizes and names it was given:
 
   python3 tests/vm/install.py --iso ... --flow setup --disk-bus virtio --disk-size 200G
+
+With --flow stock it installs plain Void instead (base-system, with what void-installer enables),
+only to measure it: the numbers the rest are compared to. Every flow measures what the machine uses
+while nothing is happening: see MEASURE.
 """
 import argparse
 import os
@@ -55,6 +59,34 @@ FIRMWARE = [
     ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
     ("/opt/homebrew/share/qemu/edk2-x86_64-code.fd", "/opt/homebrew/share/qemu/edk2-i386-vars.fd"),
 ]
+
+
+# What an idle machine uses. It says nothing about the speed of real work, and a VM has no real
+# GPU, Wi-Fi or sensors, but the difference between two installs on the same VM is real.
+MEASURE = r"""
+disk=$(lsblk -dnpo NAME,TYPE | awk '$2=="disk" {print $1; exit}')
+dev=${disk##*/}
+stat_line() { awk -v d="$dev" '/^cpu / {busy=$2+$3+$4+$7+$8+$9; all=busy+$5+$6} /^ctxt/ {c=$2} /^intr/ {i=$2} END {print busy, all, c, i}' /proc/stat; }
+written() { awk -v d="$dev" '$3==d {print $10}' /proc/diskstats; }
+a=$(stat_line); wa=$(written)
+sleep 30
+b=$(stat_line); wb=$(written)
+echo "$a $b" | awk '{printf "metric cpu_busy_pct %.2f\nmetric context_switches_per_s %.0f\nmetric interrupts_per_s %.0f\n", ($5-$1)*100/($6-$2), ($7-$3)/30, ($8-$4)/30}'
+echo "metric disk_written_kib_30s $(( (wb-wa)/2 ))"
+awk '/^MemTotal/ {t=$2} /^MemAvailable/ {a=$2} /^Shmem:/ {s=$2} /^Slab:/ {l=$2} /^Buffers/ {b=$2} /^Cached/ {c=$2} /^KernelStack/ {k=$2} /^PageTables/ {p=$2}
+	END {printf "metric mem_used_mib %d\nmetric mem_cached_mib %d\nmetric mem_shmem_mib %d\nmetric mem_slab_mib %d\nmetric mem_kernel_stacks_tables_mib %d\n", (t-a)/1024, (b+c)/1024, s/1024, l/1024, (k+p)/1024}' /proc/meminfo
+ps -eo ppid=,pid=,rss= | awk '$1!=2 && $2!=2 {n++; r+=$3} END {printf "metric processes %d\nmetric rss_sum_mib %d\n", n, r/1024}'
+echo "metric root_used_mib $(df -m --output=used / | tail -1 | tr -d ' ')"
+for d in /usr/lib/firmware /usr/lib/modules /usr/share/locale /usr/lib/locale /usr/share/doc /usr/share/man /usr/share/icons /var/cache/xbps /usr/lib/gcc /usr/include; do
+	[ -d "$d" ] && echo "metric du$(echo "$d" | tr / _)_mib $(du -sxm "$d" | cut -f1)"
+done
+echo "metric packages $(xbps-query -l | wc -l)"
+echo "--- largest processes (RSS KiB)"
+ps -eo rss=,comm= --sort=-rss | awk '$1>0' | head -24
+echo "--- services"
+ls /etc/runit/runsvdir/current/ | tr '\n' ' '
+echo
+"""
 
 
 class Failed(Exception):
@@ -164,6 +196,8 @@ class Run:
         self.user = SETUP_USER if opts.flow == "setup" else "dev"
         self.disk_dev = "/dev/vda" if opts.disk_bus == "virtio" else "/dev/nvme0n1"
         self.setup_output = ""
+        self.metrics = {}
+        self.boot_times = {}
 
     def part(self, n):
         return f"{self.disk_dev}{'p' if self.disk_dev[-1].isdigit() else ''}{n}"
@@ -518,19 +552,79 @@ class Run:
         self.expect("setup.sh: the wired network, in both modes", wired == "2", wired)
         self.expect("setup.sh: no installation leftovers", self.out("ls /tmp/kombain-step 2>/dev/null; true") == "")
 
+    def measure(self, label, settle=40):
+        """What the machine uses while nothing is happening, for the summary and to compare runs."""
+        time.sleep(settle)
+        text = self.sh(MEASURE, check=False, timeout=240)
+        numbers = dict(re.findall(r"^metric (\S+) (\S+)", text, flags=re.M))
+        numbers.update(self.boot_times)
+        self.metrics[label] = numbers
+        print(f"=== {label}\n{text}", flush=True)
+        with open(os.path.join(self.o.work, "metrics.txt"), "a") as f:
+            f.write(f"=== {label}\n{text}\n")
+
+    def install_stock(self):
+        """Plain Void: base-system, what void-installer enables, no encryption. Only to be measured."""
+        self.sh("sv down sshd; xbps-install -Sy xbps", what="tools")
+        self.sh(
+            "printf 'label: gpt\\nsize=1G, type=U\\ntype=L\\n' | sfdisk \"$DISK\"; udevadm settle; "
+            "p=$DISK; case $DISK in *[0-9]) p=${DISK}p ;; esac; "
+            "mkfs.vfat -F32 -n EFI ${p}1; mkfs.xfs -L root ${p}2; mount ${p}2 /mnt; mkdir -p /mnt/boot; mount ${p}1 /mnt/boot; "
+            "mkdir -p /mnt/var/db/xbps/keys; cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/; "
+            "XBPS_ARCH=x86_64 xbps-install -Sy -r /mnt -R https://repo-default.voidlinux.org/current base-system limine efibootmgr; "
+            "cp /etc/resolv.conf /mnt/etc/",
+            timeout=2400, what="stock: base system")
+        self.vm.send("xchroot /mnt /bin/bash\n")
+        self.adopt_shell()
+        self.sh("echo stock > /etc/hostname; sed -i -e 's/^#en_US.UTF-8/en_US.UTF-8/' /etc/default/libc-locales; xbps-reconfigure -f glibc-locales; "
+                f"echo root:{PASSWORD} | chpasswd; "
+                "p=$DISK; case $DISK in *[0-9]) p=${DISK}p ;; esac; "
+                "printf '%s\\n' \"LABEL=root / xfs defaults 0 1\" \"UUID=$(blkid -s UUID -o value ${p}1) /boot vfat defaults 0 2\" \"tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0\" > /etc/fstab; "
+                "for s in dhcpcd sshd agetty-ttyS0; do ln -sfn /etc/sv/$s /etc/runit/runsvdir/default/; done; "
+                "xbps-reconfigure -fa; "
+                "v=$(ls /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | head -1); "
+                "printf 'timeout: 0\\n\\n/Void\\n    protocol: linux\\n    path: boot():/vmlinuz-%s\\n    cmdline: root=LABEL=root rw quiet loglevel=3 console=tty0 console=ttyS0,115200\\n    module_path: boot():/initramfs-%s.img\\n' $v $v > /boot/limine.conf; "
+                "mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs none /sys/firmware/efi/efivars; "
+                "mkdir -p /boot/EFI/BOOT; cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/; "
+                "efibootmgr --create --disk $DISK --part 1 --label Limine --loader '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'",
+                timeout=1200, what="stock: settings")
+        self.vm.send("exit\n")
+        self.adopt_shell()
+        self.sh("umount -R /mnt", what="stock: unmount")
+        self.vm.send("reboot\n")
+        self.vm.wait_exit(180)
+        self.vm = None
+        self.expect("stock: installed", True)
+
+    def check_stock(self):
+        prompts = self.boot_disk()
+        self.expect("stock: boots with no passphrase", prompts == 0, prompts)
+        self.measure("stock-console")
+        self.vm.send("poweroff\n")
+        try:
+            self.vm.wait_exit(120)
+        except subprocess.TimeoutExpired:
+            self.vm.kill()
+        self.vm = None
+
     def boot_disk(self):
         """Boots the installed system, answering LUKS prompts. Returns how many it saw."""
         self.qemu(live=False)
         self.o.root_password = PASSWORD
         count = 0
+        started = time.time()
+        answered = None
         while True:
             index, m = self.vm.wait([r"(?:[Ee]nter passphrase for|Password \(?)[^\n:]*:?\s*$|assphrase[^\n]*: *$", r"login: "], self.o.boot_timeout)
             if index == 1:
+                now = time.time()
+                self.boot_times = {"boot_to_prompt_s": f"{(answered or now) - started:.1f}", "last_passphrase_to_login_s": f"{now - (answered or started):.1f}"}
                 break
             count += 1
             prompt = m.group(0)
             word = DEV_PASSPHRASE if self.luks.get("dev", "?") in prompt or self.part(3) in prompt else ROOT_PASSPHRASE
             self.vm.send(word + "\n")
+            answered = time.time()
             print(f"answered a LUKS prompt: {prompt.strip()[:80]}", flush=True)
         self.vm.send("root\n")
         self.vm.wait([r"Password: "], 60)
@@ -562,6 +656,7 @@ class Run:
         self.expect("Dev: every enabled service is running", not down, down)
         self.expect("Dev: network is up", self.wait_network())
         self.expect("Dev: no kernel oops or module refusals", not re.search(r"Oops|BUG:|Lockdown:.*module|module verification failed", self.out("dmesg")))
+        self.measure("dev-console")
 
     def install_kombain(self):
         clone = block("git clone https://github.com/FalconBinary/kombain").splitlines()
@@ -684,6 +779,7 @@ class Run:
         self.expect("netline: comes out for a volume change", body(peek) != body(gone))
         time.sleep(2.5)
         self.expect("netline: and goes back", body(self.screenshot("mango-after-peek")) == body(gone))
+        self.measure("dev-desktop")
 
     def check_gaming(self):
         self.sh("sed -i 's/^timeout: 3/timeout: 3\\ndefault_entry: 2/' /boot/limine.conf; grep -n default_entry /boot/limine.conf")
@@ -700,6 +796,7 @@ class Run:
         self.expect("Gaming: gaming runlevel", "gaming" in self.out("readlink -f /etc/runit/runsvdir/current"))
         self.expect("Gaming: tuning service is up", self.out("sv status /etc/sv/game-tune").startswith("run:"))
         self.expect("Gaming: firewall loaded", self.out("nft list ruleset").count("policy drop") == 2)
+        self.measure("gaming-console")
         self.expect("Gaming: dev's home is not reachable by gamer", "denied" in self.out("su - gamer -s /bin/sh -c 'ls /home/dev' 2>&1; true") or self.out("ls -A /home/dev | wc -l") == "0")
         # This VM has no Vulkan device, so gamescope cannot start. A real install gets the
         # same with a missing driver, or before Steam is installed.
@@ -729,7 +826,10 @@ class Run:
         code = 0
         try:
             self.boot_live()
-            if self.o.stage != "live":
+            if self.o.flow == "stock":
+                self.install_stock()
+                self.check_stock()
+            elif self.o.stage != "live":
                 if self.o.flow == "setup":
                     self.install_with_setup()
                     self.check_dev()
@@ -755,6 +855,8 @@ class Run:
         failed = [r for r in self.results if not r[0]]
         summary = [f"# Install in a VM: {len(self.results) - len(failed)} passed, {len(failed)} failed", ""]
         summary += [f"- {'pass' if ok else '**FAIL**'}: {name}" + (f" (`{detail[:120]}`)" if not ok and detail else "") for ok, name, detail in self.results]
+        for label, numbers in self.metrics.items():
+            summary += ["", f"## {label}", ""] + [f"- {k}: {v}" for k, v in numbers.items()]
         text = "\n".join(summary) + "\n"
         print("\n" + text, flush=True)
         with open(os.path.join(self.o.work, "summary.md"), "w") as f:
@@ -799,7 +901,7 @@ def main():
     p.add_argument("--iso", required=True)
     p.add_argument("--work", default="vm-work")
     p.add_argument("--stage", choices=["live", "all"], default="all")
-    p.add_argument("--flow", choices=["guide", "setup"], default="guide")
+    p.add_argument("--flow", choices=["guide", "setup", "stock"], default="guide")
     p.add_argument("--disk-bus", choices=["nvme", "virtio"], default="nvme")
     p.add_argument("--memory", type=int, default=6144)
     p.add_argument("--cpus", type=int, default=4)
