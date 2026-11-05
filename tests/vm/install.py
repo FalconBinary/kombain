@@ -166,7 +166,7 @@ class Run:
             subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", self.disk, self.o.disk_size], check=True)
         kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
         args = [
-            "qemu-system-x86_64", "-machine", "q35", "-m", str(self.o.memory), "-smp", str(self.o.cpus),
+            "qemu-system-x86_64", "-machine", "q35,vmport=off", "-m", str(self.o.memory), "-smp", str(self.o.cpus),
             "-accel", "kvm" if kvm else "tcg", "-cpu", "host" if kvm else "max",
             "-display", "none", "-serial", "stdio", "-no-reboot",
             "-monitor", f"tcp:127.0.0.1:{self.monitor},server=on,wait=off",
@@ -492,6 +492,24 @@ class Run:
         self.expect("netline: shows mute from the server's event", items(before) != items(muted))
         self.zctl("mute")
         time.sleep(1)
+
+        # the menu on mango: it comes out from under the panel by cropping, and takes the keyboard
+        card = lambda rows: [row[1000 * 3:1260 * 3] for row in rows[60:140]]
+        closed = self.screenshot("mango-before-menu")
+        self.monitor_cmd("sendkey meta_l-a")
+        time.sleep(1.5)
+        self.expect("zctl: the menu opens from a hotkey", self.out("pgrep -x zctl; true") != "")
+        opened = self.screenshot("mango-menu")
+        self.expect("zctl: the card is on screen, below the panel", card(closed) != card(opened))
+        self.expect("zctl: no dimming around the card", closed[400][100 * 3:600 * 3] == opened[400][100 * 3:600 * 3])
+        self.monitor_cmd("sendkey up")
+        time.sleep(0.5)
+        raised = self.out("su - dev -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) wpctl get-volume @DEFAULT_AUDIO_SINK@' 2>&1; true")
+        self.expect("zctl: arrow up raises the volume", "0.35" in raised, raised)
+        self.monitor_cmd("sendkey esc")
+        time.sleep(1.5)
+        self.expect("zctl: Esc closes it", self.out("pgrep -x zctl; true") == "")
+        self.expect("zctl: the card is gone", card(self.screenshot("mango-menu-closed")) == card(closed))
 
         self.monitor_cmd("mouse_move 0 400")
         time.sleep(2.5)
