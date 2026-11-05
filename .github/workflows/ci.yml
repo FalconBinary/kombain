@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ISO: void-live-x86_64-20250202-base.iso
+  ISO_SHA256: 0f7439f500740f62dd18972cae448cec7d8a85032c7eb8f1bf946100d9a92161
+
+jobs:
+  tests:
+    name: Tests on x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:latest
+      options: --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined
+    steps:
+      - name: Install the tools
+        run: |
+          xbps-install -Syu xbps
+          xbps-install -Syu
+          xbps-install -y base-devel git tar xz curl python3 python3-pip nftables iproute2 iputils runit-void util-linux libsanitizer-devel
+          pip3 install --break-system-packages pyte==0.8.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Let the unprivileged test user read the tree
+        run: chmod -R a+rX .
+      - name: fdash
+        working-directory: fdash
+        run: tests/in-docker.sh
+      - name: fdash under ASan and UBSan
+        working-directory: fdash
+        run: |
+          make TARGET=fdash-asan BUILD=build-asan OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -D_GNU_SOURCE" LINKOPT="-fsanitize=address,undefined"
+          chmod -R a+rX .
+          ASAN_OPTIONS=detect_leaks=0 python3 tests/run.py ./fdash-asan
+      - name: Zig, at the version and checksum install.sh pins
+        run: |
+          version=$(sed -n 's/^ZIG_VERSION=//p' install.sh)
+          sha=$(sed -n 's/^ZIG_SHA256_X86_64=//p' install.sh)
+          curl -fsSL "https://ziglang.org/download/$version/zig-x86_64-linux-$version.tar.xz" -o /tmp/zig.tar.xz
+          echo "$sha  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt && tar -xf /tmp/zig.tar.xz -C /opt
+          ln -s "/opt/zig-x86_64-linux-$version/zig" /usr/bin/zig
+      - name: zcool
+        working-directory: zcool
+        run: |
+          zig fmt --check src build.zig
+          zig test src/all_tests.zig
+          zig build -Doptimize=ReleaseSafe
+          chmod -R a+rX .
+          python3 tests/sim.py zig-out/bin/zcool
+      - name: Firewall, with real traffic between network namespaces
+        run: sh tests/firewall.sh
+      - name: gconv cache
+        run: sh tests/gconv-cache.sh
+
+  install:
+    name: install.sh on a clean system
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:latest
+      options: --cap-add NET_ADMIN
+    steps:
+      - name: Install what checkout needs
+        run: |
+          xbps-install -Syu xbps
+          xbps-install -y git tar
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: First run
+        run: |
+          useradd -m dev
+          ./install.sh --user dev
+      - name: What it should have left
+        run: |
+          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool mango foot swaylock nft; do
+            command -v "$c"
+          done
+          su dev -s /usr/local/bin/fdash -c 'echo "fdash runs as $USER"'
+          su dev -s /bin/sh -c 'mango -p'
+          zcool list
+          test ! -e /etc/runit/runsvdir/default/zcool
+          test -s /etc/nftables.conf
+          test -s /etc/sysctl.d/90-local.conf
+          test -z "$(git status --short)"
+      - name: Second run changes nothing it should keep
+        run: |
+          echo '# my own line' >> /etc/nftables.conf
+          before=$(sha256sum /etc/nftables.conf)
+          ./install.sh --user dev
+          test "$before" = "$(sha256sum /etc/nftables.conf)"
+
+  vm:
+    name: Full install by the guide, in a VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: QEMU with KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends qemu-system-x86 qemu-utils ovmf libarchive-tools
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: The official ISO, by checksum
+        run: |
+          curl -fsSL "https://repo-default.voidlinux.org/live/20250202/$ISO" -o "$RUNNER_TEMP/$ISO"
+          echo "$ISO_SHA256  $RUNNER_TEMP/$ISO" | sha256sum -c -
+      - name: Install, boot both modes, check them
+        run: |
+          python3 tests/vm/install.py --iso "$RUNNER_TEMP/$ISO" --work "$RUNNER_TEMP/vm" \
+            --repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --ref "$GITHUB_SHA" --boot-timeout 300
+      - name: Keep the console log and the screens
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vm-install
+          path: |
+            ${{ runner.temp }}/vm/serial.log
+            ${{ runner.temp }}/vm/summary.md
+            ${{ runner.temp }}/vm/*.png
+          if-no-files-found: warn
