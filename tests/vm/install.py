@@ -897,12 +897,13 @@ class Run:
                 "echo mac80211_hwsim > /etc/modules-load.d/test-radio.conf; echo 'options mac80211_hwsim radios=2' > /etc/modprobe.d/test-radio.conf; "
                 "cp /boot/limine.conf /root/limine.conf.saved; sed -i 's/ lockdown=integrity//' /boot/limine.conf",
                 timeout=900, what="test only: the radio simulator, built from the kernel's source")
-            self.desktop_login(True)
             self.vm.send("reboot\n")
             self.vm.wait_exit(180)
             self.vm = None
             self.boot_disk()
             print(self.out("cat /sys/kernel/security/lockdown"), flush=True)
+            # logged in once the system is up, as a person would be, not racing the services at boot
+            self.desktop_login(True)
             self.join_wifi()
         finally:
             if self.vm:
@@ -929,6 +930,8 @@ class Run:
                 break
             time.sleep(3)
         self.expect("Wi-Fi test: the desktop is back after the reboot", procs != "")
+        if not procs:
+            print(self.out("ps -eo user,tty,stat,comm | awk '$2 != \"?\"'; sv status /var/service/agetty-*; tr -s ' ' </dev/vcs1 | tail -c 600; true"), flush=True)
         time.sleep(5)
         # the panel stays out while the pointer is against the top edge, so its items can be seen
         body = lambda rows: [row[300 * 3:450 * 3] for row in rows[8:38]]
@@ -947,7 +950,7 @@ class Run:
             "ip netns exec ap ip link set lo up; ip netns exec ap ip addr add 10.42.0.1/24 dev $dev; "
             f"printf 'interface=%s\\ndriver=nl80211\\nssid={WIFI_SSID}\\nhw_mode=g\\nchannel=6\\nwpa=2\\nwpa_key_mgmt=WPA-PSK\\nrsn_pairwise=CCMP\\nwpa_passphrase={WIFI_PASSPHRASE}\\n' $dev > /tmp/ap.conf; "
             "ip netns exec ap hostapd -B /tmp/ap.conf >/tmp/hostapd.log 2>&1; "
-            "ip netns exec ap dnsmasq --interface=$dev --bind-interfaces --dhcp-range=10.42.0.10,10.42.0.50 --no-resolv --pid-file=/tmp/dnsmasq.pid",
+            "ip netns exec ap dnsmasq --interface=$dev --bind-interfaces --dhcp-range=10.42.0.10,10.42.0.50 --no-resolv --dhcp-leasefile=/tmp/dnsmasq.leases --pid-file=/tmp/dnsmasq.pid",
             what="test only: the access point")
         dev = self.out("for d in /sys/class/net/*; do [ -e $d/phy80211 ] && basename $d; done | head -1")
         print(f"iwd's device: {dev}", flush=True)
