@@ -401,7 +401,7 @@ class Run:
         vm.send("cd /root/kombain && ./setup.sh --serial; echo SETUP-EXIT=$((0+$?))=\n")
 
         def say(pattern, answer=None, timeout=120):
-            index, m = vm.wait([pattern, r"setup\.sh: [^\n]*", r"SETUP-EXIT=(\d+)="], timeout)
+            index, m = vm.wait([pattern, r"(?m)^setup\.sh: [^\n]*", r"SETUP-EXIT=(\d+)="], timeout)
             if index != 0:
                 raise Failed(f"setup.sh stopped while waiting for {pattern!r}: {m.group(0)}\n{vm.tail()}")
             if answer is not None:
@@ -453,7 +453,7 @@ class Run:
         self.expect("setup.sh: every wrong answer was refused, and asked again", True)
 
         start = vm.pos
-        patterns = [r"Remove the installation stick and press Enter to reboot: ", r"setup\.sh: [^\n]*", r"SETUP-EXIT=(\d+)=",
+        patterns = [r"Remove the installation stick and press Enter to reboot: ", r"(?m)^setup\.sh: [^\n]*", r"SETUP-EXIT=(\d+)=",
                     r"[Ee]nter passphrase for ([^:\s]+):", r"Verify passphrase:", r"New password:", r"Retype new password:"]
         mistyped_passphrase = mistyped_password = False
         last_passphrase = ROOT_PASSPHRASE
