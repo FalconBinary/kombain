@@ -114,7 +114,7 @@ ok "non-ASCII SSID is hex" "$(iwd_file_name 'дом')" "=d0b4d0bed0bc.psk"
 guide=$repo/docs/void-install-guide.md
 for start in 'DISK=/dev/nvme0n1|cfdisk' 'REPO=https://' 'DISK=/dev/nvme0n1|echo voidbox' 'xbps-install -y intel-ucode' \
 	'xbps-install -y mesa-dri' 'cat > /etc/fstab' 'mkdir -p /etc/dracut.conf.d' 'mkdir -p /etc/kernel.d/post-install' \
-	'mkdir -p /etc/iwd' 'IF=enp3s0' 'mkdir -p /etc/sysctl.d' 'cat > /etc/nftables.conf' 'mkdir -p /etc/sv/game-tune' \
+	'mkdir -p /etc/iwd' 'IF=enp3s0' "printf 'ignorepkg=dhcpcd" 'mkdir -p /etc/sysctl.d' 'cat > /etc/nftables.conf' 'mkdir -p /etc/sv/game-tune' \
 	'useradd -m -G wheel' 'xbps-reconfigure -fa' 'cat > /etc/modprobe.d/kombain.conf' 'doas sh -c'; do
 	first=${start%%|*}
 	second=
@@ -223,6 +223,7 @@ has "lockdown stays on without NVIDIA" "lockdown=integrity"
 has "wired network" "IF=eth9"
 has "in Dev" "ln -sfn /etc/sv/dhcpcd-eth9 /etc/runit/runsvdir/default/"
 has "in Gaming" "ln -sfn /etc/sv/dhcpcd-eth9 /etc/runit/runsvdir/gaming/"
+hasnt "a cable keeps dhcpcd" "xbps-remove -Ry dhcpcd"
 hasnt "no serial login unasked" "agetty-ttyS0"
 has "the hook's partitions" 'blkid -s UUID -o value "${DISK}2"'
 has "power saving" "/etc/runit/core-services/91-power-save.sh"
@@ -252,6 +253,16 @@ has "fdash" "chsh -s /usr/local/bin/fdash dev"
 hasnt "the NVIDIA card keeps its firmware" "linux-firmware-nvidia"
 has "NVMe partitions in commands" 'cryptsetup luksFormat --batch-mode --verify-passphrase --type luks2 "${DISK}p2"'
 ok "again nothing was called" "$(cat "$work/called" 2>/dev/null)" ""
+
+# ------ no cable: dhcpcd goes, as the guide's step 6 says
+dialog "$work/run6" 1 '' '' '' '' y '' '' '' n y
+ok "the dialog without a cable finishes" $? 0
+cat "$work/run6" >"$work/r"
+has "it says so" "Without a cable dhcpcd is removed"
+has "updates leave dhcpcd out" "ignorepkg=dhcpcd"
+has "and it is removed" "xbps-remove -Ry dhcpcd"
+hasnt "no dhcpcd service" "/etc/sv/dhcpcd-"
+ok "and nothing was called" "$(cat "$work/called" 2>/dev/null)" ""
 
 # ------ running out of answers ends it, instead of asking forever
 dialog "$work/run3" 1

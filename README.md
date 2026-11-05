@@ -116,7 +116,8 @@ differ. Real hardware, power draw and frame rates in games have not been measure
 Removed or put off: Xwayland (starts with an X11 program and ends with it), rtkit and polkitd at idle
 (real-time rights for sound come from limits, and polkit starts only when something asks it), spare consoles, the
 terminal server, WirePlumber's camera and MIDI watchers, the package cache (also cleared weekly), unused
-locales, and with `setup.sh` the firmware of vendors the machine doesn't have and iwd without Wi-Fi.
+locales, wpa_supplicant (iwd does Wi-Fi and its addresses), dhcpcd without a cable, and with `setup.sh` the
+firmware of vendors the machine doesn't have and iwd without Wi-Fi.
 Fewer timers: no kernel watchdog or KFENCE sampling, fewer writeback and vmstat wakeups. In Dev mode idle PCI devices may sleep,
 except the GPU and USB. Gaming mode keeps everything at full speed.
 
@@ -136,7 +137,8 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
 - zcool: unit tests and a thermal simulator, `zcool/tests/sim.py`.
 - `setup.sh`: `tests/setup-logic.sh` checks its arithmetic and dry runs, with fake commands that
   fail if anything changing a disk is called. In a VM, on a disk with other device names,
-  it is answered like a person, wrong answers first, and then gets the same checks as the guide.
+  it is answered like a person, wrong answers first, and then gets the same checks as the guide;
+  a second VM answers no to the cable and checks that dhcpcd is gone and that updates leave it out.
 - The guide itself: `tests/vm/install.py` types its commands into a UEFI VM booted
   from the Void ISO, then boots the result through Limine and checks both modes:
   LUKS prompts, the Dev volume locked in Gaming, lockdown, firewall, every sysctl and

@@ -364,6 +364,7 @@ ask_network() {
 	if [ -n "$iface" ] && ask_yes "Use the wired network on $iface in the installed system?" y; then
 		wired=$iface
 	fi
+	[ -n "$wired" ] || echo "Without a cable dhcpcd is removed (guide, step 6)."
 	if has_wifi; then
 		wifi_ssid=$(ask "Wi-Fi network to join at first boot (empty: none): ")
 		if [ -n "$wifi_ssid" ]; then
@@ -553,8 +554,13 @@ step_hook() {
 }
 
 step_wired() {
+	# without a cable dhcpcd goes: iwd gets the address for Wi-Fi itself
+	if [ -z "$wired" ]; then
+		block "printf 'ignorepkg=dhcpcd"
+		return
+	fi
 	# (dhcpcd-eth0 is the service the guide's commands copy, and it comes with the system)
-	[ -n "$wired" ] && [ "$wired" != eth0 ] || return 0
+	[ "$wired" != eth0 ] || return 0
 	t=$(block IF=enp3s0)
 	swap "$t" IF=enp3s0 "IF=$wired"
 	echo
@@ -732,7 +738,7 @@ install_system() {
 	chrooted "initramfs settings" "$s_dracut"
 	chrooted "Limine (step 5)" "$s_hook"
 	chrooted "iwd (step 6)" "$s_iwd"
-	chrooted "Wired network" "$s_wired"
+	chrooted "Wired network (step 6)" "$s_wired"
 	chrooted "Kernel settings (step 7)" "$s_sysctl"
 	chrooted "Firewall and boot services" "$s_firewall"
 	chrooted "Power saving and unused modules" "$s_power"

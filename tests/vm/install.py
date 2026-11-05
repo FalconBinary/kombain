@@ -498,8 +498,10 @@ class Run:
         say(r"for several \[[^]]*\]: ", "7")
         say(r"Numbers from 1 to 5")
         say(r"for several \[[^]]*\]: ", "")
-        wired = say(r"Use the wired network on (\S+) in the installed system\? \[Y/n\]: ", "").group(1)
+        wired = say(r"Use the wired network on (\S+) in the installed system\? \[Y/n\]: ", "n" if self.o.no_cable else "").group(1)
         print(f"wired interface: {wired}", flush=True)
+        if self.o.no_cable:
+            say(r"Without a cable dhcpcd is removed")
         if self.live_radio:
             say(r"Wi-Fi network to join at first boot \(empty: none\): ", WIFI_SSID)
             say(r"Its password: ", WIFI_PASSPHRASE)
@@ -573,8 +575,14 @@ class Run:
         self.expect("setup.sh: the user's home is theirs", self.out(f"stat -c %U /home/{self.user}") == self.user)
         self.expect("setup.sh: the host name", self.out("cat /etc/hostname") == SETUP_HOST)
         self.expect("setup.sh: the time zone", SETUP_ZONE in self.out("readlink /etc/localtime"))
-        wired = self.out("ls /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming | grep -c dhcpcd-")
-        self.expect("setup.sh: the wired network, in both modes", wired == "2", wired)
+        if self.o.no_cable:
+            self.expect("setup.sh: no cable, so no dhcpcd", self.out("xbps-query dhcpcd >/dev/null && echo installed || echo gone") == "gone")
+            # without the ignore, base-system would bring it back and xbps-pkgdb would call it missing
+            again = self.out("xbps-install -Sn -f base-system 2>&1; xbps-pkgdb base-system 2>&1; echo pkgdb=$?")
+            self.expect("setup.sh: and updates leave it out", "dhcpcd" not in again and again.endswith("pkgdb=0"), again[-300:])
+        else:
+            wired = self.out("ls /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming | grep -c dhcpcd-")
+            self.expect("setup.sh: the wired network, in both modes", wired == "2", wired)
         self.expect("setup.sh: no installation leftovers", self.out("ls /tmp/kombain-step 2>/dev/null; true") == "")
         self.expect("setup.sh: no firmware for hardware it doesn't have", "linux-firmware-nvidia" not in self.out("xbps-query -l | grep linux-firmware; true"))
         if self.live_radio:
@@ -666,7 +674,16 @@ class Run:
         self.vm.wait([r"Password: "], 60)
         self.vm.send(PASSWORD + "\n")
         self.adopt_shell()
+        if self.o.no_cable:
+            self.test_network()
         return count
+
+    def test_network(self):
+        """This system has no DHCP client, as chosen. The test still needs the internet, so the VM's
+        card gets QEMU's fixed address by hand, for this boot only."""
+        self.sh("n=$(for d in /sys/class/net/*; do [ -e $d/device ] && [ ! -e $d/wireless ] && echo ${d##*/} && break; done); "
+                "ip link set $n up; ip addr add 10.0.2.15/24 dev $n 2>/dev/null || true; ip route replace default via 10.0.2.2; "
+                "printf 'nameserver 10.0.2.3\\n' | resolvconf -a $n.test", what="test only: the VM's network by hand")
 
     def check_dev(self):
         prompts = self.boot_disk()
@@ -1176,6 +1193,7 @@ def main():
     p.add_argument("--flow", choices=["guide", "setup", "stock"], default="guide")
     p.add_argument("--disk-bus", choices=["nvme", "virtio"], default="nvme")
     p.add_argument("--secure-boot", action="store_true", help="firmware that enforces Secure Boot, and step 12 at the end")
+    p.add_argument("--no-cable", action="store_true", help="setup.sh flow: no to the wired network, so the system has Wi-Fi alone")
     p.add_argument("--memory", type=int, default=6144)
     p.add_argument("--cpus", type=int, default=4)
     p.add_argument("--disk-size", default="600G")
