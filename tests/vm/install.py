@@ -451,8 +451,12 @@ class Run:
         print(terms, flush=True)
         self.expect("mango: Alt+Return opens a terminal with fdash", "fdash" in terms, terms)
         self.screenshot("mango-terminal")
-        tags = self.out("su - dev -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); MANGO_INSTANCE_SIGNATURE=$(cat /proc/$(pgrep -x mango)/environ | tr \"\\0\" \"\\n\" | sed -n s/^MANGO_INSTANCE_SIGNATURE=//p) mmsg -g -t 2>&1 | head -3'")
+        # Mango sets the signature after it starts, so only its children have it in environ
+        self.monitor_cmd("sendkey ctrl-3")
+        time.sleep(3)
+        tags = self.out("su - dev -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); MANGO_INSTANCE_SIGNATURE=$(tr \"\\0\" \"\\n\" </proc/$(pgrep -o -x netline)/environ | sed -n s/^MANGO_INSTANCE_SIGNATURE=//p) mmsg get all-tags 2>&1 | head -24'")
         print(tags, flush=True)
+        self.screenshot("mango-tag3")
         self.sh("rm -f /etc/runit/runsvdir/default/agetty-autologin-dev-tty1; ln -s /etc/sv/agetty-tty1 /etc/runit/runsvdir/default/")
 
     def check_gaming(self):
@@ -470,9 +474,23 @@ class Run:
         self.expect("Gaming: gaming runlevel", "gaming" in self.out("readlink -f /etc/runit/runsvdir/current"))
         self.expect("Gaming: tuning service is up", self.out("sv status /etc/sv/game-tune").startswith("run:"))
         self.expect("Gaming: firewall loaded", self.out("nft list ruleset").count("policy drop") == 2)
-        self.expect("Gaming: autologin for gamer", "gamer" in self.out("ps -eo user | sort -u"))
         self.expect("Gaming: dev's home is not reachable by gamer", "denied" in self.out("su - gamer -s /bin/sh -c 'ls /home/dev' 2>&1; true") or self.out("ls -A /home/dev | wc -l") == "0")
+        # This VM has no Vulkan device, so gamescope cannot start. A real install gets the
+        # same with a missing driver, or before Steam is installed.
+        time.sleep(15)
+        session = self.out("pgrep -u gamer -f game-session; true")
+        self.expect("Gaming: autologin for gamer", session != "", session)
+        self.expect("Gaming: a session that cannot start says so", self.out("grep -ac 'Press Enter' /dev/vcs1; true") == "1")
         self.screenshot("gaming")
+        time.sleep(10)
+        same = self.out("pgrep -u gamer -f game-session; true")
+        self.expect("Gaming: it waits instead of restarting", same == session, (session, same))
+        left = self.out("ps -u gamer -o comm=")
+        self.expect("Gaming: it leaves no audio daemons", "pipewire" not in left and "wireplumber" not in left, left)
+        self.monitor_cmd("sendkey ret")
+        time.sleep(10)
+        again = self.out("pgrep -u gamer -f game-session; true")
+        self.expect("Gaming: Enter tries again", again not in ("", session), (session, again))
         self.vm.send("poweroff\n")
         try:
             self.vm.wait_exit(120)

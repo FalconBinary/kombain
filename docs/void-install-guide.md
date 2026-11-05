@@ -423,8 +423,19 @@ EOF
 
 cat > /home/gamer/game-session <<'EOF'
 #!/bin/sh
-pipewire &
-exec gamescope -e -f -- flatpak run com.valvesoftware.Steam -gamepadui
+pipewire >/dev/null 2>&1 &
+pipewire_pid=$!
+started=$(date +%s)
+gamescope -e -f -- flatpak run com.valvesoftware.Steam -gamepadui
+status=$?
+kill "$pipewire_pid" 2>/dev/null
+# Autologin would restart a session that cannot start, forever
+if [ $(($(date +%s) - started)) -lt 30 ]; then
+	echo "The game session ended right away, exit code $status."
+	echo "Check the Vulkan driver and Steam: log in on tty2 with Ctrl+Alt+F2."
+	echo "Press Enter to try again."
+	read -r reply
+fi
 EOF
 chmod +x /home/gamer/game-session
 
@@ -432,6 +443,8 @@ chown -R dev:dev /home/dev
 chown -R gamer:gamer /home/gamer
 chmod 700 /home/dev /home/gamer
 ```
+
+Если сессия не смогла запуститься (нет драйвера Vulkan, Steam ещё не установлен), она покажет причину и будет ждать Enter, а не перезапускаться по кругу. Исправить причину можно на `tty2`.
 
 Сессию для `dev` настроит `install.sh` из kombain на шаге 11.
 

@@ -718,7 +718,10 @@ def pasting_does_not_eat_memory(h):
     s.settle(0.3, 10)
     used = rss_mib(s.pid)
     expect(s.alive(), "survives a 200 KiB paste", None)
-    expect(used < 64, f"used {used} MiB for a 200 KiB paste", None)
+    # ASan keeps up to 256 MiB of freed memory and adds its shadow to RSS. A quadratic
+    # undo still goes far over this limit.
+    limit = 512 if "ASAN_OPTIONS" in os.environ else 64
+    expect(used < limit, f"used {used} MiB for a 200 KiB paste", None)
     expect(responsive(s), "usable afterwards", None)
     s.close()
 
