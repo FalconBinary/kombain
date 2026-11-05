@@ -125,7 +125,7 @@ xbps-install -y intel-ucode
 ```bash
 xbps-install -y mesa-dri vulkan-loader mesa-vulkan-radeon   # AMD
 xbps-install -y mesa-dri vulkan-loader mesa-vulkan-intel    # Intel
-xbps-install -y nvidia                                      # NVIDIA Turing (GTX 16xx, RTX 20xx) и новее
+xbps-install -y nvidia                                      # NVIDIA Turing (GTX 16xx, RTX 20xx) and newer
 xbps-install -y nvidia580                                   # NVIDIA Maxwell, Pascal, Volta
 ```
 
