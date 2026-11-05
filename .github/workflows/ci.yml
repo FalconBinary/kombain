@@ -57,6 +57,8 @@ jobs:
           python3 tests/sim.py zig-out/bin/zcool
       - name: Firewall, with real traffic between network namespaces
         run: sh tests/firewall.sh
+      - name: setup.sh, its logic and dry runs
+        run: sh tests/setup-logic.sh
       - name: gconv cache
         run: sh tests/gconv-cache.sh
 
@@ -97,9 +99,15 @@ jobs:
           test "$before" = "$(sha256sum /etc/nftables.conf)"
 
   vm:
-    name: Full install by the guide, in a VM
+    name: Full install ${{ matrix.title }}, in a VM
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { title: by the guide, flow: guide, bus: nvme, size: 600G, artifact: vm-install }
+          - { title: by setup.sh, flow: setup, bus: virtio, size: 200G, artifact: vm-setup }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: QEMU with KVM
@@ -117,12 +125,13 @@ jobs:
       - name: Install, boot both modes, check them
         run: |
           python3 tests/vm/install.py --iso "$RUNNER_TEMP/$ISO" --work "$RUNNER_TEMP/vm" \
-            --repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --ref "$GITHUB_SHA" --boot-timeout 300
+            --repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --ref "$GITHUB_SHA" --boot-timeout 300 \
+            --flow ${{ matrix.flow }} --disk-bus ${{ matrix.bus }} --disk-size ${{ matrix.size }}
       - name: Keep the console log and the screens
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: vm-install
+          name: ${{ matrix.artifact }}
           path: |
             ${{ runner.temp }}/vm/serial.log
             ${{ runner.temp }}/vm/summary.md

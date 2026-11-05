@@ -37,8 +37,13 @@ With `--extras`, because they only pay off when used: neovim (35.5 MiB, helix is
 
 ## Install
 
-On Void Linux with glibc, as root. [docs/void-install-guide.md](docs/void-install-guide.md)
-covers the system below this (LUKS, XFS, Limine, iwd, a separate gaming mode), in Russian.
+To install the whole system from the Void live ISO (LUKS, XFS, Limine, iwd, a separate
+gaming mode), `./setup.sh` asks for the disk and the sizes of `/`, the games and your files, erases the
+disk once you type its name, and installs everything below too. It runs the commands of
+[docs/void-install-guide.md](docs/void-install-guide.md), where the same steps can be done by hand.
+`--dry-run` shows the commands and changes nothing.
+
+On an existing Void Linux with glibc, as root:
 
 ```sh
 git clone https://github.com/FalconBinary/kombain
@@ -86,6 +91,9 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
   including a broken config and a missing one.
 - gconv cache: `tests/gconv-cache.sh`, including a stale and a damaged cache.
 - zcool: unit tests and a thermal simulator, `zcool/tests/sim.py`.
+- `setup.sh`: `tests/setup-logic.sh` checks its arithmetic and dry runs, with fake commands that
+  fail if anything changing a disk is called. In a VM, on a disk with other device names,
+  it is answered like a person, wrong answers first, and then gets the same checks as the guide.
 - The guide itself: `tests/vm/install.py` types its commands into a UEFI VM booted
   from the Void ISO, then boots the result through Limine and checks both modes:
   LUKS prompts, the Dev volume locked in Gaming, lockdown, firewall, every sysctl and

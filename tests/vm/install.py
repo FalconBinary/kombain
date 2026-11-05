@@ -9,6 +9,12 @@ Test-only differences from a real install, all marked `test only` below: a seria
 this script can see the machine, `sfdisk` instead of `cfdisk`, and a stable network name.
 
   python3 tests/vm/install.py --iso void-live-x86_64-20250202-base.iso --stage all
+
+With --flow setup it installs through setup.sh instead, answering its questions like a person,
+with wrong answers first, on a disk with other device names, and then makes the same checks
+plus the sizes and names it was given:
+
+  python3 tests/vm/install.py --iso ... --flow setup --disk-bus virtio --disk-size 200G
 """
 import argparse
 import os
@@ -34,6 +40,13 @@ ROOT_PASSPHRASE = "test-root-passphrase"
 DEV_PASSPHRASE = "test-dev-passphrase"
 PASSWORD = "test-password"
 PROMPT = "KOMBAIN# "
+# What the setup.sh run answers.
+SETUP_USER = "alice"
+SETUP_ROOT_MIB = 40 * 1024
+SETUP_GAMER_MIB = 60 * 1024
+SETUP_DEV_MIB = 90 * 1024
+SETUP_HOST = "kombain-vm"
+SETUP_ZONE = "Europe/Berlin"
 
 SYSCTL_SETTINGS = sum(1 for line in open(os.path.join(HERE, "..", "..", "config", "sysctl.conf")) if re.match(r"[a-z]", line))
 
@@ -148,6 +161,12 @@ class Run:
             probe.bind(("127.0.0.1", 0))
             self.monitor = probe.getsockname()[1]
         self.log_path = os.path.join(opts.work, "serial.log")
+        self.user = SETUP_USER if opts.flow == "setup" else "dev"
+        self.disk_dev = "/dev/vda" if opts.disk_bus == "virtio" else "/dev/nvme0n1"
+        self.setup_output = ""
+
+    def part(self, n):
+        return f"{self.disk_dev}{'p' if self.disk_dev[-1].isdigit() else ''}{n}"
 
     # ------------------------------------------------------------ machine
 
@@ -173,7 +192,7 @@ class Run:
             "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
             "-drive", f"if=pflash,format=raw,file={self.vars}",
             "-drive", f"file={self.disk},if=none,id=disk0,format=qcow2,discard=unmap",
-            "-device", "nvme,drive=disk0,serial=kombain",
+            "-device", "nvme,drive=disk0,serial=kombain" if self.o.disk_bus == "nvme" else "virtio-blk-pci,drive=disk0",
             "-device", "virtio-vga",
             "-nic", "user,model=virtio-net-pci",
             "-device", "virtio-rng-pci",
@@ -243,10 +262,12 @@ class Run:
     def sh(self, text, timeout=900, check=True, what=None):
         """Runs a block in a subshell with `set -e`, so a failure anywhere in it is seen. Returns its output."""
         vm = self.vm
+        if self.user != "dev":  # the same checks for another user's name
+            text = text.replace("su - dev", f"su - {self.user}").replace("/home/dev", f"/home/{self.user}").replace("--autologin dev", f"--autologin {self.user}")
         marker = f"K{int(time.time() * 1000)}"
         vm.send(f"cat > /tmp/step <<'{marker}'\n{text}\n{marker}\n")
         vm.wait([re.escape(PROMPT)], 120)
-        vm.send(f"( set -e; DISK=/dev/nvme0n1; . /tmp/step ) 2>&1; echo \"{marker}=$((0+$?))=\"\n")
+        vm.send(f"( set -e; DISK={self.disk_dev}; . /tmp/step ) 2>&1; echo \"{marker}=$((0+$?))=\"\n")
         # move past the echo of the command itself: the shell prints a literal $? in it
         vm.wait([re.escape(f'{marker}=$((0+$?))=') + r'"\r?\n'], 60)
         start = vm.pos
@@ -368,6 +389,135 @@ class Run:
         self.vm = None
         self.expect("guide steps 1 to 11: installed and rebooted", True)
 
+    def install_with_setup(self):
+        """setup.sh from the live ISO, answering like a person, including the mistakes people make."""
+        lines = block("xbps-install -Sy xbps git").splitlines()
+        if lines[-1] != "./setup.sh":
+            raise Failed("the guide's setup.sh block changed")
+        self.sh(lines[0], what="guide: tools for setup.sh")
+        self.sh(f"cd /root; rm -rf kombain; git clone -q {self.o.repo} kombain; cd kombain; git checkout -q {self.o.ref}; git log -1 --format=%h", what="clone kombain")
+
+        vm = self.vm
+        vm.send("cd /root/kombain && ./setup.sh --serial; echo SETUP-EXIT=$((0+$?))=\n")
+
+        def say(pattern, answer=None, timeout=120):
+            index, m = vm.wait([pattern, r"setup\.sh: [^\n]*", r"SETUP-EXIT=(\d+)="], timeout)
+            if index != 0:
+                raise Failed(f"setup.sh stopped while waiting for {pattern!r}: {m.group(0)}\n{vm.tail()}")
+            if answer is not None:
+                vm.send(answer + "\n")
+            return m
+
+        say(r"Install on disk number \[1\]: ", "9")
+        say(r"That is not on the list")
+        say(r"Install on disk number \[1\]: ", "")
+        say(r"User name \[dev\]: ", "Bad Name")
+        say(r"Lowercase letters")
+        say(r"User name \[dev\]: ", self.user)
+        say(r"Size of / \(the system and programs\) \[[^]]*\]: ", "banana")
+        say(r"Not a size")
+        say(r"Size of / \(the system and programs\) \[[^]]*\]: ", "5G")
+        say(r"At least 20 GiB")
+        say(r"Size of / \(the system and programs\) \[[^]]*\]: ", "9T")
+        say(r"That does not fit")
+        say(r"Size of / \(the system and programs\) \[[^]]*\]: ", f"{SETUP_ROOT_MIB // 1024}G")
+        say(r"Size of /home/gamer \(games\) \[[^]]*\]: ", "9T")
+        say(r"That does not fit")
+        say(r"Size of /home/gamer \(games\) \[[^]]*\]: ", f"{SETUP_GAMER_MIB // 1024}G")
+        say(rf"Size of /home/{self.user} \(your files\) \[[^]]*\]: ", "1M")
+        say(r"At least 1 GiB")
+        say(rf"Size of /home/{self.user} \(your files\) \[[^]]*\]: ", f"{SETUP_DEV_MIB // 1024}G")
+        say(r"Is this right\? \[Y/n\]: ", "n")
+        # asked again, the last answers are the defaults
+        say(rf"Size of / \(the system and programs\) \[{SETUP_ROOT_MIB // 1024} GiB\]: ", "")
+        say(rf"Size of /home/gamer \(games\) \[{SETUP_GAMER_MIB // 1024} GiB\]: ", "")
+        say(rf"Size of /home/{self.user} \(your files\) \[{SETUP_DEV_MIB // 1024} GiB\]: ", "")
+        say(r"Is this right\? \[Y/n\]: ", "y")
+        say(r"Host name \[voidbox\]: ", "bad/name")
+        say(r"Letters, digits")
+        say(r"Host name \[voidbox\]: ", SETUP_HOST)
+        say(r"Time zone \[Europe/Moscow\]: ", "../../etc/passwd")
+        say(r"No such time zone")
+        say(r"Time zone \[Europe/Moscow\]: ", SETUP_ZONE)
+        say(r"for several \[[^]]*\]: ", "7")
+        say(r"Numbers from 1 to 5")
+        say(r"for several \[[^]]*\]: ", "")
+        wired = say(r"Use the wired network on (\S+) in the installed system\? \[Y/n\]: ", "").group(1)
+        print(f"wired interface: {wired}", flush=True)
+        say(r"Install the desktop and tools[^\n]*\[Y/n\]: ", "")
+        name = os.path.basename(self.disk_dev)
+        say(rf"Type {name} to erase it, or stop to quit: ", "yes")
+        say(r"Nothing was erased")
+        self.expect("setup.sh: nothing is touched before the disk's name is typed", self.disk_untouched())
+        say(rf"Type {name} to erase it, or stop to quit: ", name)
+        self.expect("setup.sh: every wrong answer was refused, and asked again", True)
+
+        start = vm.pos
+        patterns = [r"Remove the installation stick and press Enter to reboot: ", r"setup\.sh: [^\n]*", r"SETUP-EXIT=(\d+)=",
+                    r"[Ee]nter passphrase for ([^:\s]+):", r"Verify passphrase:", r"New password:", r"Retype new password:"]
+        mistyped_passphrase = mistyped_password = False
+        last_passphrase = ROOT_PASSPHRASE
+        while True:
+            index, m = vm.wait(patterns, 3000)
+            if index == 0:
+                break
+            if index in (1, 2):
+                raise Failed(f"setup.sh stopped: {m.group(0)}\n{vm.tail()}")
+            if index == 3:
+                last_passphrase = DEV_PASSPHRASE if m.group(1).endswith("3") else ROOT_PASSPHRASE
+                vm.send(last_passphrase + "\n")
+            elif index == 4:
+                if not mistyped_passphrase:
+                    mistyped_passphrase = True
+                    vm.send("a mistake\n")
+                else:
+                    vm.send(last_passphrase + "\n")
+            elif index == 5:
+                vm.send(PASSWORD + "\n")
+            else:
+                if not mistyped_password:
+                    mistyped_password = True
+                    vm.send("a mistake\n")
+                else:
+                    vm.send(PASSWORD + "\n")
+        self.setup_output = clean(vm.buf[start:vm.pos])
+        self.expect("setup.sh: a mistyped passphrase and password are asked again, and it goes on", mistyped_passphrase and mistyped_password)
+        self.expect("setup.sh: it finishes", True)
+        found = re.search(r"LUKS UUID (\S+)\s+the system and games", self.setup_output), re.search(r"LUKS UUID (\S+)\s+your files", self.setup_output)
+        if not all(found):
+            raise Failed("setup.sh did not report the volumes")
+        self.luks = {"root": found[0].group(1), "dev": found[1].group(1)}
+        vm.send("\n")
+        vm.wait_exit(180)
+        self.vm = None
+
+    def disk_untouched(self):
+        """The VM's disk file is checked from outside: nothing has written to it yet."""
+        info = subprocess.run(["qemu-img", "info", "-U", "--output=json", self.disk], capture_output=True, text=True)
+        return '"actual-size"' in info.stdout and int(re.search(r'"actual-size": (\d+)', info.stdout)[1]) < 1024 * 1024
+
+    def check_answers(self):
+        """What setup.sh was told is what the machine has."""
+        lvs = self.out("lvs --noheadings --nosuffix --units m -o lv_name,lv_size vg0")
+        sizes = {w[0]: float(w[1]) for w in (line.split() for line in lvs.splitlines()) if len(w) == 2}
+        print(self.out(f"lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT {self.disk_dev}; df -h / /home/gamer /home/{self.user} /boot; vgs vg0"), flush=True)
+        self.expect("setup.sh: / has the size asked for", sizes.get("root") == SETUP_ROOT_MIB, sizes)
+        self.expect("setup.sh: /home/gamer has the size asked for", sizes.get("gamer") == SETUP_GAMER_MIB, sizes)
+        self.expect(f"setup.sh: /home/{self.user} has at least the size asked for",
+                    int(self.out(f"lsblk -bdno SIZE {self.part(3)}")) // 1048576 >= SETUP_DEV_MIB, self.out(f"lsblk -bdno SIZE {self.part(3)}"))
+        free = float(self.out("vgs --noheadings --nosuffix --units m -o vg_free vg0").strip())
+        total = int(self.out(f"lsblk -bdno SIZE {self.disk_dev}")) // 1048576
+        wanted = total - 1024 - 2 * 64 - SETUP_ROOT_MIB - SETUP_GAMER_MIB - SETUP_DEV_MIB
+        self.expect("setup.sh: the rest stays free in vg0", abs(free - wanted) < 128, (free, wanted))
+        self.expect("setup.sh: the disk's names are right", self.out(f"findmnt -n -o SOURCE /boot") == self.part(1))
+        self.expect("setup.sh: the user", self.user in self.out(f"id {self.user}") and "wheel" in self.out(f"id {self.user}"))
+        self.expect("setup.sh: the user's home is theirs", self.out(f"stat -c %U /home/{self.user}") == self.user)
+        self.expect("setup.sh: the host name", self.out("cat /etc/hostname") == SETUP_HOST)
+        self.expect("setup.sh: the time zone", SETUP_ZONE in self.out("readlink /etc/localtime"))
+        wired = self.out("ls /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming | grep -c dhcpcd-")
+        self.expect("setup.sh: the wired network, in both modes", wired == "2", wired)
+        self.expect("setup.sh: no installation leftovers", self.out("ls /tmp/kombain-step 2>/dev/null; true") == "")
+
     def boot_disk(self):
         """Boots the installed system, answering LUKS prompts. Returns how many it saw."""
         self.qemu(live=False)
@@ -379,7 +529,7 @@ class Run:
                 break
             count += 1
             prompt = m.group(0)
-            word = DEV_PASSPHRASE if self.luks.get("dev", "?") in prompt or "p3" in prompt else ROOT_PASSPHRASE
+            word = DEV_PASSPHRASE if self.luks.get("dev", "?") in prompt or self.part(3) in prompt else ROOT_PASSPHRASE
             self.vm.send(word + "\n")
             print(f"answered a LUKS prompt: {prompt.strip()[:80]}", flush=True)
         self.vm.send("root\n")
@@ -393,7 +543,7 @@ class Run:
         self.expect("Dev: boots from the disk through Limine", True)
         self.expect("Dev: asks for two LUKS passphrases", prompts == 2, prompts)
         print(self.out("uname -r; cat /proc/cmdline; lsblk -o NAME,TYPE,FSTYPE,MOUNTPOINT | cut -c1-70"), flush=True)
-        self.expect("Dev: /home/dev is mounted", "/home/dev" in self.out("findmnt -n -o TARGET /home/dev"))
+        self.expect("Dev: /home/dev is mounted", self.out("findmnt -n -o TARGET /home/dev; true") != "")
         self.expect("Dev: / is XFS", self.out("findmnt -n -o FSTYPE /") == "xfs")
         self.expect("Dev: default runlevel", "default" in self.out("readlink -f /etc/runit/runsvdir/current"))
         lockdown = self.out("cat /sys/kernel/security/lockdown")
@@ -423,6 +573,9 @@ class Run:
         print(output[-800:], flush=True)
         self.sh("chsh -s /usr/local/bin/fdash dev")
         self.expect("kombain: install.sh finishes inside the real system", True)
+        self.check_kombain(output)
+
+    def check_kombain(self, output):
         self.expect("kombain: fdash, netline and zcool are installed", all(c in self.out("ls /usr/local/bin") for c in ("fdash", "netline", "zrun", "zcool")))
         self.expect("kombain: the login shell works", self.out("su - dev -c 'echo shell-$0'").startswith("shell-"))
         self.expect("kombain: sysctl applied without errors", "could not be applied" not in output, output[-300:])
@@ -539,7 +692,7 @@ class Run:
         self.expect("Gaming: asks for one LUKS passphrase", prompts == 1, prompts)
         print(self.out("cat /proc/cmdline; lsblk -o NAME,TYPE,FSTYPE,MOUNTPOINT | cut -c1-70"), flush=True)
         self.expect("Gaming: /home/dev is not mounted", self.out("findmnt -n -o TARGET /home/dev; true") == "")
-        devices = self.out("lsblk -n -o NAME,TYPE /dev/nvme0n1p3")
+        devices = self.out(f"lsblk -n -o NAME,TYPE {self.part(3)}")
         self.expect("Gaming: the Dev volume stays locked", "crypt" not in devices, devices)
         self.expect("Gaming: gaming runlevel", "gaming" in self.out("readlink -f /etc/runit/runsvdir/current"))
         self.expect("Gaming: tuning service is up", self.out("sv status /etc/sv/game-tune").startswith("run:"))
@@ -574,9 +727,16 @@ class Run:
         try:
             self.boot_live()
             if self.o.stage != "live":
-                self.install()
-                self.check_dev()
-                self.install_kombain()
+                if self.o.flow == "setup":
+                    self.install_with_setup()
+                    self.check_dev()
+                    self.check_answers()
+                    # (its sysctl message is about the live kernel: the check above is about the real one)
+                    self.check_kombain("")
+                else:
+                    self.install()
+                    self.check_dev()
+                    self.install_kombain()
                 self.check_mango()
                 self.check_gaming()
         except Failed as e:
@@ -636,6 +796,8 @@ def main():
     p.add_argument("--iso", required=True)
     p.add_argument("--work", default="vm-work")
     p.add_argument("--stage", choices=["live", "all"], default="all")
+    p.add_argument("--flow", choices=["guide", "setup"], default="guide")
+    p.add_argument("--disk-bus", choices=["nvme", "virtio"], default="nvme")
     p.add_argument("--memory", type=int, default=6144)
     p.add_argument("--cpus", type=int, default=4)
     p.add_argument("--disk-size", default="600G")
