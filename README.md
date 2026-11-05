@@ -80,6 +80,45 @@ afterwards.
 | `Super+Escape` | Power menu |
 | `Alt+Shift` | Switch between us and ru |
 
+## What it uses
+
+Measured in a VM, on the same machine and by the same script (`tests/vm/install.py`, see the
+workflow), with nothing running. A plain Void install is base-system with what void-installer
+enables, on the same kernel. It has no encryption, no firewall and no desktop.
+
+| Idle, at the console | Plain Void | kombain |
+|---|---|---|
+| Memory in use | 251 MiB | 291 MiB |
+| Processes | 29 | 34 |
+| Context switches per second | 98 | 72 |
+| Interrupts per second | 163 | 112 |
+| Written to disk in 30 s | 792 KiB | 0 |
+| Files on `/`, with the desktop's tools for kombain | 2020 MiB | 2131 MiB |
+
+The extra memory is mostly the encryption, LVM and the second file system.
+
+| Idle, on the desktop with one terminal open | Before tuning | Now |
+|---|---|---|
+| Memory in use | 486 MiB | 442 MiB |
+| Sum of process memory (RSS) | 419 MiB | 282 MiB |
+| Processes | 63 | 48 |
+| Context switches per second | 56 | 10 |
+| Interrupts per second | 104 | 25 |
+| Files on `/` | 3400 MiB | 2131 MiB |
+
+Most of the desktop's memory is mango rendering in software in this VM (154 MiB): on a real GPU it will
+differ. Real hardware, power draw and frame rates in games have not been measured.
+
+Removed or put off: Xwayland (starts with an X11 program and ends with it), rtkit and polkitd at idle
+(real-time rights for sound come from limits, and polkit starts only when something asks it), spare consoles, the
+terminal server, WirePlumber's camera and MIDI watchers, the package cache (also cleared weekly), unused
+locales, and with `setup.sh` the firmware of vendors the machine doesn't have and iwd without Wi-Fi.
+Fewer timers: no kernel watchdog or KFENCE sampling, fewer writeback and vmstat wakeups. In Dev mode idle PCI devices may sleep,
+except the GPU and USB. Gaming mode keeps everything at full speed.
+
+The programs are built with `ReleaseSafe`: it keeps bounds checks, and against `ReleaseFast` it made no measurable difference
+to the panel's frame time. `ReleaseSmall` was about ten times slower per frame for under 0.1 MiB of memory.
+
 ## Status
 
 CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
@@ -99,7 +138,8 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
   LUKS prompts, the Dev volume locked in Gaming, lockdown, firewall, every sysctl and
   service. It then runs `install.sh` there and starts mango from tty1 with netline
   and foot running fdash, and checks that the panel slides out at the screen edge, follows
-  mango's tags and shows the state of the session's PipeWire.
+  mango's tags, shows the state of the session's PipeWire and a battery from the kernel's test module, and that
+  sound still runs in real time.
 
 The VM differs from the guide in a few places: `sfdisk` instead of `cfdisk`, a serial
 console, wired network instead of iwd, and mango rendering in software on virtio-gpu.
@@ -111,9 +151,11 @@ Not checked yet:
 - **gamescope and Steam.** The VM has no Vulkan device, so gamescope stops at startup.
   Only that failure is tested: the session reports it and waits instead of restarting.
 - **Wi-Fi through iwd.**
-- **A real battery and backlight.** The VM has neither; netline's own tests use fake ones
-  in /sys, so real hardware, and elogind's path for the brightness, have not run.
+- **A real battery and backlight.** The VM has the kernel's test battery and no backlight; netline's own tests
+  use a fake one in /sys, so real hardware, and elogind's path for the brightness, have not run.
 - **Secure Boot**, step 12 of the guide.
+- **Power saving on real devices.** A device that misbehaves when asleep shows up only on real hardware. To
+  turn it off: `rm /etc/runit/core-services/91-power-save.sh`.
 - **zcool on real sensors and fans.** Real drivers and chips differ from the model,
   so start with `--dry-run`. Undervolting has not run on any CPU.
 

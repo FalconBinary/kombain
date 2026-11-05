@@ -389,7 +389,10 @@ def fans_never_drop_below_firmware(r):
     for _ in range(40):
         m.advance(0.5, limit_cpu=85)
         if get(f"{m.board_dir}/pwm2_enable") == "1":
-            lowest = min(lowest, int(get(f"{m.board_dir}/pwm2")))
+            # a plain file here, unlike sysfs: it can be read between zcool's truncate and write
+            value = get(f"{m.board_dir}/pwm2")
+            if value:
+                lowest = min(lowest, int(value))
     r.check(lowest >= 200, f"pump went to {lowest}")
     r.note(f"pump stayed at {lowest}/255 or above")
     m.stop()
