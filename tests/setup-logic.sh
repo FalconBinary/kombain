@@ -115,7 +115,7 @@ guide=$repo/docs/void-install-guide.md
 for start in 'DISK=/dev/nvme0n1|cfdisk' 'REPO=https://' 'DISK=/dev/nvme0n1|echo voidbox' 'xbps-install -y intel-ucode' \
 	'xbps-install -y mesa-dri' 'cat > /etc/fstab' 'mkdir -p /etc/dracut.conf.d' 'mkdir -p /etc/kernel.d/post-install' \
 	'mkdir -p /etc/iwd' 'IF=enp3s0' 'mkdir -p /etc/sysctl.d' 'cat > /etc/nftables.conf' 'mkdir -p /etc/sv/game-tune' \
-	'useradd -m -G wheel' 'xbps-reconfigure -fa'; do
+	'useradd -m -G wheel' 'xbps-reconfigure -fa' 'cat > /etc/modprobe.d/kombain.conf' 'doas xbps-remove -Oy'; do
 	first=${start%%|*}
 	second=
 	case $start in *'|'*) second=${start#*|} ;; esac
@@ -129,6 +129,7 @@ mkdir -p "$work/bin" "$work/net/eth9/device" "$work/pci/gpu"
 echo up >"$work/net/eth9/operstate"
 echo 0x030000 >"$work/pci/gpu/class"
 echo 0x10de >"$work/pci/gpu/vendor"
+echo 'vendor_id : GenuineIntel' >"$work/cpuinfo"
 for c in sfdisk cryptsetup pvcreate vgcreate lvcreate mkfs.xfs mkfs.vfat wipefs mount umount xchroot xbps-install reboot chroot blockdev dd; do
 	cat >"$work/bin/$c" <<EOF
 #!/bin/sh
@@ -156,7 +157,7 @@ chmod +x "$work/bin/lsblk"
 dialog() { # output file, answers...
 	out=$1
 	shift
-	printf '%s\n' "$@" | PATH="$work/bin:$PATH" KOMBAIN_NET="$work/net" KOMBAIN_PCI="$work/pci" sh "$repo/setup.sh" --dry-run >"$out" 2>&1
+	printf '%s\n' "$@" | PATH="$work/bin:$PATH" KOMBAIN_NET="$work/net" KOMBAIN_PCI="$work/pci" KOMBAIN_CPUINFO="$work/cpuinfo" sh "$repo/setup.sh" --dry-run >"$out" 2>&1
 }
 
 # ------ a full run with every kind of wrong answer first
@@ -224,6 +225,13 @@ has "in Dev" "ln -sfn /etc/sv/dhcpcd-eth9 /etc/runit/runsvdir/default/"
 has "in Gaming" "ln -sfn /etc/sv/dhcpcd-eth9 /etc/runit/runsvdir/gaming/"
 hasnt "no serial login unasked" "agetty-ttyS0"
 has "the hook's partitions" 'blkid -s UUID -o value "${DISK}2"'
+has "power saving" "/etc/runit/core-services/91-power-save.sh"
+has "the package cache goes" "xbps-remove -Oy"
+hasnt "no doas in the live system's chroot" "doas xbps-remove"
+has "no Wi-Fi here, so no iwd" "rm -f /etc/runit/runsvdir/default/iwd"
+has "no AMD here, in the CPU or the GPU" "linux-firmware-amd"
+hasnt "an Intel CPU keeps its firmware" "linux-firmware-intel"
+has "and gets its microcode" "xbps-install -y intel-ucode"
 has "the desktop is skipped when refused" "That was a dry run"
 hasnt "the desktop was refused" "install.sh --user"
 ok "a dry run calls nothing that changes a disk" "$(cat "$work/called" 2>/dev/null)" ""
@@ -241,6 +249,7 @@ has "the NVIDIA driver" "nvidia"
 has "lockdown is replaced" "nvidia_drm.modeset=1"
 has "the desktop" "./install.sh --user dev"
 has "fdash" "chsh -s /usr/local/bin/fdash dev"
+hasnt "the NVIDIA card keeps its firmware" "linux-firmware-nvidia"
 has "NVMe partitions in commands" 'cryptsetup luksFormat --batch-mode --verify-passphrase --type luks2 "${DISK}p2"'
 ok "again nothing was called" "$(cat "$work/called" 2>/dev/null)" ""
 

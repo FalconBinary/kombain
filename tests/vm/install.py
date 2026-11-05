@@ -74,11 +74,11 @@ b=$(stat_line); wb=$(written)
 echo "$a $b" | awk '{printf "metric cpu_busy_pct %.2f\nmetric context_switches_per_s %.0f\nmetric interrupts_per_s %.0f\n", ($5-$1)*100/($6-$2), ($7-$3)/30, ($8-$4)/30}'
 echo "metric disk_written_kib_30s $(( (wb-wa)/2 ))"
 awk '/^MemTotal/ {t=$2} /^MemAvailable/ {a=$2} /^Shmem:/ {s=$2} /^Slab:/ {l=$2} /^Buffers/ {b=$2} /^Cached/ {c=$2} /^KernelStack/ {k=$2} /^PageTables/ {p=$2}
-	END {printf "metric mem_used_mib %d\nmetric mem_cached_mib %d\nmetric mem_shmem_mib %d\nmetric mem_slab_mib %d\nmetric mem_kernel_stacks_tables_mib %d\n", (t-a)/1024, (b+c)/1024, s/1024, l/1024, (k+p)/1024}' /proc/meminfo
+ END {printf "metric mem_used_mib %d\nmetric mem_cached_mib %d\nmetric mem_shmem_mib %d\nmetric mem_slab_mib %d\nmetric mem_kernel_stacks_tables_mib %d\n", (t-a)/1024, (b+c)/1024, s/1024, l/1024, (k+p)/1024}' /proc/meminfo
 ps -eo ppid=,pid=,rss= | awk '$1!=2 && $2!=2 {n++; r+=$3} END {printf "metric processes %d\nmetric rss_sum_mib %d\n", n, r/1024}'
 echo "metric root_used_mib $(df -m --output=used / | tail -1 | tr -d ' ')"
 for d in /usr/lib/firmware /usr/lib/modules /usr/share/locale /usr/lib/locale /usr/share/doc /usr/share/man /usr/share/icons /var/cache/xbps /usr/lib/gcc /usr/include; do
-	[ -d "$d" ] && echo "metric du$(echo "$d" | tr / _)_mib $(du -sxm "$d" | cut -f1)"
+ [ -d "$d" ] && echo "metric du$(echo "$d" | tr / _)_mib $(du -sxm "$d" | cut -f1)"
 done
 echo "metric packages $(xbps-query -l | wc -l)"
 echo "--- largest processes (RSS KiB)"
@@ -394,6 +394,7 @@ class Run:
         self.sh(block("IF=enp3s0").replace("IF=enp3s0", "IF=eth1"), what="guide step 6: wired service")
         self.sh(block("mkdir -p /etc/sysctl.d"), what="guide step 7: sysctl")
         self.sh(block("cat > /etc/nftables.conf"), what="guide step 7: firewall and boot services")
+        self.sh(block("cat > /etc/modprobe.d/kombain.conf"), what="guide step 7: power saving and unused modules")
         self.sh(block("mkdir -p /etc/sv/game-tune"), what="guide step 8: runlevels")
         # test only: a login for this script, and the wired network the VM has instead of Wi-Fi
         self.sh("for r in default gaming; do ln -sfn /etc/sv/agetty-ttyS0 /etc/runit/runsvdir/$r/; ln -sfn /etc/sv/dhcpcd-eth0 /etc/runit/runsvdir/$r/; done")
@@ -551,6 +552,9 @@ class Run:
         wired = self.out("ls /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming | grep -c dhcpcd-")
         self.expect("setup.sh: the wired network, in both modes", wired == "2", wired)
         self.expect("setup.sh: no installation leftovers", self.out("ls /tmp/kombain-step 2>/dev/null; true") == "")
+        self.expect("setup.sh: no firmware for hardware it doesn't have", "linux-firmware-nvidia" not in self.out("xbps-query -l | grep linux-firmware; true"))
+        self.expect("setup.sh: no iwd without Wi-Fi", "iwd" not in self.out("ls /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming"))
+        self.expect("setup.sh: no package cache", int(self.out("du -sxm /var/cache/xbps | cut -f1")) < 5)
 
     def measure(self, label, settle=40):
         """What the machine uses while nothing is happening, for the summary and to compare runs."""
@@ -577,7 +581,7 @@ class Run:
         self.vm.send("xchroot /mnt /bin/bash\n")
         self.adopt_shell()
         self.sh("echo stock > /etc/hostname; sed -i -e 's/^#en_US.UTF-8/en_US.UTF-8/' /etc/default/libc-locales; xbps-reconfigure -f glibc-locales; "
-                f"echo root:{PASSWORD} | chpasswd; "
+                "passwd; "
                 "p=$DISK; case $DISK in *[0-9]) p=${DISK}p ;; esac; "
                 "printf '%s\\n' \"LABEL=root / xfs defaults 0 1\" \"UUID=$(blkid -s UUID -o value ${p}1) /boot vfat defaults 0 2\" \"tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0\" > /etc/fstab; "
                 "for s in dhcpcd sshd agetty-ttyS0; do ln -sfn /etc/sv/$s /etc/runit/runsvdir/default/; done; "
@@ -647,7 +651,8 @@ class Run:
         self.expect("Dev: zram swap is on", "zram" in self.out("swapon --show"))
         wrong = self.out(
             "grep -E '^[a-z]' /etc/sysctl.d/90-local.conf | while IFS== read -r key want; do "
-            "have=$(sysctl -n \"$key\" 2>&1); [ \"$have\" = \"$want\" ] || echo \"$key wanted $want got $have\"; done"
+            "for f in /proc/sys/$(echo \"$key\" | tr . /); do "
+            "have=$(cat \"$f\" 2>&1); [ \"$have\" = \"$want\" ] || echo \"$f wanted $want got $have\"; done; done"
         )
         self.expect("Dev: every sysctl setting is in effect", not wrong, wrong)
         self.expect("Dev: the sysctl file is complete", self.out("grep -cE '^[a-z]' /etc/sysctl.d/90-local.conf") == str(SYSCTL_SETTINGS))
@@ -656,6 +661,21 @@ class Run:
         self.expect("Dev: every enabled service is running", not down, down)
         self.expect("Dev: network is up", self.wait_network())
         self.expect("Dev: no kernel oops or module refusals", not re.search(r"Oops|BUG:|Lockdown:.*module|module verification failed", self.out("dmesg")))
+        cmdline = self.out("cat /proc/cmdline")
+        for word in ("init_on_free=1", "ia32_emulation=0", "nowatchdog", "kfence.sample_interval=0", "debugfs=off"):
+            self.expect(f"Dev: the kernel runs with {word}", word in cmdline, cmdline)
+        self.expect("Dev: no debugfs", "debugfs" not in self.out("findmnt -n -t debugfs; true"))
+        interfaces = self.out("ls /sys/class/net | grep -v lo; true").split()
+        for name in interfaces:
+            self.expect(f"Dev: redirects are off on {name} itself", self.out(f"cat /proc/sys/net/ipv4/conf/{name}/accept_redirects") == "0")
+        consoles = self.out("ls /etc/runit/runsvdir/current/ | grep -c '^agetty-tty[3-6]'; true")
+        self.expect("Dev: no spare consoles", consoles == "0", consoles)
+        self.expect("Dev: rtkit is gone", "rtkit" not in self.out("ls /etc/runit/runsvdir/current/"))
+        sleepers = self.out("for d in /sys/bus/pci/devices/*; do echo $(cat $d/class) $(cat $d/power/control); done")
+        print(sleepers, flush=True)
+        self.expect("Dev: idle PCI devices may sleep", any(l.endswith(" auto") for l in sleepers.splitlines()), sleepers[:200])
+        self.expect("Dev: not the GPU", all(l.endswith(" on") for l in sleepers.splitlines() if l.startswith("0x03")), sleepers[:200])
+        self.expect("Dev: the package locales stay out", self.out("ls /usr/share/locale | wc -l").isdigit() and int(self.out("du -sxm /usr/share/locale | cut -f1")) < 60, self.out("du -sxm /usr/share/locale"))
         self.measure("dev-console")
 
     def install_kombain(self):
@@ -667,6 +687,7 @@ class Run:
         output = self.sh("cd /root/kombain; ./install.sh --user dev", timeout=1800, what="guide step 11: install.sh")
         print(output[-800:], flush=True)
         self.sh("chsh -s /usr/local/bin/fdash dev")
+        self.sh(block("doas xbps-remove -Oy").replace("doas ", ""), what="guide step 11: package cache")
         self.expect("kombain: install.sh finishes inside the real system", True)
         self.check_kombain(output)
 
@@ -675,6 +696,7 @@ class Run:
         self.expect("kombain: the login shell works", self.out("su - dev -c 'echo shell-$0'").startswith("shell-"))
         self.expect("kombain: sysctl applied without errors", "could not be applied" not in output, output[-300:])
         self.expect("kombain: gconv cache built", "gconv-modules.cache" in self.out("ls /usr/lib/gconv/"))
+        self.expect("kombain: sound's real-time limit is there", self.out("su - dev -c 'ulimit -r'") == "88", self.out("su - dev -c 'ulimit -r'"))
         listing = self.out("zcool list")
         print(listing, flush=True)
         self.expect("zcool: list runs on the real kernel", "chip" in listing, listing[:200])
@@ -684,8 +706,8 @@ class Run:
 
     def check_mango(self):
         """mango on a real DRM device (virtio-gpu with software rendering) through the guide's own login."""
-        # a sound card for the session's PipeWire to find: the kernel's own test module
-        print(self.out("modprobe snd_dummy 2>&1; ls /proc/asound; true"), flush=True)
+        # a sound card and a battery for the panel: the kernel's own test modules, so real device events
+        print(self.out("modprobe snd_dummy 2>&1; modprobe test_power 2>&1; ls /proc/asound /sys/class/power_supply; true"), flush=True)
         self.sh(
             "cp -R /etc/sv/agetty-tty1 /etc/sv/agetty-autologin-dev-tty1; rm -f /etc/sv/agetty-autologin-dev-tty1/supervise; "
             "echo 'GETTY_ARGS=\"--autologin dev --noclear\"' >> /etc/sv/agetty-autologin-dev-tty1/conf; "
@@ -748,6 +770,17 @@ class Run:
         self.zctl("mute")
         time.sleep(1)
 
+        self.expect("zctl: finds the battery", "battery 50 " in status, status)
+        # a change in the kernel: through the real udevd and the panel's filter on its broadcast
+        before = self.screenshot("mango-battery-before")
+        self.sh("echo 12 > /sys/module/test_power/parameters/battery_capacity")
+        for _ in range(5):
+            after = self.screenshot("mango-battery-after")
+            if items(before) != items(after):
+                break
+        self.expect("netline: a real battery event reaches the icon", items(before) != items(after))
+        self.expect("zctl: reads the new charge", "battery 12 " in self.zctl("status"), self.zctl("status"))
+
         # the menu on mango: it comes out from under the panel by cropping, and takes the keyboard
         card = lambda rows: [row[1000 * 3:1260 * 3] for row in rows[60:140]]
         closed = self.screenshot("mango-before-menu")
@@ -779,10 +812,17 @@ class Run:
         self.expect("netline: comes out for a volume change", body(peek) != body(gone))
         time.sleep(2.5)
         self.expect("netline: and goes back", body(self.screenshot("mango-after-peek")) == body(gone))
+        procs = self.out("ps -eo comm=")
+        self.expect("idle: no Xwayland without X11 programs", "Xwayland" not in procs)
+        self.expect("idle: no polkitd", "polkitd" not in procs)
+        self.expect("idle: no rtkit", "rtkit" not in procs)
+        threads = self.out("ps -eLo cls=,comm= | grep -E 'data-loop|pipewire' | sort -u")
+        print(threads, flush=True)
+        self.expect("sound still runs in real time, without rtkit", re.search(r"^\s*(RR|FF)\s", threads, flags=re.M), threads)
         self.measure("dev-desktop")
 
     def check_gaming(self):
-        self.sh("sed -i 's/^timeout: 3/timeout: 3\\ndefault_entry: 2/' /boot/limine.conf; grep -n default_entry /boot/limine.conf")
+        self.sh("sed -i 's/^timeout: .*/&\\ndefault_entry: 2/' /boot/limine.conf; grep -n default_entry /boot/limine.conf")
         self.vm.send("reboot\n")
         self.vm.wait_exit(180)
         self.vm = None

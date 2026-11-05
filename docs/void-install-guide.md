@@ -25,6 +25,8 @@ cd kombain
 - **размеры** `/`, `/home/gamer` и `/home/ПОЛЬЗОВАТЕЛЬ`: `80G`, `500M` или `1.5T`, а Enter принимает значение, рассчитанное под ваш диск. Что осталось, остаётся свободным в `vg0`, чтобы потом увеличить `/` или `/home/gamer`: XFS нельзя уменьшить;
 - **имя машины, часовой пояс, драйвер видеокарты** (карту он определит сам), **сеть** и **ставить ли рабочий стол**.
 
+Заодно он убирает то, что этой машине не нужно: прошивки чужих производителей (NVIDIA, AMD или Intel, если их нет ни в процессоре, ни в видеокарте) и `iwd`, если нет Wi-Fi. Если потом поставите такую видеокарту, удалите `/etc/xbps.d/11-firmware.conf` и выполните `xbps-install -Su linux-firmware`. Для Wi-Fi: `ln -s /etc/sv/iwd /etc/runit/runsvdir/default/`.
+
 До ввода имени диска ничего не меняется. Вопросы на английском: в консоли live ISO нет кириллического шрифта. Пароли LUKS и пароли пользователей вы вводите прямо в `cryptsetup` и `passwd`: скрипт их не видит. Только пароль Wi-Fi, если он его спросит, сохраняется для `iwd` на зашифрованном диске.
 
 `./setup.sh --dry-run` задаст те же вопросы и покажет все команды, ничего не меняя.
@@ -114,9 +116,10 @@ mount /dev/mapper/cryptdev /mnt/home/dev
 
 ```bash
 REPO=https://repo-default.voidlinux.org/current
-mkdir -p /mnt/var/db/xbps/keys
+mkdir -p /mnt/var/db/xbps/keys /mnt/etc/xbps.d
 cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
-XBPS_ARCH=x86_64 xbps-install -S -r /mnt -R "$REPO" base-system cryptsetup lvm2 xfsprogs zstd limine efibootmgr iwd openresolv dbus elogind polkit rtkit chrony nftables zramen snooze run-parts opendoas xtools git pipewire wireplumber flatpak gamescope void-repo-nonfree
+printf 'noextract=%s\n' '/usr/share/locale/*' '!/usr/share/locale/ru/*' '!/usr/share/locale/en*' > /mnt/etc/xbps.d/20-noextract.conf
+XBPS_ARCH=x86_64 xbps-install -S -r /mnt -R "$REPO" base-system cryptsetup lvm2 xfsprogs zstd limine efibootmgr iwd openresolv dbus elogind polkit chrony nftables zramen snooze run-parts opendoas xtools git pipewire wireplumber flatpak gamescope void-repo-nonfree
 cp /etc/resolv.conf /mnt/etc/
 xchroot /mnt /bin/bash
 ```
@@ -199,8 +202,8 @@ SECUREBOOT=0
 ROOT_UUID=ROOT-UUID
 DEV_UUID=DEV-UUID
 
-COMMON="rd.luks.uuid=$ROOT_UUID rd.lvm.vg=vg0 root=/dev/vg0/root rootfstype=xfs rw quiet loglevel=3 slab_nomerge page_alloc.shuffle=1 zswap.enabled=0 lockdown=integrity"
-DEV_CMD="rd.luks.uuid=$DEV_UUID $COMMON"
+COMMON="rd.luks.uuid=$ROOT_UUID rd.lvm.vg=vg0 root=/dev/vg0/root rootfstype=xfs rw quiet loglevel=3 slab_nomerge page_alloc.shuffle=1 zswap.enabled=0 lockdown=integrity nowatchdog kfence.sample_interval=0 debugfs=off"
+DEV_CMD="rd.luks.uuid=$DEV_UUID $COMMON init_on_free=1 ia32_emulation=0"
 GAME_CMD="$COMMON gaming preempt=full split_lock_detect=off"
 
 BOOT=/boot
@@ -230,7 +233,7 @@ done
 newest=$(echo $kernels | cut -d' ' -f1)
 
 {
-	printf 'timeout: 3\neditor_enabled: no\n\n'
+	printf 'timeout: 2\neditor_enabled: no\n\n'
 	entry "Void Dev" "$newest" "$DEV_CMD"
 	entry "Void Gaming" "$newest" "$GAME_CMD"
 	for v in $kernels; do
@@ -259,6 +262,8 @@ mkdir -p /boot/EFI/BOOT
 cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/
 efibootmgr --create --disk "$DISK" --part 1 --label "Limine" --loader '\EFI\BOOT\BOOTX64.EFI'
 ```
+
+Параметры ядра: `nowatchdog` и `kfence.sample_interval=0` убирают регулярные пробуждения процессора, `debugfs=off` закрывает отладочную файловую систему. Только в Dev: `init_on_free=1` стирает освобождённую память (данные не остаются в RAM, это стоит немного скорости, поэтому в Gaming его нет) и `ia32_emulation=0` отключает 32-битный вход в ядро (Steam и игры работают в Gaming, где он остаётся). Для запуска 32-битных программ в Dev уберите этот параметр.
 
 **Только для NVIDIA:** модули DKMS не подписаны, а `lockdown=integrity` их не загрузит. В строке `COMMON` замените `lockdown=integrity` на `nvidia_drm.modeset=1`.
 
@@ -307,17 +312,31 @@ fs.protected_regular=2
 fs.suid_dumpable=0
 net.core.bpf_jit_harden=2
 net.ipv4.tcp_syncookies=1
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv6.conf.all.accept_redirects=0
+net.ipv4.conf.*.rp_filter=1
+net.ipv4.conf.*.accept_redirects=0
+net.ipv4.conf.*.secure_redirects=0
+net.ipv4.conf.*.send_redirects=0
+net.ipv4.conf.*.accept_source_route=0
+net.ipv6.conf.*.accept_redirects=0
+net.ipv6.conf.*.accept_source_route=0
+net.ipv4.tcp_rfc1337=1
+dev.tty.ldisc_autoload=0
+kernel.io_uring_disabled=2
+vm.unprivileged_userfaultfd=0
+vm.mmap_rnd_bits=32
 
 # Performance
 vm.max_map_count=1048576
 vm.swappiness=100
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+
+# Fewer wakeups and disk writes while idle; zram needs no read-ahead
+vm.dirty_writeback_centisecs=1500
+vm.stat_interval=10
+vm.compaction_proactiveness=0
+vm.page-cluster=0
+vm.watermark_boost_factor=0
 EOF
 printf 'tcp_bbr\nsch_fq\n' > /etc/modules-load.d/bbr.conf
 ```
@@ -398,6 +417,68 @@ chmod +x /etc/cron.weekly/fstrim
 mkdir -p /etc/pipewire/pipewire.conf.d
 ln -s /usr/share/examples/wireplumber/10-wireplumber.conf /etc/pipewire/pipewire.conf.d/
 ln -s /usr/share/examples/pipewire/20-pipewire-pulse.conf /etc/pipewire/pipewire.conf.d/
+
+mkdir -p /etc/wireplumber/wireplumber.conf.d
+cat > /etc/wireplumber/wireplumber.conf.d/10-kombain.conf <<'EOF'
+# Only sound: nothing here watches cameras or MIDI devices, which takes memory and wakeups.
+# Programs can still use a camera directly.
+wireplumber.profiles = {
+  main = {
+    monitor.libcamera = disabled
+    monitor.v4l2 = disabled
+    monitor.alsa-midi = disabled
+    monitor.bluez-midi = disabled
+  }
+}
+EOF
+
+mkdir -p /etc/security/limits.d
+cat > /etc/security/limits.d/90-audio.conf <<'EOF'
+# Real-time scheduling for sound, without rtkit and the polkit it brings along.
+@audio - rtprio 88
+@audio - nice -11
+@audio - memlock 4194304
+EOF
+```
+
+Экономия энергии и лишние модули. Сервис работает один раз при загрузке и только в Dev: в Gaming всё остаётся на полной скорости. USB и видеокарта не трогаются, потому что с ними чаще всего бывают проблемы.
+
+```bash
+cat > /etc/modprobe.d/kombain.conf <<'EOF'
+# The sound card sleeps after 10 s of silence
+options snd_hda_intel power_save=10
+# Beeps, and hardware watchdogs nobody is listening to
+blacklist pcspkr
+blacklist iTCO_wdt
+blacklist sp5100_tco
+# Rare network protocols: a known source of kernel holes, and nothing here uses them
+install dccp /bin/false
+install sctp /bin/false
+install rds /bin/false
+install tipc /bin/false
+install n-hdlc /bin/false
+install ax25 /bin/false
+install netrom /bin/false
+install x25 /bin/false
+install rose /bin/false
+install appletalk /bin/false
+install atm /bin/false
+EOF
+
+cat > /etc/runit/core-services/91-power-save.sh <<'EOF'
+# Lets idle devices sleep, once at boot. Dev mode only; not the GPU or USB, where this can misbehave.
+if ! grep -qw gaming /proc/cmdline; then
+	for dev in /sys/bus/pci/devices/*; do
+		case $(cat "$dev/class") in
+		0x03* | 0x0c03*) ;;
+		*) echo auto > "$dev/power/control" 2>/dev/null || : ;;
+		esac
+	done
+	for host in /sys/class/scsi_host/*/link_power_management_policy; do
+		[ -e "$host" ] && { echo med_power_with_dipm > "$host" 2>/dev/null || : ; }
+	done
+fi
+EOF
 ```
 
 ## 8. Два режима: runlevel
@@ -420,14 +501,13 @@ GETTY_ARGS="--autologin gamer --noclear"
 EOF
 
 mkdir -p /etc/runit/runsvdir/gaming
-for s in udevd dbus elogind rtkit iwd chronyd zramen game-tune agetty-autologin-tty1 agetty-tty2; do
+for s in udevd dbus elogind iwd chronyd zramen game-tune agetty-autologin-tty1 agetty-tty2; do
 	ln -sfn "/etc/sv/$s" /etc/runit/runsvdir/gaming/
 done
 
-for s in udevd dbus elogind rtkit iwd chronyd zramen snooze-weekly; do
+for s in udevd dbus elogind iwd chronyd zramen snooze-weekly; do
 	ln -sfn "/etc/sv/$s" /etc/runit/runsvdir/default/
 done
-rm -f /etc/runit/runsvdir/default/agetty-tty4 /etc/runit/runsvdir/default/agetty-tty5 /etc/runit/runsvdir/default/agetty-tty6
 ls -l /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming
 ```
 
@@ -478,6 +558,11 @@ chmod 700 /home/dev /home/gamer
 
 ```bash
 xbps-reconfigure -fa
+# Spare consoles. Reconfiguring brings their links back, and so can an update: `down` keeps them off then.
+for n in 3 4 5 6; do
+	rm -f "/etc/runit/runsvdir/default/agetty-tty$n"
+	touch "/etc/sv/agetty-tty$n/down"
+done
 ls -l /boot /boot/EFI/BOOT
 grep -E '^/|cmdline' /boot/limine.conf
 ```
@@ -517,6 +602,12 @@ git clone https://github.com/FalconBinary/kombain
 cd kombain
 doas ./install.sh --user dev
 doas chsh -s /usr/local/bin/fdash dev
+```
+
+Кэш скачанных пакетов занимает больше гигабайта, и в установленной системе он не нужен:
+
+```bash
+doas xbps-remove -Oy
 ```
 
 После выхода и нового входа на `tty1` запустится mango. Терминал открывается по `Alt+Return`, приложения по `Super+D`, Wi-Fi по `Super+W`.

@@ -489,8 +489,32 @@ step_settings() {
 }
 
 step_microcode() {
-	grep -q GenuineIntel /proc/cpuinfo 2>/dev/null || return 0
+	cpu_is GenuineIntel || return 0
 	block 'xbps-install -y intel-ucode'
+}
+
+# Firmware for hardware this machine doesn't have: hundreds of MiB that nothing would ever load.
+has_vendor() { # PCI vendor of a display adapter
+	for dev in "${KOMBAIN_PCI:-/sys/bus/pci/devices}"/*; do
+		[ -e "$dev/class" ] || continue
+		case $(cat "$dev/class") in 0x03*) ;; *) continue ;; esac
+		[ "$(cat "$dev/vendor")" = "$1" ] && return 0
+	done
+	return 1
+}
+
+cpu_is() {
+	grep -q "$1" "${KOMBAIN_CPUINFO:-/proc/cpuinfo}" 2>/dev/null
+}
+
+step_firmware() {
+	drop=
+	has_vendor 0x10de || drop="$drop linux-firmware-nvidia"
+	has_vendor 0x1002 || cpu_is AuthenticAMD || drop="$drop linux-firmware-amd"
+	has_vendor 0x8086 || cpu_is GenuineIntel || drop="$drop linux-firmware-intel"
+	[ -n "$drop" ] || return 0
+	echo "printf 'ignorepkg=%s\\n'$drop > /etc/xbps.d/11-firmware.conf"
+	echo "xbps-remove -Ry$drop"
 }
 
 step_gpu() {
@@ -540,6 +564,8 @@ step_links() {
 	for r in default gaming; do
 		[ -z "$wired" ] || echo "ln -sfn /etc/sv/dhcpcd-$wired /etc/runit/runsvdir/$r/"
 		[ "$serial" -eq 0 ] || echo "ln -sfn /etc/sv/agetty-ttyS0 /etc/runit/runsvdir/$r/"
+		# (iwd only handles Wi-Fi)
+		has_wifi || echo "rm -f /etc/runit/runsvdir/$r/iwd"
 	done
 	echo :
 }
@@ -596,6 +622,7 @@ prepare_steps() {
 	s_disk=$(step_disk)
 	s_base=$(step_base)
 	s_settings=$(step_settings)
+	s_firmware=$(step_firmware)
 	s_microcode=$(step_microcode)
 	s_gpu=$(step_gpu)
 	s_fstab=$(step_fstab)
@@ -605,6 +632,7 @@ prepare_steps() {
 	s_wired=$(step_wired)
 	s_sysctl=$(block 'mkdir -p /etc/sysctl.d')
 	s_firewall=$(adapt "$(block 'cat > /etc/nftables.conf')")
+	s_power=$(block 'cat > /etc/modprobe.d/kombain.conf')
 	s_runlevels=$(block 'mkdir -p /etc/sv/game-tune')
 	s_links=$(step_links)
 	s_users=$(step_users)
@@ -612,6 +640,8 @@ prepare_steps() {
 	s_boot=$(block 'xbps-reconfigure -fa')
 	s_verify=$(step_verify)
 	s_desktop=$(step_desktop)
+	s_clean=$(block 'doas xbps-remove -Oy')
+	s_clean=${s_clean#doas }
 }
 
 live() { # name, commands
@@ -695,6 +725,7 @@ install_system() {
 		cp -R "$here" /mnt/root/kombain
 	fi
 	chrooted "System settings (step 4); now a password for root" "$s_settings"
+	chrooted "Firmware for hardware this machine doesn't have" "$s_firmware"
 	chrooted "CPU microcode" "$s_microcode"
 	chrooted "Graphics drivers" "$s_gpu"
 	chrooted "fstab" "$s_fstab"
@@ -704,6 +735,7 @@ install_system() {
 	chrooted "Wired network" "$s_wired"
 	chrooted "Kernel settings (step 7)" "$s_sysctl"
 	chrooted "Firewall and boot services" "$s_firewall"
+	chrooted "Power saving and unused modules" "$s_power"
 	chrooted "The two modes (step 8)" "$s_runlevels"
 	chrooted "Services for this machine" "$s_links"
 	chrooted "Users (step 9)" "$s_users"
@@ -711,6 +743,7 @@ install_system() {
 	chrooted "Kernel and boot menu (step 10)" "$s_boot"
 	chrooted "Checking that it will boot" "$s_verify"
 	chrooted "Desktop and tools: install.sh (several minutes)" "$s_desktop"
+	chrooted "Removing the package cache" "$s_clean"
 }
 
 finish() {
