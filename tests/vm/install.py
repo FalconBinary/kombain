@@ -472,6 +472,10 @@ class Run:
         self.check_panel_modules(body, tag4)
         self.sh("rm -f /etc/runit/runsvdir/default/agetty-autologin-dev-tty1; ln -s /etc/sv/agetty-tty1 /etc/runit/runsvdir/default/")
 
+    def cursor(self):
+        """Where mango says the pointer is. foot runs under mango, so it has mango's address."""
+        return self.out("su - dev -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); MANGO_INSTANCE_SIGNATURE=$(tr \"\\0\" \"\\n\" </proc/$(pgrep -o -x foot)/environ | sed -n s/^MANGO_INSTANCE_SIGNATURE=//p) mmsg get cursorpos 2>&1' 2>&1; true")
+
     def zctl(self, *words):
         return self.out("su - dev -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) zctl " + " ".join(words) + "' 2>&1; true")
 
@@ -511,7 +515,10 @@ class Run:
         self.expect("zctl: Esc closes it", self.out("pgrep -x zctl; true") == "")
         self.expect("zctl: the card is gone", card(self.screenshot("mango-menu-closed")) == card(closed))
 
-        self.monitor_cmd("mouse_move 0 400")
+        print("pointer on the panel:", self.cursor(), flush=True)
+        for _ in range(6):
+            self.monitor_cmd("mouse_move 0 100")
+            print("pointer moved down:", self.cursor(), flush=True)
         time.sleep(2.5)
         gone = self.screenshot("mango-panel-gone")
         self.expect("netline: goes back when the pointer leaves", body(gone) != body(hidden_from))
