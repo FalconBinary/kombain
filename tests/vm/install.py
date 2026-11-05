@@ -209,9 +209,10 @@ class Run:
         self.monitor_cmd(f"screendump {ppm}")
         time.sleep(1)
         png = os.path.join(self.o.work, name + ".png")
-        write_png(ppm, png)
+        rows = write_png(ppm, png)
         os.unlink(ppm)
         print(f"screenshot: {png}", flush=True)
+        return rows
 
     # ------------------------------------------------------------ shell
 
@@ -373,7 +374,7 @@ class Run:
         self.o.root_password = PASSWORD
         count = 0
         while True:
-            index, m = self.vm.wait([r"(?:[Ee]nter passphrase for|Password \(?)[^\n:]*:?\s*$|assphrase[^\n]*: *$", r"login: $"], self.o.boot_timeout)
+            index, m = self.vm.wait([r"(?:[Ee]nter passphrase for|Password \(?)[^\n:]*:?\s*$|assphrase[^\n]*: *$", r"login: "], self.o.boot_timeout)
             if index == 1:
                 break
             count += 1
@@ -451,12 +452,15 @@ class Run:
         print(terms, flush=True)
         self.expect("mango: Alt+Return opens a terminal with fdash", "fdash" in terms, terms)
         self.screenshot("mango-terminal")
-        # Mango sets the signature after it starts, so only its children have it in environ
+        # Tags 3 and 4 are both empty, so only netline can make these two frames differ
         self.monitor_cmd("sendkey ctrl-3")
         time.sleep(3)
-        tags = self.out("su - dev -c 'export XDG_RUNTIME_DIR=/run/user/$(id -u); MANGO_INSTANCE_SIGNATURE=$(tr \"\\0\" \"\\n\" </proc/$(pgrep -o -x netline)/environ | sed -n s/^MANGO_INSTANCE_SIGNATURE=//p) mmsg get all-tags 2>&1 | head -24'")
-        print(tags, flush=True)
-        self.screenshot("mango-tag3")
+        tag3 = self.screenshot("mango-tag3")
+        self.monitor_cmd("sendkey ctrl-4")
+        time.sleep(3)
+        tag4 = self.screenshot("mango-tag4")
+        strip = lambda rows: [row[40 * 3:210 * 3] for row in rows[12:34]]
+        self.expect("netline: follows the tag mango switched to", strip(tag3) != strip(tag4))
         self.sh("rm -f /etc/runit/runsvdir/default/agetty-autologin-dev-tty1; ln -s /etc/sv/agetty-tty1 /etc/runit/runsvdir/default/")
 
     def check_gaming(self):
@@ -548,7 +552,8 @@ def write_png(ppm_path, png_path):
         pos = end
     pos += 1
     width, height = int(fields[1]), int(fields[2])
-    raw = b"".join(b"\0" + data[pos + y * width * 3:pos + (y + 1) * width * 3] for y in range(height))
+    rows = [data[pos + y * width * 3:pos + (y + 1) * width * 3] for y in range(height)]
+    raw = b"".join(b"\0" + row for row in rows)
 
     def chunk(kind, body):
         return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
@@ -556,6 +561,7 @@ def write_png(ppm_path, png_path):
     with open(png_path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
                 + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+    return rows
 
 
 def main():
