@@ -305,8 +305,10 @@ cat > /etc/nftables.conf <<'EOF'
 # Nothing comes in unless it answers something we started, nothing is forwarded,
 # everything may go out. Open a port with a line in the input chain:
 #   tcp dport 22 accept
-flush ruleset
-table inet filter {
+# Only this table is replaced: rules of other programs stay. Containers with their own
+# network still need a forward rule here, because this chain drops what is not allowed.
+destroy table inet kombain
+table inet kombain {
   chain input {
     type filter hook input priority 0; policy drop;
     ct state vmap { established : accept, related : accept, invalid : drop }
@@ -333,8 +335,8 @@ msg "Loading firewall..."
 if ! nft -f /etc/nftables.conf; then
 	msg_warn "/etc/nftables.conf did not load, using the built-in rules"
 	nft -f - <<'RULES' || msg_error "NO FIREWALL: nft could not load any rules"
-flush ruleset
-table inet filter {
+destroy table inet kombain
+table inet kombain {
   chain input {
     type filter hook input priority 0; policy drop;
     ct state vmap { established : accept, related : accept, invalid : drop }

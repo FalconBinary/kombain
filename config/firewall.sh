@@ -6,8 +6,8 @@ msg "Loading firewall..."
 if ! nft -f /etc/nftables.conf; then
 	msg_warn "/etc/nftables.conf did not load, using the built-in rules"
 	nft -f - <<'RULES' || msg_error "NO FIREWALL: nft could not load any rules"
-flush ruleset
-table inet filter {
+destroy table inet kombain
+table inet kombain {
   chain input {
     type filter hook input priority 0; policy drop;
     ct state vmap { established : accept, related : accept, invalid : drop }

@@ -138,6 +138,16 @@ check "without the rule: router advert blocked" 0 "$($fw ip -6 route show defaul
 check "without the rule: IPv6 out breaks" dropped "$($fw $probe tcp fd99::2 443 | sed 's/^error.*/dropped/')"
 check "without the rule: IPv4 out still works" OPEN "$($fw $probe tcp 10.99.0.2 443)"
 
+echo "--- rules of other programs survive loading the firewall"
+clear_rules
+$fw nft add table inet other
+$fw nft add chain inet other keep
+cp "$repo/config/nftables.conf" /etc/nftables.conf
+boot_service >/dev/null
+boot_service >/dev/null
+check "another program's table is still there" 1 "$($fw nft list tables | grep -c 'inet other')"
+check "loading twice leaves one table of ours" 1 "$($fw nft list tables | grep -c 'inet kombain')"
+
 echo "--- typo in /etc/nftables.conf"
 clear_rules
 printf 'table inet filter {\n  chain input { type filter hook input priority 0; polcy drop; }\n}\n' >/etc/nftables.conf

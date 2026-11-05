@@ -754,7 +754,7 @@ fn tickMs() i64 {
     for (chips[0..nchips]) |*c| {
         if (c.controlled() and (c.thermal.forecast() > c.limit - control.fan_band or c.throttle.level < 1)) return 250;
     }
-    return 1000;
+    return 500;
 }
 
 fn onStop(_: std.os.linux.SIG) callconv(.c) void {

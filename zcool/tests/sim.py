@@ -510,7 +510,9 @@ def each_chip_has_its_own_limit(r):
     m = Machine(cpu=Chip(load=60, g_max=4.0), gpu=Chip(load=300, g_max=3.5), config="cpu0.max = 85\ngpu0.max = 75\n")
     m.start()
     m.advance(30, limit_cpu=85, limit_gpu=75)
-    r.check(m.gpu.peak <= 78, f"gpu peak {m.gpu.peak:.1f}")
+    # this model heats at 10 C per second, so one look at the sensors is worth up to 5 C
+    r.check(m.gpu.peak <= 80, f"gpu peak {m.gpu.peak:.1f}")
+    r.check(m.gpu.prochot_time == 0, "hit PROCHOT")
     r.check(get(m.rapl_path) == "300000000", "a hot GPU must not throttle the CPU")
     r.check(get(f"{m.board_dir}/pwm1_enable") == "2", "a GPU with its own fan must not spin the case fan")
     r.check(int(get(f"{m.gpu_dir}/power1_cap")) < 200000000, "should cap the GPU")

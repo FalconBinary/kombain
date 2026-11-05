@@ -242,7 +242,7 @@ class Run:
         vm.wait([re.escape(PROMPT)], 120)
         vm.send(f"( set -e; DISK=/dev/nvme0n1; . /tmp/step ) 2>&1; echo \"{marker}=$((0+$?))=\"\n")
         # move past the echo of the command itself: the shell prints a literal $? in it
-        vm.wait([re.escape(f'{marker}=$((0+$?))=')], 60)
+        vm.wait([re.escape(f'{marker}=$((0+$?))=') + r'"\r?\n'], 60)
         start = vm.pos
         patterns = [rf"{marker}=(\d+)=", r"\[Y/n\]", r"capital letters\):", r"[Ee]nter passphrase for ([^:\s]+):",
                     r"Verify passphrase:", r"(New|Retype new) password:"]
@@ -283,11 +283,19 @@ class Run:
         self.login(self.o.boot_timeout)
         self.expect("the live ISO boots to a shell over serial", True)
         print(self.out("uname -m; uname -r; cat /sys/class/net/*/operstate | tr '\\n' ' '; ls /sys/firmware/efi >/dev/null && echo uefi; lsblk -d -o NAME,SIZE | tail -3"), flush=True)
-        for _ in range(30):
-            if "rc=0" in self.out("xbps-query -R --show xbps >/dev/null 2>&1; echo rc=$?"):
-                break
-            time.sleep(2)
-        self.expect("the live ISO reaches the Void repository", "rc=0" in self.out("xbps-install -S >/dev/null 2>&1; echo rc=$?"))
+        self.expect("the live ISO has a working network", self.wait_network())
+
+    def wait_network(self, seconds=90):
+        """Real name resolution: xbps-install -S exits 0 without a network. Says why when it fails."""
+        start = time.time()
+        while time.time() - start < seconds:
+            if "net-yes" in self.out("getent hosts github.com >/dev/null && echo net-yes || echo net-no"):
+                print(f"network ready after {time.time() - start:.0f} s", flush=True)
+                return True
+            time.sleep(3)
+        print(self.out("ls -l /etc/resolv.conf; cat /etc/resolv.conf; ip -br addr; ip route; for s in dhcpcd dhcpcd-eth0; do sv status /etc/sv/$s 2>&1; done; "
+                       "ps -eo comm | grep -E 'dhcpcd|iwd|resolvconf' | sort -u; ls /etc/runit/runsvdir/current/ | tr '\\n' ' '; nft list ruleset | head -30"), flush=True)
+        return False
 
     def install(self):
         self.sh(block("sv down sshd"))
@@ -391,7 +399,7 @@ class Run:
         services = self.out("for s in /etc/runit/runsvdir/current/*; do sv status \"$s\" | cut -d: -f1,2 | head -1; done")
         down = [l for l in services.splitlines() if l and not l.startswith("run:")]
         self.expect("Dev: every enabled service is running", not down, down)
-        self.expect("Dev: network is up", "rc=0" in self.out("xbps-install -S >/dev/null 2>&1; echo rc=$?"))
+        self.expect("Dev: network is up", self.wait_network())
         self.expect("Dev: no kernel oops or module refusals", not re.search(r"Oops|BUG:|Lockdown:.*module|module verification failed", self.out("dmesg")))
 
     def install_kombain(self):
