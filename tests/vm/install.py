@@ -780,7 +780,8 @@ class Run:
         before = self.screenshot("mango-battery-before")
         self.sh("echo 12 > /sys/module/test_power/parameters/battery_capacity")
         changed = False
-        for _ in range(5):
+        # software rendering in a busy VM has kept the whole screen seconds behind before
+        for _ in range(10):
             after = self.screenshot("mango-battery-after")
             if battery(before) != battery(after):
                 changed = True
