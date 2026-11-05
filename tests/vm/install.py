@@ -35,6 +35,8 @@ DEV_PASSPHRASE = "test-dev-passphrase"
 PASSWORD = "test-password"
 PROMPT = "KOMBAIN# "
 
+SYSCTL_SETTINGS = sum(1 for line in open(os.path.join(HERE, "..", "..", "config", "sysctl.conf")) if re.match(r"[a-z]", line))
+
 FIRMWARE = [
     ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
     ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
@@ -127,6 +129,9 @@ def block(start):
     found = [b for b in guide_blocks() if b.startswith(start)]
     if len(found) != 1:
         raise Failed(f"expected one guide block starting with {start!r}, found {len(found)}")
+    # Before the locale exists, bash takes these bytes for Meta keys and eats the next line.
+    if not found[0].isascii():
+        raise Failed(f"the guide block starting with {start!r} must be plain ASCII")
     return found[0]
 
 
@@ -230,7 +235,7 @@ class Run:
 
     def adopt_shell(self):
         time.sleep(1)
-        self.vm.send(f"export PS1='{PROMPT}' TERM=dumb; stty cols 200; echo ADOPT$((40+2))\n")
+        self.vm.send(f"export PS1='{PROMPT}' TERM=dumb PAGER=cat GIT_PAGER=cat; stty cols 200; echo ADOPT$((40+2))\n")
         self.vm.wait([r"ADOPT42"], 120)
         self.vm.wait([re.escape(PROMPT)], 60)
 
@@ -395,7 +400,12 @@ class Run:
         ruleset = self.out("nft list ruleset")
         self.expect("Dev: firewall loaded with a drop policy", ruleset.count("policy drop") == 2, ruleset[:200])
         self.expect("Dev: zram swap is on", "zram" in self.out("swapon --show"))
-        self.expect("Dev: sysctl hardening applied", self.out("sysctl -n kernel.kptr_restrict") == "2")
+        wrong = self.out(
+            "grep -E '^[a-z]' /etc/sysctl.d/90-local.conf | while IFS== read -r key want; do "
+            "have=$(sysctl -n \"$key\" 2>&1); [ \"$have\" = \"$want\" ] || echo \"$key wanted $want got $have\"; done"
+        )
+        self.expect("Dev: every sysctl setting is in effect", not wrong, wrong)
+        self.expect("Dev: the sysctl file is complete", self.out("grep -cE '^[a-z]' /etc/sysctl.d/90-local.conf") == str(SYSCTL_SETTINGS))
         services = self.out("for s in /etc/runit/runsvdir/current/*; do sv status \"$s\" | cut -d: -f1,2 | head -1; done")
         down = [l for l in services.splitlines() if l and not l.startswith("run:")]
         self.expect("Dev: every enabled service is running", not down, down)

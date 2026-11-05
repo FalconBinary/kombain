@@ -20,7 +20,7 @@
 Скачайте **base**-образ x86_64 (glibc, не musl), `sha256sum.txt` и `sha256sum.sig` с `https://repo-default.voidlinux.org/live/current/`. Ключ `void-release-*.pub` возьмите из каталога `void-release-keys` в Git-репозитории Void.
 
 ```bash
-minisign -V -p void-release-ДАТА.pub -x sha256sum.sig -m sha256sum.txt
+minisign -V -p void-release-DATE.pub -x sha256sum.sig -m sha256sum.txt
 shasum -a 256 -c sha256sum.txt --ignore-missing
 ```
 
@@ -39,7 +39,7 @@ sv down sshd
 Wi-Fi (по кабелю сеть поднимется сама):
 
 ```bash
-wpa_passphrase "ИМЯ_СЕТИ" "ПАРОЛЬ" >> /etc/wpa_supplicant/wpa_supplicant.conf
+wpa_passphrase "NETWORK_NAME" "PASSWORD" >> /etc/wpa_supplicant/wpa_supplicant.conf
 sv restart wpa_supplicant
 sv restart dhcpcd
 ping -c3 repo-default.voidlinux.org
@@ -57,7 +57,7 @@ DISK=/dev/nvme0n1
 cfdisk -z "$DISK"
 
 cryptsetup luksFormat --type luks2 "${DISK}p2"
-cryptsetup luksFormat --type luks2 "${DISK}p3"   # другой пароль
+cryptsetup luksFormat --type luks2 "${DISK}p3"   # a different passphrase
 cryptsetup open --allow-discards --perf-no_read_workqueue --perf-no_write_workqueue --persistent "${DISK}p2" cryptroot
 cryptsetup open --allow-discards --perf-no_read_workqueue --perf-no_write_workqueue --persistent "${DISK}p3" cryptdev
 
@@ -166,7 +166,7 @@ EOF
 mkdir -p /etc/kernel.d/post-install /etc/kernel.d/post-remove
 cat > /etc/kernel.d/post-install/60-limine <<'HOOK'
 #!/bin/sh
-# Пересобирает limine.conf; при SECUREBOOT=1 добавляет хэши, вписывает хэш конфига в Limine и подписывает его
+# Rebuilds limine.conf. With SECUREBOOT=1 it adds file hashes, enrolls the config hash in Limine and signs it
 SECUREBOOT=0
 ROOT_UUID=ROOT-UUID
 DEV_UUID=DEV-UUID
@@ -210,7 +210,7 @@ newest=$(echo $kernels | cut -d' ' -f1)
 	done
 } > "$OUT.tmp" || exit 1
 
-# Конфиг и Limine заменяются только вместе: при сбое подписи загрузка остаётся рабочей
+# The config and Limine are replaced together: if signing fails, booting still works
 mkdir -p "$BOOT/EFI/BOOT"
 cp /usr/share/limine/BOOTX64.EFI "$EFI.new" || exit 1
 if [ "$SECUREBOOT" = 1 ]; then
@@ -265,7 +265,7 @@ sed -i "s/eth0/$IF/g" "/etc/sv/dhcpcd-$IF/run"
 ```bash
 mkdir -p /etc/sysctl.d /etc/modules-load.d
 cat > /etc/sysctl.d/90-local.conf <<'EOF'
-# Защита
+# Protection
 kernel.kptr_restrict=2
 kernel.dmesg_restrict=1
 kernel.unprivileged_bpf_disabled=1
@@ -285,7 +285,7 @@ net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.all.accept_source_route=0
 net.ipv6.conf.all.accept_redirects=0
 
-# Производительность
+# Performance
 vm.max_map_count=1048576
 vm.swappiness=100
 net.core.default_qdisc=fq
@@ -466,7 +466,7 @@ dmesg | grep -i microcode
 swapon --show
 iwctl station wlan0 scan
 iwctl station wlan0 get-networks
-iwctl station wlan0 connect "ИМЯ_СЕТИ"
+iwctl station wlan0 connect "NETWORK_NAME"
 ```
 
 Ожидается `[integrity]` в первом выводе (кроме NVIDIA), активная таблица файрвола и zram в `swapon`. Имя `wlan0` может быть другим, его покажет `iwctl device list`.
