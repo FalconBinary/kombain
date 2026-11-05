@@ -106,7 +106,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { title: by the guide, flow: guide, bus: nvme, size: 600G, artifact: vm-install }
+          - { title: by the guide, flow: guide, bus: nvme, size: 600G, artifact: vm-install, extra: --secure-boot }
           - { title: by setup.sh, flow: setup, bus: virtio, size: 200G, artifact: vm-setup }
           - { title: of plain Void to compare with, flow: stock, bus: nvme, size: 200G, artifact: vm-stock }
     steps:
@@ -127,7 +127,7 @@ jobs:
         run: |
           python3 tests/vm/install.py --iso "$RUNNER_TEMP/$ISO" --work "$RUNNER_TEMP/vm" \
             --repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --ref "$GITHUB_SHA" --boot-timeout 300 \
-            --flow ${{ matrix.flow }} --disk-bus ${{ matrix.bus }} --disk-size ${{ matrix.size }}
+            --flow ${{ matrix.flow }} --disk-bus ${{ matrix.bus }} --disk-size ${{ matrix.size }} ${{ matrix.extra }}
       - name: Keep the console log and the screens
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

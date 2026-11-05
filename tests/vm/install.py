@@ -54,6 +54,11 @@ SETUP_ZONE = "Europe/Berlin"
 
 SYSCTL_SETTINGS = sum(1 for line in open(os.path.join(HERE, "..", "..", "config", "sysctl.conf")) if re.match(r"[a-z]", line))
 
+# Firmware that can enforce Secure Boot, starting in setup mode: no keys until step 12 enrolls them.
+SECURE_FIRMWARE = ("/usr/share/OVMF/OVMF_CODE_4M.secboot.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd")
+WIFI_SSID = "kombain-wifi"
+WIFI_PASSPHRASE = "test-wifi-passphrase"
+
 FIRMWARE = [
     ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
     ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
@@ -199,6 +204,7 @@ class Run:
         self.setup_output = ""
         self.metrics = {}
         self.boot_times = {}
+        self.live_radio = False
 
     def part(self, n):
         return f"{self.disk_dev}{'p' if self.disk_dev[-1].isdigit() else ''}{n}"
@@ -206,6 +212,10 @@ class Run:
     # ------------------------------------------------------------ machine
 
     def firmware(self):
+        if self.o.secure_boot:
+            if not all(os.path.exists(f) for f in SECURE_FIRMWARE):
+                raise Failed("no Secure Boot firmware found")
+            return SECURE_FIRMWARE
         for code, varsfile in FIRMWARE:
             if os.path.exists(code) and os.path.exists(varsfile):
                 return code, varsfile
@@ -220,7 +230,7 @@ class Run:
             subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", self.disk, self.o.disk_size], check=True)
         kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
         args = [
-            "qemu-system-x86_64", "-machine", "q35,vmport=off", "-m", str(self.o.memory), "-smp", str(self.o.cpus),
+            "qemu-system-x86_64", "-machine", "q35,vmport=off" + (",smm=on" if self.o.secure_boot else ""), "-m", str(self.o.memory), "-smp", str(self.o.cpus),
             "-accel", "kvm" if kvm else "tcg", "-cpu", "host" if kvm else "max",
             "-display", "none", "-serial", "stdio", "-no-reboot",
             "-monitor", f"tcp:127.0.0.1:{self.monitor},server=on,wait=off",
@@ -232,6 +242,9 @@ class Run:
             "-nic", "user,model=virtio-net-pci",
             "-device", "virtio-rng-pci",
         ]
+        if self.o.secure_boot:
+            # the firmware's variables, keys among them, must be out of the guest's reach outside SMM
+            args += ["-global", "driver=cfi.pflash01,property=secure,value=on"]
         if live:
             kernel, initrd = self.extract_boot()
             args += ["-kernel", kernel, "-initrd", initrd, "-append", LIVE_ARGS, "-cdrom", self.o.iso]
@@ -431,6 +444,9 @@ class Run:
         if lines[-1] != "./setup.sh":
             raise Failed("the guide's setup.sh block changed")
         self.sh(lines[0], what="guide: tools for setup.sh")
+        # test only: a radio, so setup.sh asks for a Wi-Fi network and saves it for the installed system
+        self.live_radio = "hwsim" in self.out("modprobe mac80211_hwsim radios=1 2>&1 && echo hwsim; true")
+        print(f"radio in the live system: {self.live_radio}", flush=True)
         self.sh(f"cd /root; rm -rf kombain; git clone -q {self.o.repo} kombain; cd kombain; git checkout -q {self.o.ref}; git log -1 --format=%h", what="clone kombain")
 
         vm = self.vm
@@ -480,6 +496,9 @@ class Run:
         say(r"for several \[[^]]*\]: ", "")
         wired = say(r"Use the wired network on (\S+) in the installed system\? \[Y/n\]: ", "").group(1)
         print(f"wired interface: {wired}", flush=True)
+        if self.live_radio:
+            say(r"Wi-Fi network to join at first boot \(empty: none\): ", WIFI_SSID)
+            say(r"Its password: ", WIFI_PASSPHRASE)
         say(r"Install the desktop and tools[^\n]*\[Y/n\]: ", "")
         name = os.path.basename(self.disk_dev)
         say(rf"Type {name} to erase it, or stop to quit: ", "yes")
@@ -554,7 +573,12 @@ class Run:
         self.expect("setup.sh: the wired network, in both modes", wired == "2", wired)
         self.expect("setup.sh: no installation leftovers", self.out("ls /tmp/kombain-step 2>/dev/null; true") == "")
         self.expect("setup.sh: no firmware for hardware it doesn't have", "linux-firmware-nvidia" not in self.out("xbps-query -l | grep linux-firmware; true"))
-        self.expect("setup.sh: no iwd without Wi-Fi", "iwd" not in self.out("ls /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming"))
+        if self.live_radio:
+            saved = self.out(f"ls /var/lib/iwd; stat -c '%a %U' '/var/lib/iwd/{WIFI_SSID}.psk'")
+            self.expect("setup.sh: the Wi-Fi network is saved for iwd, readable by root alone", f"{WIFI_SSID}.psk" in saved and "600 root" in saved, saved)
+            self.expect("setup.sh: iwd is kept with a radio", "iwd" in self.out("ls /etc/runit/runsvdir/default"))
+        else:
+            self.expect("setup.sh: no iwd without Wi-Fi", "iwd" not in self.out("ls /etc/runit/runsvdir/default /etc/runit/runsvdir/gaming"))
         self.expect("setup.sh: no package cache", int(self.out("du -sxm /var/cache/xbps | cut -f1")) < 5)
 
     def measure(self, label, settle=40):
@@ -591,7 +615,7 @@ class Run:
                 "printf 'timeout: 0\\n\\n/Void\\n    protocol: linux\\n    path: boot():/vmlinuz-%s\\n    cmdline: root=LABEL=root rw quiet loglevel=3 console=tty0 console=ttyS0,115200\\n    module_path: boot():/initramfs-%s.img\\n' $v $v > /boot/limine.conf; "
                 "mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs none /sys/firmware/efi/efivars; "
                 "mkdir -p /boot/EFI/BOOT; cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/; "
-                "efibootmgr --create --disk $DISK --part 1 --label Limine --loader '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'",
+                "efibootmgr --create --disk $DISK --part 1 --label Limine --loader '\\EFI\\BOOT\\BOOTX64.EFI'",
                 timeout=1200, what="stock: settings")
         self.vm.send("exit\n")
         self.adopt_shell()
@@ -835,6 +859,114 @@ class Run:
         print(threads, flush=True)
         self.expect("sound still runs in real time, without rtkit", re.search(r"^\s*(RR|FF)\s", threads, flags=re.M), threads)
         self.measure("dev-desktop")
+        self.check_wifi()
+
+    def check_wifi(self):
+        """A Wi-Fi network from the kernel's radio simulator, its access point in a network namespace of its
+        own, so iwd here sees only the client side. The guide's way is iwctl; setup.sh's is the file it saved."""
+        if "hwsim" not in self.out("modprobe mac80211_hwsim radios=2 2>&1 && echo hwsim; true"):
+            self.expect("Wi-Fi: the kernel can simulate radios", False)
+            return
+        time.sleep(3)
+        phys = self.out("ls /sys/class/ieee80211").split()
+        print(f"radios: {phys}", flush=True)
+        icon = lambda rows: [row[1150 * 3:1186 * 3] for row in rows[8:38]]
+        before = self.screenshot("wifi-before")
+        self.sh("xbps-install -Sy hostapd dnsmasq iw >/dev/null", timeout=600, what="test only: an access point")
+        self.sh(
+            f"ip netns add ap; iw phy {phys[-1]} set netns name ap; sleep 1; "
+            "dev=$(ip netns exec ap ls /sys/class/net | grep -v lo | head -1); "
+            "ip netns exec ap ip link set lo up; ip netns exec ap ip addr add 10.42.0.1/24 dev $dev; "
+            f"printf 'interface=%s\\ndriver=nl80211\\nssid={WIFI_SSID}\\nhw_mode=g\\nchannel=6\\nwpa=2\\nwpa_key_mgmt=WPA-PSK\\nrsn_pairwise=CCMP\\nwpa_passphrase={WIFI_PASSPHRASE}\\n' $dev > /tmp/ap.conf; "
+            "ip netns exec ap hostapd -B /tmp/ap.conf >/tmp/hostapd.log 2>&1; "
+            "ip netns exec ap dnsmasq --interface=$dev --bind-interfaces --dhcp-range=10.42.0.10,10.42.0.50 --no-resolv --pid-file=/tmp/dnsmasq.pid",
+            what="test only: the access point")
+        dev = self.out("for d in /sys/class/net/*; do [ -e $d/phy80211 ] && basename $d; done | head -1")
+        print(f"iwd's device: {dev}", flush=True)
+        if self.o.flow == "guide":
+            # what the guide tells a person to type after the first boot
+            self.sh(f"iwctl station {dev} scan; sleep 4; iwctl station {dev} get-networks; iwctl --passphrase '{WIFI_PASSPHRASE}' station {dev} connect {WIFI_SSID}; true")
+        state = ""
+        for _ in range(30):
+            state = self.out(f"iw dev {dev} link; true")
+            if f"SSID: {WIFI_SSID}" in state:
+                break
+            time.sleep(2)
+        print(state, flush=True)
+        how = "with iwctl, as the guide says" if self.o.flow == "guide" else "on its own, with what setup.sh saved"
+        self.expect(f"Wi-Fi: iwd connects {how}", f"SSID: {WIFI_SSID}" in state, state)
+        address = ""
+        for _ in range(15):
+            address = self.out(f"ip -4 -o addr show {dev} | awk '{{print $4}}'; true")
+            if address.startswith("10.42.0."):
+                break
+            time.sleep(2)
+        self.expect("Wi-Fi: iwd gets an address on its own", address.startswith("10.42.0."), address)
+        self.expect("Wi-Fi: the network answers", "1 received" in self.out("ping -c1 -W3 10.42.0.1; true"))
+        after = None
+        for _ in range(5):
+            after = self.screenshot("wifi-connected")
+            if icon(before) != icon(after):
+                break
+        self.expect("netline: the Wi-Fi icon shows the connection", icon(before) != icon(after))
+
+    def try_unsigned_loader(self):
+        """Boots once from a copy of Limine that nobody signed. Returns whether it was what booted."""
+        self.sh("mkdir -p /boot/EFI/test; cp /usr/share/limine/BOOTX64.EFI /boot/EFI/test/unsigned.efi; "
+                "efibootmgr | grep -q ' unsigned' || "
+                f"efibootmgr --create --disk {self.disk_dev} --part 1 --label unsigned --loader '\\EFI\\test\\unsigned.efi' >/dev/null; "
+                "n=$(efibootmgr | awk '/ unsigned/ {print substr($1, 5, 4); exit}'); efibootmgr --bootnext $n >/dev/null; efibootmgr | head -4")
+        self.vm.send("reboot\n")
+        self.vm.wait_exit(180)
+        self.vm = None
+        self.boot_disk()
+        booted = self.out("efibootmgr | grep -E 'BootCurrent|unsigned|Limine'")
+        print(booted, flush=True)
+        current = re.search(r"BootCurrent: (\w+)", booted)
+        unsigned = re.search(r"Boot(\w+)\*? unsigned", booted)
+        return bool(current and unsigned and current.group(1) == unsigned.group(1))
+
+    def check_secure_boot(self):
+        """Step 12 of the guide, in a firmware that enforces Secure Boot once it has keys, then two ways
+        an attacker with the disk would try: a bootloader of their own, and a changed kernel."""
+        self.boot_disk()
+        # the control: before step 12 this unsigned copy boots, so the entry itself is fine
+        self.expect("Secure Boot off: an unsigned bootloader still boots (the entry works)", self.try_unsigned_loader())
+        status = self.out("sbctl status 2>&1; true")
+        print(status, flush=True)
+        lines = block("doas xbps-install -Sy sbctl").splitlines()
+        self.sh("\n".join(line.replace("doas ", "", 1) for line in lines), timeout=900, what="guide step 12: Secure Boot keys")
+        conf = self.out("cat /boot/limine.conf")
+        self.expect("Secure Boot: the boot menu holds hashes of the kernel and initramfs", conf.count("#") >= 4, conf[:300])
+        self.vm.send("reboot\n")
+        self.vm.wait_exit(180)
+        self.vm = None
+
+        prompts = self.boot_disk()
+        status = self.out("sbctl status 2>&1; true")
+        print(status, flush=True)
+        self.expect("Secure Boot: on after the guide's step 12", re.search(r"Secure Boot:\s+\S*\s*Enabled", status), status)
+        self.expect("Secure Boot: Dev still asks for two passphrases", prompts == 2, prompts)
+        self.expect("Secure Boot: the kernel knows", "secure boot enabled" in self.out("dmesg | grep -i 'secure boot'; true").lower())
+
+        # The same unsigned copy, now: the firmware must refuse it and go on to the signed Limine.
+        self.expect("Secure Boot: an unsigned bootloader is refused, and the signed Limine boots instead", not self.try_unsigned_loader())
+
+        # The kernel changed by one byte: Limine checks it against the hash in its signed config.
+        self.sh("for k in /boot/vmlinuz-*; do printf x >> $k; done")
+        self.vm.send("reboot\n")
+        self.vm.wait_exit(180)
+        self.vm = None
+        self.qemu(live=False)
+        try:
+            index, _ = self.vm.wait([r"(?:[Ee]nter passphrase for|Password \(?)", r"login: "], 120)
+            refused = False
+        except Failed:
+            refused = True
+        self.screenshot("secure-boot-changed-kernel")
+        self.expect("Secure Boot: a kernel changed by one byte does not boot", refused)
+        self.vm.kill()
+        self.vm = None
 
     def check_gaming(self):
         self.sh("sed -i 's/^timeout: .*/&\\ndefault_entry: 2/' /boot/limine.conf; grep -n default_entry /boot/limine.conf")
@@ -897,6 +1029,8 @@ class Run:
                     self.install_kombain()
                 self.check_mango()
                 self.check_gaming()
+                if self.o.secure_boot:
+                    self.check_secure_boot()
         except Failed as e:
             self.expect("the run reached its end", False, e)
             print(str(e), flush=True)
@@ -958,6 +1092,7 @@ def main():
     p.add_argument("--stage", choices=["live", "all"], default="all")
     p.add_argument("--flow", choices=["guide", "setup", "stock"], default="guide")
     p.add_argument("--disk-bus", choices=["nvme", "virtio"], default="nvme")
+    p.add_argument("--secure-boot", action="store_true", help="firmware that enforces Secure Boot, and step 12 at the end")
     p.add_argument("--memory", type=int, default=6144)
     p.add_argument("--cpus", type=int, default=4)
     p.add_argument("--disk-size", default="600G")
