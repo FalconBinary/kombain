@@ -1,0 +1,5 @@
+--recursive	Remove unneeded dependencies too
+--clean-cache	Clean the package cache
+--remove-orphans	Remove orphans
+--yes	Assume yes
+--dry-run	Show what would happen

@@ -27,6 +27,7 @@ ic_private void   tty_free(tty_t* tty);
 
 ic_private bool   tty_is_utf8(const tty_t* tty);
 ic_private bool   tty_start_raw(tty_t* tty);
+ic_private bool   tty_has_input(tty_t* tty);
 ic_private void   tty_end_raw(tty_t* tty);
 ic_private code_t tty_read(tty_t* tty);
 ic_private bool   tty_read_timeout(tty_t* tty, long timeout_ms, code_t* c );

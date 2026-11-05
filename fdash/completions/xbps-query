@@ -1,0 +1,8 @@
+--search	Search packages
+--repository	Query repositories too
+--files	List package files
+--show	Show package details
+--list-pkgs	List installed packages
+--list-manual-pkgs	List manually installed packages
+--ownedby	Find the package owning a file
+--revdeps	Show reverse dependencies

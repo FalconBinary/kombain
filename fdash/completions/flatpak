@@ -1,0 +1,9 @@
+install	Install an application
+uninstall	Remove an application
+update	Update applications
+list	List installed applications
+run	Run an application
+search	Search remotes
+remote-add	Add a remote
+override	Change application permissions
+info	Show details of an application

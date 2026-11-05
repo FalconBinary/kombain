@@ -220,3 +220,17 @@ __lookupalias(const char *name) {
 
 	return app;
 }
+
+#ifdef FDASH
+void
+fdash_listaliases(void (*fn)(const char *, void *), void *arg)
+{
+	int i;
+	struct alias *ap;
+
+	for (i = 0; i < ATABSIZE; i++)
+		for (ap = atab[i]; ap; ap = ap->next)
+			if (!(ap->flag & ALIASDEAD))
+				fn(ap->name, arg);
+}
+#endif

@@ -670,3 +670,15 @@ findvar(const char *name)
 	}
 	return vpp;
 }
+
+#ifdef FDASH
+/* Sets $status for the prompt: a readonly one must not raise an error at every prompt. */
+void
+fdash_setstatus(int status)
+{
+	struct var *vp = *findvar("status");
+
+	if (!vp || !(vp->flags & VREADONLY))
+		setvarint("status", status, 0);
+}
+#endif

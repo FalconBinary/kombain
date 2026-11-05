@@ -1,0 +1,51 @@
+# [subcommand ...] word<TAB>description
+add	Stage changes
+bisect	Find a commit that introduced a bug
+blame	Show who last changed each line
+branch	List, create or delete branches
+checkout	Switch branches or restore files
+clone	Clone a repository
+commit	Record staged changes
+diff	Show changes
+fetch	Download from a remote
+init	Create a repository
+log	Show commit history
+merge	Join histories
+mv	Move a tracked file
+pull	Fetch and integrate
+push	Update a remote
+rebase	Reapply commits on another base
+reflog	Show where references have been
+remote	Manage remotes
+reset	Move the current branch
+restore	Restore working tree files
+revert	Undo a commit with a new one
+rm	Remove tracked files
+show	Show an object
+stash	Set changes aside
+status	Show the working tree state
+switch	Switch branches
+tag	Manage tags
+worktree	Manage extra working trees
+add --patch	Choose hunks interactively
+add --all	Stage everything
+commit --amend	Replace the last commit
+commit --message	Set the message
+commit --all	Stage tracked changes first
+commit --fixup	Prepare a fixup commit
+diff --staged	Compare the index with HEAD
+diff --stat	Show a summary
+log --oneline	One line per commit
+log --graph	Draw the commit graph
+log --stat	Show changed files
+push --force-with-lease	Force only over what you have seen
+push --set-upstream	Remember the remote branch
+push --tags	Push tags too
+rebase --interactive	Edit the commit list
+rebase --continue	Go on after a conflict
+rebase --abort	Stop and go back
+reset --hard	Discard working tree changes
+reset --soft	Keep changes staged
+stash pop	Apply and drop the last stash
+stash list	List stashes
+stash push	Save changes

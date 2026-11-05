@@ -44,6 +44,9 @@
 
 #include "shell.h"
 #include "parser.h"
+#ifdef FDASH
+#include "fdash.h"
+#endif
 #include "nodes.h"
 #include "expand.h"	/* defines rmescapes() */
 #include "exec.h"	/* defines find_builtin() */
@@ -1714,6 +1717,11 @@ setprompt(int which)
 	show = 1;
 #else
 	show = !el;
+#endif
+#ifdef FDASH
+	/* the line editor draws the prompt itself */
+	if (fdash_active())
+		show = 0;
 #endif
 	if (show) {
 		pushstackmark(&smark, stackblocksize());

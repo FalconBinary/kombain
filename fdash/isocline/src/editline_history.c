@@ -15,14 +15,25 @@ static void edit_history_at(ic_env_t* env, editor_t* eb, int ofs )
     history_update(env->history, sbuf_string(eb->input)); // update first entry if modified
     eb->history_idx = 0;          // and start again 
     eb->modified = false;    
+    mem_free(env->mem, eb->hprefix);
+    eb->hprefix = mem_strdup(env->mem, sbuf_string(eb->input));
   }
-  const char* entry = history_get(env->history,eb->history_idx + ofs);
+  // fdash: up and down only visit entries starting with what was typed, as in fish
+  const char* prefix = (eb->hprefix != NULL ? eb->hprefix : "");
+  const size_t plen = strlen(prefix);
+  const char* current = sbuf_string(eb->input);
+  ssize_t idx = eb->history_idx;
+  const char* entry;
+  do {
+    idx += ofs;
+    entry = history_get(env->history,idx);
+  } while (entry != NULL && idx != 0 && (strncmp(entry,prefix,plen) != 0 || strcmp(entry,current) == 0));
   // debug_msg( "edit: history: at: %d + %d, found: %s\n", eb->history_idx, ofs, entry);
   if (entry == NULL) {
     term_beep(env->term);
   }
   else {
-    eb->history_idx += ofs;
+    eb->history_idx = idx;
     sbuf_replace(eb->input, entry);
     if (ofs > 0) {
       // at end of first line when scrolling up

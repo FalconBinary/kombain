@@ -7,13 +7,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "../include/isocline.h"
 #include "common.h"
 #include "history.h"
 #include "stringbuf.h"
 
-#define IC_MAX_HISTORY (200)
+#define IC_MAX_HISTORY (100000)
 
 struct history_s {
   ssize_t  count;              // current number of entries in use
@@ -22,6 +24,7 @@ struct history_s {
   const char*  fname;         // history file
   alloc_t* mem;
   bool     allow_duplicates;   // allow duplicate entries?
+  off_t    read_off;           // fdash: how much of the history file has been read
 };
 
 ic_private history_t* history_new(alloc_t* mem) {
@@ -182,35 +185,34 @@ static bool ic_isxdigit( int c ) {
   return ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || (c >= '0' && c <= '9'));
 }
 
-static bool history_read_entry( history_t* h, FILE* f, stringbuf_t* sbuf ) {
+// fdash: decodes one line of the history file
+static bool history_decode_entry( const char* s, stringbuf_t* sbuf ) {
   sbuf_clear(sbuf);
-  while( !feof(f)) {
-    int c = fgetc(f);
-    if (c == EOF || c == '\n') break;
+  while (*s != 0) {
+    int c = (uint8_t)*s++;
     if (c == '\\') {
-      c = fgetc(f);
+      c = (uint8_t)*s;
+      if (c != 0) s++;
       if (c == 'n')       { sbuf_append(sbuf,"\n"); }
-      else if (c == 'r')  { /* ignore */ }  // sbuf_append(sbuf,"\r");
+      else if (c == 'r')  { /* ignore */ }
       else if (c == 't')  { sbuf_append(sbuf,"\t"); }
       else if (c == '\\') { sbuf_append(sbuf,"\\"); }
       else if (c == 'x') {
-        int c1 = fgetc(f);
-        int c2 = fgetc(f);
+        int c1 = (uint8_t)s[0];
+        int c2 = (c1 != 0 ? (uint8_t)s[1] : 0);
         if (ic_isxdigit(c1) && ic_isxdigit(c2)) {
-          char chr = from_xdigit(c1)*16 + from_xdigit(c2);
-          sbuf_append_char(sbuf,chr);
+          s += 2;
+          sbuf_append_char(sbuf, from_xdigit(c1)*16 + from_xdigit(c2));
         }
         else return false;
       }
       else return false;
     }
-    else if (c == '\r') { /* ignore */ }
-    else {
+    else if (c != '\r') {
       sbuf_append_char(sbuf,(char)c);
     }
   }
-  if (sbuf_len(sbuf)==0 || sbuf_string(sbuf)[0] == '#') return true;
-  return history_push(h, sbuf_string(sbuf));
+  return true;
 }
 
 static bool history_write_entry( const char* entry, FILE* f, stringbuf_t* sbuf ) {
@@ -240,33 +242,149 @@ static bool history_write_entry( const char* entry, FILE* f, stringbuf_t* sbuf )
   return true;
 }
 
-ic_private void history_load( history_t* h ) {
-  if (h->fname == NULL) return;
-  FILE* f = fopen(h->fname, "r");
-  if (f == NULL) return;
-  stringbuf_t* sbuf = sbuf_new(h->mem);
-  if (sbuf != NULL) {
-    while (!feof(f)) {
-      if (!history_read_entry(h,f,sbuf)) break; // error
+// fdash: reads `size` bytes from `off`; the buffer ends in a 0 and must be freed by the caller
+static char* history_read_file( history_t* h, off_t off, off_t* size ) {
+  int fd = open(h->fname, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return NULL;
+  struct stat st;
+  char* buf = NULL;
+  if (fstat(fd,&st) == 0 && st.st_size >= off && lseek(fd,off,SEEK_SET) == off) {
+    size_t want = (size_t)(st.st_size - off);
+    buf = (char*)mem_malloc(h->mem, (ssize_t)want + 1);
+    if (buf != NULL) {
+      size_t got = 0;
+      while (got < want) {
+        ssize_t n = read(fd, buf + got, want - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+      }
+      buf[got] = 0;
+      *size = off + (off_t)got;
     }
-    sbuf_free(sbuf);
   }
-  fclose(f);
+  close(fd);
+  return buf;
 }
 
-ic_private void history_save( const history_t* h ) {
+static uint32_t history_hash( const char* s ) {
+  uint32_t x = 2166136261u;
+  for (; *s != 0; s++) { x = (x ^ (uint8_t)*s) * 16777619u; }
+  return x;
+}
+
+// fdash: walks the file newest first with a hash set of seen lines, so a large history loads in O(n)
+ic_private void history_load( history_t* h ) {
+  if (h->fname == NULL || h->len <= 0) return;
+  off_t size = 0;
+  char* buf = history_read_file(h, 0, &size);
+  if (buf == NULL) return;
+  h->read_off = size;
+  ssize_t nlines = 0;
+  for (char* p = buf; *p != 0; p++) { if (*p == '\n') nlines++; }
+  nlines++;
+  char** lines = (char**)mem_malloc(h->mem, nlines * (ssize_t)sizeof(char*));
+  ssize_t nslots = 2*nlines + 1;
+  int32_t* slots = (int32_t*)mem_zalloc(h->mem, nslots * (ssize_t)sizeof(int32_t));
+  stringbuf_t* sbuf = sbuf_new(h->mem);
+  if (lines != NULL && slots != NULL && sbuf != NULL) {
+    ssize_t n = 0;
+    for (char* p = buf; p != NULL && *p != 0; ) {
+      lines[n++] = p;
+      p = strchr(p,'\n');
+      if (p != NULL) { *p++ = 0; }
+    }
+    ssize_t kept = 0;
+    for (ssize_t i = n-1; i >= 0 && kept < h->len; i--) {
+      if (lines[i][0] == 0 || lines[i][0] == '#') continue;
+      ssize_t slot = (ssize_t)(history_hash(lines[i]) % (uint32_t)nslots);
+      bool dup = false;
+      while (slots[slot] != 0) {
+        if (strcmp(lines[slots[slot]-1], lines[i]) == 0) { dup = true; break; }
+        slot = (slot + 1) % nslots;
+      }
+      if (dup) continue;
+      slots[slot] = (int32_t)(i+1);
+      if (history_decode_entry(lines[i],sbuf) && sbuf_len(sbuf) > 0) {
+        h->elems[h->len - ++kept] = mem_strdup(h->mem, sbuf_string(sbuf));
+      }
+    }
+    if (kept < h->len) { memmove(h->elems, h->elems + (h->len - kept), (size_t)kept * sizeof(char*)); }
+    h->count = kept;
+    // the file only ever grows between loads: drop old and duplicate lines once it doubled
+    if (n > 2*kept + 64) { history_save(h); }
+  }
+  sbuf_free(sbuf);
+  mem_free(h->mem, slots);
+  mem_free(h->mem, lines);
+  mem_free(h->mem, buf);
+}
+
+// fdash: rewrites the file atomically
+ic_private void history_save( history_t* h ) {
   if (h->fname == NULL) return;
-  FILE* f = fopen(h->fname, "w");
-  if (f == NULL) return;
-  #ifndef _WIN32
-  chmod(h->fname,S_IRUSR|S_IWUSR);
-  #endif
+  stringbuf_t* tmp = sbuf_new(h->mem);
+  stringbuf_t* sbuf = sbuf_new(h->mem);
+  if (tmp != NULL && sbuf != NULL) {
+    char pid[32];
+    snprintf(pid, sizeof(pid), ".%ld.tmp", (long)getpid());
+    sbuf_replace(tmp, h->fname);
+    sbuf_append(tmp, pid);
+    int fd = open(sbuf_string(tmp), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR|S_IWUSR);
+    FILE* f = (fd >= 0 ? fdopen(fd,"w") : NULL);
+    if (f != NULL) {
+      for (ssize_t i = 0; i < h->count; i++) {
+        if (!history_write_entry(h->elems[i],f,sbuf)) break;
+      }
+      bool ok = (fflush(f) == 0);
+      off_t end = ftello(f);
+      fclose(f);
+      if (ok && rename(sbuf_string(tmp), h->fname) == 0) { h->read_off = end; }
+      else { unlink(sbuf_string(tmp)); }
+    }
+  }
+  sbuf_free(sbuf);
+  sbuf_free(tmp);
+}
+
+// fdash: appends the newest entry; one O_APPEND write keeps lines of concurrent shells intact
+ic_private void history_append_last( history_t* h ) {
+  if (h->fname == NULL || h->count <= 0) return;
+  int fd = open(h->fname, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR|S_IWUSR);
+  if (fd < 0) return;
+  FILE* f = fdopen(fd,"a");
+  stringbuf_t* sbuf = sbuf_new(h->mem);
+  if (f != NULL && sbuf != NULL) { history_write_entry(h->elems[h->count-1],f,sbuf); }
+  sbuf_free(sbuf);
+  if (f != NULL) { fclose(f); } else { close(fd); }
+}
+
+// fdash: picks up what other running shells appended since the last look
+ic_private void history_sync( history_t* h ) {
+  if (h->fname == NULL || h->len <= 0) return;
+  struct stat st;
+  if (stat(h->fname,&st) != 0 || st.st_size == h->read_off) return;
+  if (st.st_size < h->read_off) {
+    history_clear(h);
+    h->read_off = 0;
+    history_load(h);
+    return;
+  }
+  off_t size = h->read_off;
+  char* buf = history_read_file(h, h->read_off, &size);
+  if (buf == NULL) return;
   stringbuf_t* sbuf = sbuf_new(h->mem);
   if (sbuf != NULL) {
-    for( int i = 0; i < h->count; i++ )  {
-      if (!history_write_entry(h->elems[i],f,sbuf)) break;  // error
+    char* p = buf;
+    char* nl;
+    while ((nl = strchr(p,'\n')) != NULL) {
+      *nl = 0;
+      if (p[0] != 0 && p[0] != '#' && history_decode_entry(p,sbuf) && sbuf_len(sbuf) > 0) {
+        history_push(h, sbuf_string(sbuf));
+      }
+      p = nl + 1;
     }
+    h->read_off += (off_t)(p - buf);   // a partial last line is read again next time
     sbuf_free(sbuf);
   }
-  fclose(f);
+  mem_free(h->mem, buf);
 }

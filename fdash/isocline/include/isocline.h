@@ -140,6 +140,25 @@ void ic_history_clear(void);
 /// Add an entry to the history
 void ic_history_add( const char* entry );
 
+/// fdash: entry `idx` of the history, 0 being the newest; NULL when out of range.
+const char* ic_history_get( long idx );
+
+/// fdash: number of history entries.
+long ic_history_count(void);
+
+/// fdash: expansion hook for abbreviations: called on space and enter with the input and cursor.
+/// Returns the replacement for input[*start..pos), or NULL to leave the input alone.
+typedef const char* (ic_abbr_fun_t)( const char* input, long pos, long* start, void* arg );
+
+/// fdash: set the abbreviation hook.
+void ic_set_abbr_expander( ic_abbr_fun_t* fun, void* arg );
+
+/// fdash: true while completers are asked for a suggestion instead of a tab press.
+bool ic_completion_is_hint(void);
+
+/// fdash: set the character that continues a line on enter (0 disables it).
+void ic_set_multiline_eol( char eol );
+
 /// \}
 
 //--------------------------------------------------------------

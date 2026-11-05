@@ -1,0 +1,21 @@
+# ~/.config/fdash/config.sh: runs in every interactive fdash, never in scripts.
+
+# Commands fish users expect
+alias source=.
+alias ll='ls -la'
+alias la='ls -A'
+
+# Abbreviations expand in place on space or enter, as in fish
+abbr g git
+abbr gs git status
+abbr gd git diff
+abbr gc git commit
+abbr gp git push
+abbr xi doas xbps-install -S
+abbr xu doas xbps-install -Su
+abbr xr doas xbps-remove -R
+abbr xq xbps-query -Rs
+
+# FDASH_PS1 replaces the built-in prompt and takes isocline markup, for example:
+# FDASH_PS1='[ansi-cyan]$PWD[/] > '
+# A plain PS1 also replaces it, as text without colors.

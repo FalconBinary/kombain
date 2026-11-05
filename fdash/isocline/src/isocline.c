@@ -220,6 +220,7 @@ ic_public void ic_history_add( const char* entry ) {
 ic_public void ic_history_clear(void) {
   ic_env_t* env = ic_get_env(); if (env==NULL) return;
   history_clear(env->history);
+  history_save(env->history);
 }
 
 ic_public bool ic_enable_auto_tab( bool enable ) {
@@ -248,6 +249,32 @@ ic_public bool ic_enable_hint(bool enable) {
   bool prev = env->no_hint;
   env->no_hint = !enable;
   return !prev;
+}
+
+ic_public const char* ic_history_get( long idx ) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return NULL;
+  return history_get(env->history, idx);
+}
+
+ic_public long ic_history_count(void) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return 0;
+  return history_count(env->history);
+}
+
+ic_public void ic_set_abbr_expander( ic_abbr_fun_t* fun, void* arg ) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return;
+  env->abbr_fun = fun;
+  env->abbr_arg = arg;
+}
+
+ic_public bool ic_completion_is_hint(void) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return false;
+  return env->hinting;
+}
+
+ic_public void ic_set_multiline_eol( char eol ) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return;
+  env->multiline_eol = eol;
 }
 
 ic_public long ic_set_hint_delay(long delay_ms) {
@@ -491,7 +518,6 @@ static void ic_atexit(void);
 
 static void ic_env_free(ic_env_t* env) {
   if (env == NULL) return;
-  history_save(env->history);
   history_free(env->history);
   completions_free(env->completions);
   bbcode_free(env->bbcode);

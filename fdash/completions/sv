@@ -1,0 +1,6 @@
+status	Show service status
+up	Start a service
+down	Stop a service
+restart	Restart a service
+once	Start once, without restarting
+check	Check that a service is up

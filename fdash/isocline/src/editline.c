@@ -34,6 +34,8 @@ typedef struct editor_s {
   ssize_t       cur_row;      // current row that has the cursor (0 based, relative to the prompt)
   ssize_t       termw;
   bool          modified;     // has a modification happened? (used for history navigation for example)  
+  const char*   hprefix;      // fdash: typed text that filters up/down through the history
+  bool          burst;        // fdash: this key was queued behind the previous one, as in a paste
   bool          disable_undo; // temporarily disable auto undo (for history search)
   ssize_t       history_idx;  // current index in the history 
   editstate_t*  undo;         // undo buffer  
@@ -111,7 +113,8 @@ static void editor_redo_restore(editor_t* eb ) {
 }
 
 static void editor_start_modify(editor_t* eb ) {
-  editor_undo_capture(eb);
+  // fdash: a snapshot per key would make a paste cost memory quadratic in its length
+  if (!eb->burst) editor_undo_capture(eb);
   editstate_done(eb->mem, &eb->redo);  // clear redo
   eb->modified = true;
 }
@@ -451,14 +454,31 @@ static void editor_append_hint_help(editor_t* eb, const char* help) {
 
 // refresh with possible hint
 static void edit_refresh_hint(ic_env_t* env, editor_t* eb) {
+  if (tty_has_input(env->tty)) return;   // fdash: pasting stays linear, the last key redraws
   if (env->no_hint || env->hint_delay > 0) {
     // refresh without hint first
     edit_refresh(env, eb);
     if (env->no_hint) return;
   }
     
+  // fdash: the newest history entry that starts with the input is the suggestion, as in fish
+  if (eb->pos > 0 && eb->pos == sbuf_len(eb->input)) {
+    const char* in = sbuf_string(eb->input);
+    const char* entry;
+    for (ssize_t i = 1; (entry = history_get(env->history,i)) != NULL; i++) {
+      if (strncmp(entry,in,(size_t)eb->pos) == 0 && entry[eb->pos] != 0) {
+        sbuf_replace(eb->hint, entry + eb->pos);
+        sbuf_clear(eb->hint_help);
+        if (env->hint_delay <= 0) edit_refresh(env, eb);
+        return;
+      }
+    }
+  }
+
   // and see if we can construct a hint (displayed after a delay)
+  env->hinting = true;
   ssize_t count = completions_generate(env, env->completions, sbuf_string(eb->input), eb->pos, 2);
+  env->hinting = false;
   if (count == 1) {
     const char* help = NULL;
     const char* hint = completions_get_hint(env->completions, 0, &help);
@@ -502,6 +522,35 @@ static void edit_refresh_hint(ic_env_t* env, editor_t* eb) {
 //-------------------------------------------------------------
 // Edit operations
 //-------------------------------------------------------------
+
+// fdash: moves the shown suggestion (all of it, or its next word) into the input
+static void edit_accept_hint(ic_env_t* env, editor_t* eb, bool word) {
+  const char* hint = sbuf_string(eb->hint);
+  ssize_t n = sbuf_len(eb->hint);
+  if (word) {
+    n = 0;
+    while (hint[n] == ' ' || hint[n] == '/') n++;
+    while (hint[n] != 0 && hint[n] != ' ' && hint[n] != '/') n++;
+    if (hint[n] == '/') n++;
+  }
+  editor_start_modify(eb);
+  char* part = mem_strndup(env->mem, hint, n);
+  if (part != NULL) {
+    eb->pos = sbuf_insert_at(eb->input, part, eb->pos);
+    mem_free(env->mem, part);
+  }
+}
+
+// fdash: replaces an abbreviation that ends at the cursor
+static void edit_expand_abbr(ic_env_t* env, editor_t* eb) {
+  if (env->abbr_fun == NULL) return;
+  long start = 0;
+  const char* rep = env->abbr_fun(sbuf_string(eb->input), (long)eb->pos, &start, env->abbr_arg);
+  if (rep == NULL) return;
+  editor_start_modify(eb);
+  sbuf_delete_from_to(eb->input, start, eb->pos);
+  eb->pos = sbuf_insert_at(eb->input, rep, start);
+}
 
 static void edit_history_prev(ic_env_t* env, editor_t* eb);
 static void edit_history_next(ic_env_t* env, editor_t* eb);
@@ -876,10 +925,12 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
   edit_write_prompt(env, &eb, 0, false);   
 
   // always a history entry for the current input
+  history_sync(env->history);
   history_push(env->history, "");
 
   // process keys
   code_t c;          // current key code
+  bool queued = false; // fdash: was more input waiting behind the previous key?
   while(true) {    
     // read a character
     term_flush(env->term);
@@ -909,15 +960,28 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
       edit_resize(env,&eb);            
     }
 
-    // clear hint only after a potential resize (so resize row calculations are correct)
+    // fdash: a read interrupted by a signal (a background job ending) is not a key press
+    if (c == KEY_NONE) continue;
+
+    // fdash: everything queued up counts as one edit, so one undo step covers a paste
+    eb.burst = queued;
+    queued = tty_has_input(env->tty);
+
+    // fdash: right, end, ctrl+F and ctrl+E take the suggestion, the word movements its next word
     const bool had_hint = (sbuf_len(eb.hint) > 0);
+    const bool take_all = (had_hint && (c == KEY_RIGHT || c == KEY_END || c == KEY_CTRL_F || c == KEY_CTRL_E));
+    const bool take_word = (had_hint && (c == KEY_CTRL_RIGHT || c == WITH_SHIFT(KEY_RIGHT) || c == WITH_ALT('f') || c == WITH_ALT(KEY_RIGHT)));
+    if (take_all || take_word) {
+      edit_accept_hint(env, &eb, take_word);
+    }
+
+    // clear hint only after a potential resize (so resize row calculations are correct)
     sbuf_clear(eb.hint);
     sbuf_clear(eb.hint_help);
 
-    // if the user tries to move into a hint with left-cursor or end, we complete it first
-    if ((c == KEY_RIGHT || c == KEY_END) && had_hint) {
-      edit_generate_completions(env, &eb, true);
-      c = KEY_NONE;      
+    if (take_all || take_word) {
+      edit_refresh_hint(env, &eb);
+      c = KEY_NONE;
     }
 
     // Operations that may return
@@ -931,6 +995,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
       }
       else {
         // otherwise done
+        edit_expand_abbr(env,&eb);
         break;
       }
     } 
@@ -1052,6 +1117,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
       // deletion
       case KEY_BACKSP:
         edit_backspace(env,&eb);
+        edit_refresh_hint(env,&eb);
         break;
       case KEY_DEL:
         edit_delete_char(env,&eb);
@@ -1061,6 +1127,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
         break;
       case KEY_CTRL_W:
         edit_delete_to_start_of_ws_word(env, &eb);
+        edit_refresh_hint(env,&eb);
         break;
       case WITH_ALT(KEY_DEL):
       case WITH_ALT(KEY_BACKSP):
@@ -1087,6 +1154,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
         char chr;
         unicode_t uchr;
         if (code_is_ascii_char(c,&chr)) {
+          if (chr == ' ') { edit_expand_abbr(env,&eb); }
           edit_insert_char(env,&eb,chr);
         }
         else if (code_is_unicode(c, &uchr)) {
@@ -1124,8 +1192,10 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
 
   // update history
   history_update(env->history, sbuf_string(eb.input));
-  if (res == NULL || sbuf_len(eb.input) <= 1) { ic_history_remove_last(); } // no empty or single-char entries
-  history_save(env->history);
+  // fdash: a line starting with a space stays out of the history, as in fish
+  if (res == NULL || sbuf_len(eb.input) <= 1 || sbuf_string(eb.input)[0] == ' ') { ic_history_remove_last(); } // no empty or single-char entries
+  else { history_append_last(env->history); }
+  mem_free(env->mem, eb.hprefix);
 
   // free resources 
   editstate_done(env->mem, &eb.undo);

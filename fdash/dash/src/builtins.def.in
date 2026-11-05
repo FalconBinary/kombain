@@ -58,6 +58,11 @@ fgcmd		-u fg
 histcmd		-u fc
 #endif
 
+#ifdef FDASH
+abbrcmd		-u abbr
+historycmd	-u history
+#endif
+
 breakcmd	-s break -s continue
 cdcmd		-u cd chdir
 commandcmd	-u command

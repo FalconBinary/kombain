@@ -49,6 +49,9 @@ struct ic_env_s {
   bool            no_autobrace;     // enable automatic brace insertion?
   bool            no_lscolors;      // use LSCOLORS/LS_COLORS to colorize file name completions?
   long            hint_delay;       // delay before displaying a hint in milliseconds
+  bool            hinting;          // fdash: completers run for a suggestion
+  ic_abbr_fun_t*  abbr_fun;         // fdash: abbreviation hook
+  void*           abbr_arg;         // fdash: user state for the abbreviation hook
 };
 
 ic_private char*        ic_editline(ic_env_t* env, const char* prompt_text);

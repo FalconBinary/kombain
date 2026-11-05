@@ -909,3 +909,24 @@ int commandcmd(int argc, char **argv)
 
 	return 0;
 }
+
+#ifdef FDASH
+int
+fdash_isfunction(const char *name)
+{
+	struct tblentry *cmdp = cmdlookup(name, 0);
+
+	return cmdp && cmdp->cmdtype == CMDFUNCTION;
+}
+
+void
+fdash_listfunctions(void (*fn)(const char *, void *), void *arg)
+{
+	struct tblentry **pp, *cmdp;
+
+	for (pp = cmdtable; pp < &cmdtable[CMDTABLESIZE]; pp++)
+		for (cmdp = *pp; cmdp; cmdp = cmdp->next)
+			if (cmdp->cmdtype == CMDFUNCTION)
+				fn(cmdp->cmdname, arg);
+}
+#endif

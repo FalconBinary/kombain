@@ -456,6 +456,14 @@ static bool tty_readc_blocking(tty_t* tty, uint8_t* c) {
 }
 
 
+// fdash: is more input already waiting? Then a redraw would be stale immediately.
+ic_private bool tty_has_input(tty_t* tty) {
+  if (tty == NULL) return false;
+  if (tty->cpush_count > 0) return true;
+  int pending = 0;
+  return (ioctl(tty->fd_in, FIONREAD, &pending) == 0 && pending > 0);
+}
+
 // non blocking read -- with a small timeout used for reading escape sequences.
 ic_private bool tty_readc_noblock(tty_t* tty, uint8_t* c, long timeout_ms)
 {
@@ -564,17 +572,7 @@ typedef struct signal_handler_s {
 } signal_handler_t;
 
 static signal_handler_t sighandlers[] = {
-  { SIGWINCH, {0} },
-  { SIGTERM , {0} },
-  { SIGINT  , {0} },
-  { SIGQUIT , {0} },
-  { SIGHUP  , {0} },
-  { SIGSEGV , {0} },
-  { SIGTRAP , {0} },
-  { SIGBUS  , {0} },
-  { SIGTSTP , {0} },
-  { SIGTTIN , {0} },
-  { SIGTTOU , {0} },
+  { SIGWINCH, {0} },  // fdash: the shell owns all other signals
   { 0       , {0} }
 };
 
@@ -592,7 +590,7 @@ static void sig_handler(int signum, siginfo_t* siginfo, void* uap ) {
   else {
     // the rest are termination signals; restore the terminal mode. (`tcsetattr` is signal-safe)
     if (sig_tty != NULL && sig_tty->raw_enabled) {
-      tcsetattr(sig_tty->fd_in, TCSAFLUSH, &sig_tty->orig_ios);
+      tcsetattr(sig_tty->fd_in, TCSADRAIN, &sig_tty->orig_ios);
       sig_tty->raw_enabled = false;
     }
   }
@@ -653,7 +651,7 @@ static void signals_restore(void) {
 ic_private bool tty_start_raw(tty_t* tty) {
   if (tty == NULL) return false;
   if (tty->raw_enabled) return true;
-  if (tcsetattr(tty->fd_in,TCSAFLUSH,&tty->raw_ios) < 0) return false;
+  if (tcsetattr(tty->fd_in,TCSADRAIN,&tty->raw_ios) < 0) return false;
   tty->raw_enabled = true;
   return true;
 }
@@ -662,7 +660,7 @@ ic_private void tty_end_raw(tty_t* tty) {
   if (tty == NULL) return;
   if (!tty->raw_enabled) return;
   tty->cpush_count = 0;
-  if (tcsetattr(tty->fd_in,TCSAFLUSH,&tty->orig_ios) < 0) return;
+  if (tcsetattr(tty->fd_in,TCSADRAIN,&tty->orig_ios) < 0) return;
   tty->raw_enabled = false;
 }
 

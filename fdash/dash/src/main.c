@@ -169,6 +169,9 @@ state2:
 		if ((shinit = lookupvar("ENV")) != NULL && *shinit != '\0') {
 			read_profile(shinit);
 		}
+#ifdef FDASH
+		read_profile("${XDG_CONFIG_HOME:-$HOME/.config}/fdash/config.sh");
+#endif
 	}
 	popstackmark(&smark);
 state3:

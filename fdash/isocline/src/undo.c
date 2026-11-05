@@ -19,6 +19,8 @@
 //-------------------------------------------------------------
 // edit state
 //-------------------------------------------------------------
+#define IC_MAX_UNDO (256)
+
 struct editstate_s {
   struct editstate_s* next;
   const char* input;          // input
@@ -51,6 +53,10 @@ ic_private void editstate_capture( alloc_t* mem, editstate_t** es, const char* i
   // and push
   entry->next = *es;
   *es = entry;
+  // fdash: a long line typed key by key must not keep a copy per key forever
+  editstate_t* last = entry;
+  for (int n = 1; last != NULL && n < IC_MAX_UNDO; n++) { last = last->next; }
+  if (last != NULL) { editstate_done(mem, &last->next); }
 }
 
 // caller should free *input

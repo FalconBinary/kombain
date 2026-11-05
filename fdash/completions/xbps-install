@@ -1,0 +1,6 @@
+--sync	Sync repository indexes
+--update	Update installed packages
+--yes	Assume yes
+--dry-run	Show what would happen
+--force	Force reinstall
+--repository	Add a repository

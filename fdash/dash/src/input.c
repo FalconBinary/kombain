@@ -48,6 +48,9 @@
 #include "error.h"
 #include "eval.h"
 #include "input.h"
+#ifdef FDASH
+#include "fdash.h"
+#endif
 #include "main.h"
 #include "memalloc.h"
 #include "myhistedit.h"
@@ -295,6 +298,10 @@ preadfd(void)
 	pnr = nr;
 retry:
 	nr = pnr;
+#ifdef FDASH
+	if (fd == 0 && fdash_active())
+		return fdash_read(buf, nr);
+#endif
 #ifndef SMALL
 	if (fd == 0 && el) {
 		static const char *rl_cp;
