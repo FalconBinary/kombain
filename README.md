@@ -93,9 +93,11 @@ enables, on the same kernel. It has no encryption, no firewall and no desktop.
 | Context switches per second | 98 | 72 |
 | Interrupts per second | 163 | 112 |
 | Written to disk in 30 s | 792 KiB | 0 |
-| Files on `/`, with the desktop's tools for kombain | 2020 MiB | 2131 MiB |
+| Files on `/`, without the package cache | 1166 MiB | 1759 MiB |
 
-The extra memory is mostly the encryption, LVM and the second file system.
+kombain has more installed at this point: 366 packages against 140, among them Flatpak and gamescope for Steam.
+Of its 40 MiB of extra memory, 9 MiB are processes and 12 MiB kernel slab, and the rest wasn't broken down:
+it also runs encryption and LVM, which plain Void here doesn't.
 
 | Idle, on the desktop with one terminal open | Before tuning | Now |
 |---|---|---|
