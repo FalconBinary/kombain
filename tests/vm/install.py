@@ -94,6 +94,30 @@ ls /etc/runit/runsvdir/current/ | tr '\n' ' '
 echo
 """
 
+# Test only, for one boot: a kernel log line before each step of runit's stage 1, so the log times them.
+BOOT_MARKS = r"""
+[ -e /etc/runit/1.timeless ] || cp -p /etc/runit/1 /etc/runit/1.timeless
+cp -p /etc/runit/1.timeless /etc/runit/1
+sed -i '/\. "\{0,1\}\$f/i echo "kombain-boot $f" >/dev/kmsg 2>/dev/null' /etc/runit/1
+echo 'echo "kombain-boot end" >/dev/kmsg 2>/dev/null' >> /etc/runit/1
+grep -c kombain-boot /etc/runit/1
+"""
+
+# Times since the kernel started: kernel log lines, and when each process started.
+BOOT_TIMELINE = r"""
+echo "hz $(getconf CLK_TCK)"
+dmesg | sed -nE 's/^\[ *([0-9]+\.[0-9]+)\] (Run \/init as init process|kombain-boot .*|XFS \(.*\): Ending clean mount|Freeing unused kernel image.*)$/mark \1 \2/p'
+for p in /proc/[0-9]*; do
+	c=$(tr '\0' ' ' <$p/cmdline 2>/dev/null | cut -c1-70)
+	[ -n "$c" ] || continue
+	echo "proc $(sed 's/.*) //' $p/stat | cut -d' ' -f20) $(cat $p/comm) $c"
+done | sort -k2,2n
+ls -l /boot | awk '/vmlinuz|initramfs/ {printf "file %s %d KiB\n", $NF, $5 / 1024}'
+for d in $(blkid -t TYPE=crypto_LUKS -o device); do
+	echo "luks $d $(cryptsetup luksDump $d | awk '/PBKDF:/ {k=$2} /Time cost:/ {t=$3} /Memory:/ {m=$2} /Threads:/ {n=$2} END {print k, "time=" t, "memory_kib=" m, "threads=" n}')"
+done
+"""
+
 
 class Failed(Exception):
     pass
@@ -643,6 +667,13 @@ class Run:
         prompts = self.boot_disk()
         self.expect("stock: boots with no passphrase", prompts == 0, prompts)
         self.measure("stock-console")
+        self.sh(BOOT_MARKS, what="test only: boot marks")
+        self.vm.send("reboot\n")
+        self.vm.wait_exit(180)
+        self.vm = None
+        self.boot_disk()
+        time.sleep(10)
+        self.boot_timeline("boot-stock")
         self.vm.send("poweroff\n")
         try:
             self.vm.wait_exit(120)
@@ -657,13 +688,16 @@ class Run:
         count = 0
         started = time.time()
         answered = None
+        self.boot_events = [("start", started)]
         while True:
             index, m = self.vm.wait([r"(?:[Ee]nter passphrase for|Password \(?)[^\n:]*: *$|assphrase[^\n]*: *$", r"login: "], self.o.boot_timeout)
             if index == 1:
                 now = time.time()
+                self.boot_events.append(("login", now))
                 self.boot_times = {"boot_to_prompt_s": f"{(answered or now) - started:.1f}", "last_passphrase_to_login_s": f"{now - (answered or started):.1f}"}
                 break
             count += 1
+            self.boot_events.append(("prompt", time.time()))
             prompt = m.group(0)
             word = DEV_PASSPHRASE if self.luks.get("dev", "?") in prompt or self.part(3) in prompt else ROOT_PASSPHRASE
             # cryptsetup prints the prompt before it turns echo off and flushes the input: an answer
@@ -671,6 +705,7 @@ class Run:
             time.sleep(1)
             self.vm.send(word + "\n")
             answered = time.time()
+            self.boot_events.append(("answer", answered))
             print(f"answered a LUKS prompt: {prompt.strip()[:80]}", flush=True)
         self.vm.send("root\n")
         self.vm.wait([r"Password: "], 60)
@@ -679,6 +714,90 @@ class Run:
         if self.o.no_cable:
             self.test_network()
         return count
+
+    def boot_timeline(self, label):
+        """Where the last boot's time went, from QEMU's start. The time a prompt waited for its
+        passphrase is left out: it is the person's, not the machine's."""
+        try:
+            # the kernel's start on this host's clock: the quickest of three readings is the least late
+            kernel = min(time.time() - float(self.out("cut -d' ' -f1 /proc/uptime")) for _ in range(3))
+            text = self.out(BOOT_TIMELINE)
+            print(f"=== boot timeline: {label}\n{text}", flush=True)
+            hz = int(re.search(r"^hz (\d+)", text, re.M).group(1))
+            marks = [(float(t), what) for t, what in re.findall(r"^mark (\S+) (.*)$", text, re.M)]
+            procs = [(int(t) / hz, comm, cmd) for t, comm, cmd in re.findall(r"^proc (\d+) (\S+) (.*)$", text, re.M)]
+            events = self.boot_events
+            start = events[0][1]
+            prompts = [t - kernel for kind, t in events if kind == "prompt"]
+            answers = [t - kernel for kind, t in events if kind == "answer"]
+            waiting = sum(a - p for p, a in zip(prompts, answers))
+
+            def mark(pattern):
+                return next((t for t, what in marks if re.search(pattern, what)), None)
+
+            def started_at(comm=None, arg=""):
+                found = [t for t, c, cmd in procs if (comm is None or c == comm) and arg in cmd]
+                return min(found) if found else None
+
+            n = {"firmware_and_loader_s": kernel - start}
+            init = mark(r"^Run /init")
+            root = mark(r"Ending clean mount")
+            n["kernel_s"] = init
+            if prompts and init is not None and root is not None:
+                n["initramfs_to_first_prompt_s"] = prompts[0] - init
+                # from each answer to the next prompt, and from the last one to the root file system
+                n["unlock_each_s"] = " + ".join(f"{b - a:.2f}" for a, b in zip(answers, prompts[1:] + [root]))
+            elif init is not None and root is not None:
+                n["initramfs_s"] = root - init
+            stage1 = [(t, what.split(" ", 1)[1]) for t, what in marks if what.startswith("kombain-boot ")]
+            if len(stage1) > 2 and root is not None:
+                n["root_to_stage1_s"] = stage1[0][0] - root
+                n["stage1_s"] = stage1[-1][0] - stage1[0][0]
+                steps = sorted(((b[0] - a[0], os.path.basename(a[1])) for a, b in zip(stage1, stage1[1:])), reverse=True)
+                n["stage1_slowest"] = ", ".join(f"{name} {d:.2f}" for d, name in steps[:5])
+            else:
+                print("boot timeline: runit's stage 1 was not marked", flush=True)
+            runsvdir = started_at("runsvdir")
+            tty1 = started_at("runsv", "tty1")
+            if runsvdir is not None and tty1 is not None:
+                if stage1:
+                    n["stage1_end_to_stage2_s"] = runsvdir - stage1[-1][0]
+                n["stage2_to_tty1_s"] = tty1 - runsvdir
+                n["machine_time_to_tty1_s"] = tty1 + (kernel - start) - waiting
+            n["waiting_for_passphrases_s"] = waiting
+            # dev or gamer logged in by itself on tty1
+            for name, comm, arg in (("mango", "mango", ""), ("netline", "netline", ""), ("game_session", None, "game-session")):
+                t = started_at(comm, arg)
+                if t is not None and tty1 is not None:
+                    n[f"tty1_to_{name}_s"] = t - tty1
+            self.metrics[label] = {k: f"{v:.2f}" if isinstance(v, float) else v for k, v in n.items()}
+            for line in re.findall(r"^(?:file|luks) .*$", text, re.M):
+                key, rest = line.split(" ", 1)
+                self.metrics[label][f"{key} {rest.split(' ', 1)[0]}"] = rest.split(" ", 1)[1]
+            print("\n".join(f"{k}: {v}" for k, v in self.metrics[label].items()), flush=True)
+        except (Failed, AttributeError, ValueError, IndexError, TypeError) as e:
+            print(f"boot timeline {label}: {e!r}", flush=True)
+
+    def unlock_cost(self):
+        """How long each LUKS volume's key derivation takes on this CPU, with nothing else running."""
+        for part, word in ((2, ROOT_PASSPHRASE), (3, DEV_PASSPHRASE)):
+            took = self.out(f"a=$(cut -d' ' -f1 /proc/uptime); printf '%s' '{word}' | cryptsetup open --test-passphrase --key-file=- {self.part(part)} && "
+                            "b=$(cut -d' ' -f1 /proc/uptime) && echo \"$a $b\" | awk '{printf \"%.2f\", $2 - $1}'; true")
+            self.metrics.setdefault("boot-dev", {})[f"unlock_p{part}_alone_s"] = took
+
+    def check_boot_time(self):
+        """One more Dev boot, with runit's stage 1 marked and dev logged in by itself, to see where the time goes."""
+        self.sh(BOOT_MARKS, what="test only: boot marks")
+        self.desktop_login(True)
+        self.vm.send("reboot\n")
+        self.vm.wait_exit(180)
+        self.vm = None
+        self.boot_disk()
+        time.sleep(20)
+        self.boot_timeline("boot-dev")
+        self.unlock_cost()
+        self.sh("mv /etc/runit/1.timeless /etc/runit/1")
+        self.desktop_login(False)
 
     def test_network(self):
         """This system has no DHCP client, as chosen. The test still needs the internet, so the VM's
@@ -1115,6 +1234,7 @@ class Run:
         self.vm = None
 
     def check_gaming(self):
+        self.sh(BOOT_MARKS, what="test only: boot marks")
         self.sh("sed -i 's/^timeout: .*/&\\ndefault_entry: 2/' /boot/limine.conf; grep -n default_entry /boot/limine.conf")
         self.vm.send("reboot\n")
         self.vm.wait_exit(180)
@@ -1138,6 +1258,8 @@ class Run:
         time.sleep(15)
         session = self.out("pgrep -u gamer -f game-session; true")
         self.expect("Gaming: autologin for gamer", session != "", session)
+        self.boot_timeline("boot-gaming")
+        self.sh("mv /etc/runit/1.timeless /etc/runit/1")
         self.expect("Gaming: a session that cannot start says so", self.out("grep -ac 'Press Enter' /dev/vcs1; true") == "1")
         self.screenshot("gaming")
         time.sleep(10)
@@ -1176,6 +1298,7 @@ class Run:
                     self.check_dev()
                     self.install_kombain()
                 self.check_mango()
+                self.check_boot_time()
                 self.check_wifi()
                 self.check_gaming()
                 if self.o.secure_boot:
