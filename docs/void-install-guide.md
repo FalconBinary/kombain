@@ -12,7 +12,7 @@
 Загрузите ISO в режиме UEFI, войдите как `root` / `voidlinux` и выключите SSH: `sv down sshd`. По кабелю сеть поднимется сама, для Wi-Fi выполните команды из шага 1. Затем:
 
 ```bash
-xbps-install -Sy xbps git
+xbps-install -Syi -R https://repo-de.voidlinux.org/current xbps git
 git clone https://github.com/FalconBinary/kombain
 cd kombain
 ./setup.sh
@@ -27,7 +27,7 @@ cd kombain
 
 Заодно он убирает то, что этой машине не нужно: прошивки чужих производителей (NVIDIA, AMD или Intel, если их нет ни в процессоре, ни в видеокарте) `iwd`, если нет Wi-Fi, и `dhcpcd`, если вы отказались от кабеля. Если потом поставите такую видеокарту, удалите `/etc/xbps.d/11-firmware.conf` и выполните `xbps-install -Su linux-firmware`. Для Wi-Fi: `ln -s /etc/sv/iwd /etc/runit/runsvdir/default/`. Для кабеля: конец шага 6.
 
-Если пакеты качаются медленно или загрузка замирает (из России стандартное зеркало бывает недоступно), прервите `Ctrl+C` и запустите с ближним зеркалом из списка на `xmirror.voidlinux.org`. Повторный запуск сам закроет то, что осталось от прерванного, а зеркало останется и для обновлений:
+Пакеты идут с зеркала Void во Франкфурте, его держит сам проект. Если они качаются медленно или загрузка замирает, прервите `Ctrl+C` и запустите с ближним зеркалом из списка на `xmirror.voidlinux.org`. Повторный запуск сам закроет то, что осталось от прерванного, а зеркало останется и для обновлений:
 
 ```
 ./setup.sh --mirror https://mirror.yandex.ru/mirrors/voidlinux
@@ -78,8 +78,8 @@ Wi-Fi (по кабелю сеть поднимется сама):
 wpa_passphrase "NETWORK_NAME" "PASSWORD" >> /etc/wpa_supplicant/wpa_supplicant.conf
 sv restart wpa_supplicant
 sv restart dhcpcd
-ping -c3 repo-default.voidlinux.org
-xbps-install -Sy xbps
+ping -c3 repo-de.voidlinux.org
+xbps-install -Syi -R https://repo-de.voidlinux.org/current xbps
 ```
 
 iwd на base-образе нет, он появится в установленной системе.
@@ -121,7 +121,7 @@ mount /dev/mapper/cryptdev /mnt/home/dev
 `base-minimal` теперь просто `base-container`, поэтому основа здесь `base-system`, из которого лишнее удаляется ниже.
 
 ```bash
-REPO=https://repo-default.voidlinux.org/current
+REPO=https://repo-de.voidlinux.org/current
 mkdir -p /mnt/var/db/xbps/keys /mnt/etc/xbps.d
 cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
 printf 'noextract=%s\n' '/usr/share/locale/*' '!/usr/share/locale/ru/*' '!/usr/share/locale/en*' > /mnt/etc/xbps.d/20-noextract.conf
@@ -131,7 +131,7 @@ printf 'repository=%s/nonfree\n' "$REPO" > /mnt/etc/xbps.d/10-repository-nonfree
 xchroot /mnt /bin/bash
 ```
 
-`REPO` — зеркало Void. Если пакеты качаются медленно или загрузка замирает (из России стандартное зеркало бывает недоступно), возьмите ближнее из списка на `xmirror.voidlinux.org`, например `REPO=https://mirror.yandex.ru/mirrors/voidlinux/current`. Две строки `printf` оставляют это зеркало и для обновлений установленной системы.
+`REPO` — зеркало Void во Франкфурте, его держит сам проект. Если пакеты качаются медленно или загрузка замирает, возьмите ближнее из списка на `xmirror.voidlinux.org`, например `REPO=https://mirror.yandex.ru/mirrors/voidlinux/current`, и его же в `-R` на шаге 1 (`-i` там значит: только это зеркало, не стандартное из ISO). Две строки `printf` оставляют это зеркало и для обновлений установленной системы.
 
 `resolv.conf` в систему не копируется: внутри `xchroot` работают DNS-серверы live-системы, а установленная система получит свой файл от `resolvconf` при первом подключении. Скопированный файл `resolvconf` считал бы чужим и не обновлял, и DNS остался бы от сети, в которой шла установка.
 

@@ -27,7 +27,7 @@ MIN_DEV=1024
 
 dry_run=0
 serial=0
-DEFAULT_MIRROR=https://repo-default.voidlinux.org
+DEFAULT_MIRROR=https://repo-de.voidlinux.org # the guide's, run by Void in Frankfurt
 mirror=$DEFAULT_MIRROR
 
 # The answers

@@ -425,7 +425,7 @@ class Run:
     def install(self):
         self.sh(block("sv down sshd"))
         # Wi-Fi lines skipped: this VM is wired
-        self.sh("xbps-install -Sy xbps", what="guide step 1: update xbps")
+        self.sh(block("wpa_passphrase").splitlines()[-1], what="guide step 1: update xbps")
 
         # test only: cfdisk is interactive; this makes the same three partitions
         step2 = block("DISK=/dev/nvme0n1\ncfdisk")
@@ -492,7 +492,7 @@ class Run:
 
     def install_with_setup(self):
         """setup.sh from the live ISO, answering like a person, including the mistakes people make."""
-        lines = block("xbps-install -Sy xbps git").splitlines()
+        lines = block("xbps-install -Syi -R ").splitlines()
         if lines[-1] != "./setup.sh":
             raise Failed("the guide's setup.sh block changed")
         self.sh(lines[0], what="guide: tools for setup.sh")
@@ -869,7 +869,7 @@ class Run:
         down = [l for l in services.splitlines() if l and not l.startswith("run:")]
         self.expect("Dev: every enabled service is running", not down, down)
         self.expect("Dev: network is up", self.wait_network())
-        mirror = self.o.mirror or "https://repo-default.voidlinux.org"
+        mirror = self.o.mirror or "https://repo-de.voidlinux.org"
         repos = sorted(re.findall(r"https://\S+", self.out("xbps-query -L")))
         self.expect("Dev: updates come from the mirror it was installed from, nonfree too",
                     repos == [f"{mirror}/current", f"{mirror}/current/nonfree"], repos)

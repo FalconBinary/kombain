@@ -269,7 +269,7 @@ hasnt "the NVIDIA card keeps its firmware" "linux-firmware-nvidia"
 has "NVMe partitions in commands" 'cryptsetup luksFormat --batch-mode --verify-passphrase --type luks2 "${DISK}p2"'
 ok "again nothing was called" "$(cat "$work/called" 2>/dev/null)" ""
 
-has "the default mirror" "REPO=https://repo-default.voidlinux.org/current"
+has "the default mirror" "REPO=https://repo-de.voidlinux.org/current"
 has "kept for updates" "/mnt/etc/xbps.d/00-repository-main.conf"
 has "nonfree too" "/mnt/etc/xbps.d/10-repository-nonfree.conf"
 
@@ -279,7 +279,7 @@ printf '%s\n' 1 '' '' '' '' y '' '' '' y y | PATH="$work/bin:$PATH" KOMBAIN_NET=
 ok "the dialog with a mirror finishes" $? 0
 cat "$work/run7" >"$work/r"
 has "step 3 takes it" "REPO=https://mirror.yandex.ru/mirrors/voidlinux/current"
-hasnt "and nothing else" "repo-default"
+hasnt "and nothing else" "repo-de.voidlinux.org"
 has "and keeps it for updates" "/mnt/etc/xbps.d/00-repository-main.conf"
 sh "$repo/setup.sh" --dry-run --mirror 'https://a.org/x;reboot' </dev/null >"$work/run8" 2>&1
 yes_ "a mirror a shell would read is refused" [ $? -ne 0 ]
