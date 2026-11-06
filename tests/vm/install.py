@@ -250,6 +250,7 @@ class Run:
             self.monitor = probe.getsockname()[1]
         self.log_path = os.path.join(opts.work, "serial.log")
         self.user = SETUP_USER if opts.flow == "setup" else "dev"
+        self.mirror = None  # what setup.sh says it installs from; the guide's when None
         self.disk_dev = "/dev/vda" if opts.disk_bus == "virtio" else "/dev/nvme0n1"
         self.setup_output = ""
         self.metrics = {}
@@ -517,6 +518,15 @@ class Run:
                 vm.send(answer + "\n")
             return m
 
+        # without --mirror it times them first: four, or all of them if tier 1 stalls
+        self.mirror = say(r"(?m)^Packages from (https://\S+)\.\r?$", timeout=600).group(1)
+        print(f"mirror: {self.mirror}", flush=True)
+        if self.o.mirror:
+            self.expect("setup.sh: takes the mirror it was given", self.mirror == self.o.mirror, self.mirror)
+        else:
+            timed = re.findall(r"(?m)^  (https://\S+) +(\S+ [KM]iB/s|no answer)", vm.buf)
+            self.expect("setup.sh: times the tier 1 mirrors and takes one that answered",
+                        len(timed) >= 4 and (self.mirror, True) in [(m, s != "no answer") for m, s in timed], timed)
         say(r"Install on disk number \[1\]: ", "9")
         say(r"That is not on the list")
         say(r"Install on disk number \[1\]: ", "")
@@ -869,7 +879,7 @@ class Run:
         down = [l for l in services.splitlines() if l and not l.startswith("run:")]
         self.expect("Dev: every enabled service is running", not down, down)
         self.expect("Dev: network is up", self.wait_network())
-        mirror = self.o.mirror or "https://repo-de.voidlinux.org"
+        mirror = self.mirror or "https://repo-de.voidlinux.org"
         repos = sorted(re.findall(r"https://\S+", self.out("xbps-query -L")))
         self.expect("Dev: updates come from the mirror it was installed from, nonfree too",
                     repos == [f"{mirror}/current", f"{mirror}/current/nonfree"], repos)

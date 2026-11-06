@@ -7,7 +7,8 @@
 #
 #   --dry-run     ask everything, print the commands, change nothing
 #   --serial      also a console and a login on the first serial port
-#   --mirror URL  packages from this Void mirror (see xmirror.voidlinux.org), now and for updates
+#   --mirror URL  packages from this Void mirror (see xmirror.voidlinux.org), now and for updates;
+#                 without it the fastest mirror that answers is picked
 #
 # The commands live in the guide alone, so the two cannot drift apart. If the guide is rewritten
 # in a way this script doesn't recognize, it stops before touching the disk.
@@ -28,7 +29,24 @@ MIN_DEV=1024
 dry_run=0
 serial=0
 DEFAULT_MIRROR=https://repo-de.voidlinux.org # the guide's, run by Void in Frankfurt
-mirror=$DEFAULT_MIRROR
+mirror=$DEFAULT_MIRROR mirror_given=0
+
+# The mirrors to time, from xmirror.voidlinux.org (2026-11), https only: the package lists are not
+# signed. Tier 1 first, fed straight from Void's build servers; the rest, run by universities and
+# companies and sometimes a day behind, only if none of those answers.
+MIRRORS_TIER1="https://repo-de.voidlinux.org https://repo-fi.voidlinux.org https://repo-fastly.voidlinux.org
+https://mirrors.summithq.com/voidlinux"
+MIRRORS_TIER2="https://mirrors.cicku.me/voidlinux https://mirror.nju.edu.cn/voidlinux https://mirrors.bfsu.edu.cn/voidlinux
+https://mirrors.tuna.tsinghua.edu.cn/voidlinux https://mirror.mmdbalkhi.ir/void https://mirrors.kubarcloud.net/voidlinux
+https://repo.jing.rocks/voidlinux https://mirror.freedif.org/voidlinux https://mirror.heigou.pe.kr/voidlinux
+https://mirror.meowsmp.net/voidlinux https://voidlinux.mirror-services.net/voidlinux https://mirrors.dotsrc.org/voidlinux
+https://void.mirror.lynnfra.net https://ftp.cc.uoc.gr/mirrors/linux/voidlinux https://voidlinux.mirror.garr.it
+https://void.sakamoto.pl https://mirror.yandex.ru/mirrors/voidlinux https://ftp.lysator.liu.se/pub/voidlinux
+https://mirror.accum.se/mirror/voidlinux https://mirror.puzzle.ch/voidlinux https://mirror.vofr.net/voidlinux
+https://mirrors.lug.mtu.edu/voidlinux https://void.tuxmirrors.xyz https://mirror.aarnet.edu.au/pub/voidlinux
+https://void.voidbr.org/voidlinux https://void.voidlinux.com.br/voidlinux https://mirror.linux.ec/voidlinux"
+MIRROR_SECONDS=10 # for the package list, about 2 MiB: a mirror that stalls is dropped
+MIRROR_MAX_DAYS=7 # Void updates it several times a day: older means the mirror stopped syncing
 
 # The answers
 disk= suffix= disk_mib=0 disk_model=
@@ -396,6 +414,64 @@ set_mirror() {
 	mirror=$m
 }
 
+# KiB/s at which this machine gets the mirror's package list, or nothing if it stalls, fails or is old.
+mirror_kib() {
+	d=$(mktemp -d)
+	t0=$(date +%s%N)
+	if (cd "$d" && timeout "$MIRROR_SECONDS" xbps-fetch "$1/current/x86_64-repodata") >/dev/null 2>&1; then
+		us=$((($(date +%s%N) - t0) / 1000 + 1))
+		bytes=$(wc -c <"$d/x86_64-repodata" 2>/dev/null || echo 0)
+		# xbps-fetch gives the file the mirror's own time for it
+		age=$((($(date +%s) - $(stat -c %Y "$d/x86_64-repodata" 2>/dev/null || echo 0)) / 86400))
+		# a few KiB would be an error page, not the list
+		if [ "$bytes" -gt 500000 ] && [ "$age" -lt "$MIRROR_MAX_DAYS" ]; then
+			echo $((bytes * 1000000 / 1024 / us))
+		fi
+	fi
+	rm -rf "$d"
+}
+
+fmt_speed() {
+	awk -v k="$1" 'BEGIN { if (k >= 1024) printf "%.1f MiB/s", k / 1024; else printf "%d KiB/s", k }'
+}
+
+fastest() { # mirrors...; the table goes to stderr
+	top= top_kib=0
+	for m in "$@"; do
+		printf '  %-48s ' "$m" >&2
+		kib=$(mirror_kib "$m")
+		if [ -z "$kib" ]; then
+			echo "no answer, or out of date" >&2
+			continue
+		fi
+		echo "$(fmt_speed "$kib")" >&2
+		if [ -z "$top" ] || [ "$kib" -gt "$top_kib" ]; then
+			top=$m top_kib=$kib
+		fi
+	done
+	echo "$top"
+}
+
+choose_mirror() {
+	echo
+	if [ "$mirror_given" -eq 1 ]; then
+		host=${mirror#https://}
+		[ "$dry_run" -eq 1 ] || getent hosts "${host%%/*}" >/dev/null || die "no network, or no such mirror. See step 1 of the guide for Wi-Fi."
+	elif command -v xbps-fetch >/dev/null 2>&1; then
+		echo "Timing the mirrors: each gets $MIRROR_SECONDS s for the package list."
+		best=$(fastest $MIRRORS_TIER1)
+		if [ -z "$best" ]; then
+			echo "None of Void's tier 1 mirrors answered. The others, run by universities and companies:"
+			best=$(fastest $MIRRORS_TIER2)
+		fi
+		[ -n "$best" ] || die "no mirror sent the package list in time. Check the network (step 1 of the guide), or name one with --mirror."
+		mirror=$best
+	else
+		echo "No xbps-fetch here to time the mirrors with."
+	fi
+	echo "Packages from $mirror."
+}
+
 # ---------------------------------------------------------------- the guide's commands
 
 # The guide's block whose first line starts with $1 (and second with $2, if given). It must be
@@ -709,8 +785,6 @@ check_system() {
 	[ "$(uname -m)" = x86_64 ] || die "this is for x86_64"
 	# Known to everyone, so it goes first: the ISO's SSH accepts root with the password voidlinux.
 	sv down sshd >/dev/null 2>&1 || true
-	host=${mirror#https://}
-	getent hosts "${host%%/*}" >/dev/null || die "no network, or no such mirror. See step 1 of the guide for Wi-Fi."
 }
 
 check_vg() {
@@ -800,10 +874,11 @@ main() {
 		--mirror)
 			[ $# -ge 2 ] || die "--mirror needs an address"
 			set_mirror "$2"
+			mirror_given=1
 			shift
 			;;
 		-h | --help)
-			sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+			sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
 			exit 0
 			;;
 		*) die "unknown option: $1" ;;
@@ -815,6 +890,7 @@ main() {
 	[ "$dry_run" -eq 1 ] || check_system
 	[ "$dry_run" -eq 1 ] || clean_previous
 	[ "$dry_run" -eq 1 ] || check_vg
+	choose_mirror
 
 	ask_disk
 	ask_user

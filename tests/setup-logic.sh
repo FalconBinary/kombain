@@ -121,6 +121,9 @@ ok "no spaces" "$(mirror_is 'https://a.org/x y')" ""
 ok "no quotes" "$(mirror_is "https://a.org/x'y")" ""
 ok "no substitutions" "$(mirror_is 'https://a.org/$(reboot)')" ""
 ok "not empty" "$(mirror_is '')" ""
+for m in $MIRRORS_TIER1 $MIRRORS_TIER2; do
+	ok "the list's $m is a mirror setup.sh takes" "$(mirror_is "$m")" "$m"
+done
 
 # ---------------------------------------------------------------- the guide
 
@@ -166,6 +169,19 @@ case "\$*" in
 esac
 EOF
 chmod +x "$work/bin/lsblk"
+# test only: the package list comes at once from FAKE_FAST, a moment later from the rest, never from
+# FAKE_DEAD, as an error page from FAKE_PAGE, and a month old from FAKE_OLD
+cat >"$work/bin/xbps-fetch" <<'EOF'
+#!/bin/sh
+for dead in ${FAKE_DEAD:-}; do case $1 in *"$dead"*) exit 1 ;; esac; done
+case $1 in *"${FAKE_FAST:-repo-de.voidlinux.org}"*) ;; *) sleep 0.2 ;; esac
+case $1 in
+*"${FAKE_PAGE:-none}"*) head -c 3000 /dev/zero >"${1##*/}" ;;
+*) head -c 2200000 /dev/zero >"${1##*/}" ;;
+esac
+case $1 in *"${FAKE_OLD:-none}"*) touch -d '30 days ago' "${1##*/}" ;; esac
+EOF
+chmod +x "$work/bin/xbps-fetch"
 
 dialog() { # output file, answers...
 	out=$1
@@ -269,7 +285,9 @@ hasnt "the NVIDIA card keeps its firmware" "linux-firmware-nvidia"
 has "NVMe partitions in commands" 'cryptsetup luksFormat --batch-mode --verify-passphrase --type luks2 "${DISK}p2"'
 ok "again nothing was called" "$(cat "$work/called" 2>/dev/null)" ""
 
-has "the default mirror" "REPO=https://repo-de.voidlinux.org/current"
+has "the mirrors are timed" "Timing the mirrors"
+has "the fastest is taken" "Packages from https://repo-de.voidlinux.org."
+has "into step 3" "REPO=https://repo-de.voidlinux.org/current"
 has "kept for updates" "/mnt/etc/xbps.d/00-repository-main.conf"
 has "nonfree too" "/mnt/etc/xbps.d/10-repository-nonfree.conf"
 
@@ -287,6 +305,44 @@ grep -q "takes an https address" "$work/run8"
 ok "with an example" $? 0
 sh "$repo/setup.sh" --dry-run --mirror </dev/null >"$work/run8" 2>&1
 yes_ "--mirror without an address is refused" [ $? -ne 0 ]
+
+# ------ the fastest, not the first
+export FAKE_FAST=repo-fi.voidlinux.org
+dialog "$work/run9" 1 '' '' '' '' y '' '' '' y y
+ok "the dialog finishes" $? 0
+cat "$work/run9" >"$work/r"
+has "the fastest tier 1 mirror" "REPO=https://repo-fi.voidlinux.org/current"
+
+# ------ an error page or a mirror that stopped syncing is passed over
+export FAKE_PAGE=repo-fi.voidlinux.org FAKE_OLD=repo-de.voidlinux.org
+dialog "$work/run9" 1 '' '' '' '' y '' '' '' y y
+cat "$work/run9" >"$work/r"
+hasnt "not an error page" "REPO=https://repo-fi.voidlinux.org/current"
+hasnt "not an old list" "REPO=https://repo-de.voidlinux.org/current"
+has "but another tier 1 mirror" "REPO=https://"
+unset FAKE_PAGE FAKE_OLD
+
+# ------ no tier 1 mirror answers: the others are timed
+export FAKE_DEAD="voidlinux.org summithq.com" FAKE_FAST=mirror.yandex.ru
+dialog "$work/run9" 1 '' '' '' '' y '' '' '' y y
+ok "the dialog with tier 1 down finishes" $? 0
+cat "$work/run9" >"$work/r"
+has "it says so" "None of Void's tier 1 mirrors answered"
+has "and takes the fastest of the rest" "REPO=https://mirror.yandex.ru/mirrors/voidlinux/current"
+
+# ------ none answers: it stops before any question
+export FAKE_DEAD=https
+dialog "$work/run9" 1 '' '' '' '' y '' '' '' y y
+yes_ "no mirror stops it" [ $? -ne 0 ]
+cat "$work/run9" >"$work/r"
+has "and says what to do" "no mirror sent the package list in time"
+hasnt "before the disk is asked" "Install on disk number"
+
+# ------ a mirror given is not timed
+sh "$repo/setup.sh" --dry-run --mirror https://mirror.yandex.ru/mirrors/voidlinux </dev/null >"$work/run9" 2>&1
+cat "$work/run9" >"$work/r"
+hasnt "a given mirror is not timed" "Timing the mirrors"
+unset FAKE_DEAD FAKE_FAST
 
 # ------ no cable: dhcpcd goes, as the guide's step 6 says
 dialog "$work/run6" 1 '' '' '' '' y '' '' '' n y
