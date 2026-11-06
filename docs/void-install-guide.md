@@ -120,9 +120,10 @@ mkdir -p /mnt/var/db/xbps/keys /mnt/etc/xbps.d
 cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
 printf 'noextract=%s\n' '/usr/share/locale/*' '!/usr/share/locale/ru/*' '!/usr/share/locale/en*' > /mnt/etc/xbps.d/20-noextract.conf
 XBPS_ARCH=x86_64 xbps-install -S -r /mnt -R "$REPO" base-system cryptsetup lvm2 xfsprogs zstd limine efibootmgr iwd openresolv dbus elogind polkit chrony nftables zramen snooze run-parts opendoas xtools git pipewire wireplumber flatpak gamescope void-repo-nonfree
-cp /etc/resolv.conf /mnt/etc/
 xchroot /mnt /bin/bash
 ```
+
+`resolv.conf` в систему не копируется: внутри `xchroot` работают DNS-серверы live-системы, а установленная система получит свой файл от `resolvconf` при первом подключении. Скопированный файл `resolvconf` считал бы чужим и не обновлял, и DNS остался бы от сети, в которой шла установка.
 
 ## 4. Настройка системы
 
@@ -595,6 +596,8 @@ grep -E '^/|cmdline' /boot/limine.conf
 
 ```bash
 exit
+# the empty resolv.conf xchroot leaves: resolvconf writes its own at the first connection
+rm -f /mnt/etc/resolv.conf
 umount -R /mnt
 reboot
 ```
