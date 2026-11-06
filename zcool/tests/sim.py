@@ -17,6 +17,8 @@ import time
 
 ZCOOL = os.path.abspath(sys.argv[1])
 ONLY = sys.argv[2] if len(sys.argv) > 2 else None
+# `zig build fake-nvml` puts the stand-in for NVIDIA's library next to zig-out/bin
+FAKE_LIB = os.path.abspath(os.path.join(os.path.dirname(ZCOOL), "..", "fake-nvml"))
 
 
 def put(path, value):
@@ -31,10 +33,11 @@ def get(path):
 
 
 class Chip:
-    """One chip with a heat load, a thermal mass and a conductance that depends on its fan."""
+    """One chip with a heat load, a thermal mass and a conductance that depends on its fan,
+    and for a GPU in a case a little on the case fan too."""
 
-    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30):
-        self.load, self.g_min, self.g_max, self.mass = load, g_min, g_max, mass
+    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0):
+        self.load, self.g_min, self.g_max, self.mass, self.g_case = load, g_min, g_max, mass, g_case
         self.temp, self.ambient = temp, ambient
         self.work = 0.0
         self.time = 0.0
@@ -44,7 +47,7 @@ class Chip:
         self.over = 0.0
         self.power = 0.0
 
-    def step(self, dt, allowed_power, speed, duty, limit):
+    def step(self, dt, allowed_power, speed, duty, limit, case_duty=0):
         if self.temp >= 100:
             self.prochot = True
         elif self.temp < 95:
@@ -55,7 +58,7 @@ class Chip:
             power *= 0.16
             perf *= 0.4
             self.prochot_time += dt
-        g = self.g_min + (self.g_max - self.g_min) * duty / 255
+        g = self.g_min + (self.g_max - self.g_min) * duty / 255 + self.g_case * case_duty / 255
         self.power = power * speed ** 2.5
         self.temp += (self.power - (self.temp - self.ambient) * g) * dt / self.mass
         self.work += perf * dt
@@ -69,11 +72,26 @@ class Chip:
         return self.work / self.time if self.time else 1
 
 
+class Nvidia:
+    """A GPU on NVIDIA's own driver, as the fake library shows it to zcool-nvidia. With no fans
+    of its own it is a laptop's, cooled by the board fan with the CPU. `limit` is the driver's
+    power limit range, (min, max, default) in mW, or None where it takes none."""
+
+    def __init__(self, chip, fans=0, limit=None, clocks=True, boot=False, control="on", status="active",
+                 d3="Enabled (fine-grained)", util=None, slowdown=98, gpumax=87, maxclock=1600):
+        self.chip, self.fans, self.limit, self.clocks, self.boot = chip, fans, limit, clocks, boot
+        self.control, self.status, self.d3, self.util = control, status, d3, util
+        self.slowdown, self.gpumax, self.maxclock = slowdown, gpumax, maxclock
+        self.bus = "0000:01:00.0"
+
+
 class Machine:
     def __init__(self, cpu=None, gpu=None, rapl=True, rapl_enforced=True, rapl_writable=True, freq=True, cpu_fan=True, pump=False, config="",
-                 cores=4, nvme_temp=None, bogus_sensor=False):
+                 cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu"):
         self.root = tempfile.mkdtemp(prefix="zcool-")
-        self.cpu, self.gpu = cpu, gpu
+        self.cpu, self.gpu, self.nv, self.gpu_driver = cpu, gpu, nvidia, gpu_driver
+        self.first_case = self.first_own_full = None
+        self.env = dict(os.environ, LD_LIBRARY_PATH=FAKE_LIB, FAKE_NVML=f"{self.root}/dev/nvml", FAKE_NVML_SYS=self.root)
         self.rapl, self.rapl_enforced, self.cpu_fan, self.pump = rapl, rapl_enforced, cpu_fan, pump
         self.energy = 0.0
         self.freq, self.cores = freq, cores
@@ -99,7 +117,14 @@ class Machine:
         if pump:
             put(f"{self.board_dir}/pwm2", 200)
             put(f"{self.board_dir}/pwm2_enable", 2)
-        if gpu:
+        if gpu and gpu_driver == "xe":
+            # Intel's discrete GPU: a power limit called power1_max, no fan of its own
+            put(f"{self.gpu_dir}/name", "xe")
+            put(f"{self.gpu_dir}/temp1_label", "pkg")
+            put(f"{self.gpu_dir}/temp1_crit", 105000)
+            put(f"{self.gpu_dir}/power1_max", 150000000)
+            put(f"{self.gpu_dir}/device/power/runtime_status", "active")
+        elif gpu:
             put(f"{self.gpu_dir}/name", "amdgpu")
             put(f"{self.gpu_dir}/temp1_label", "edge")
             put(f"{self.gpu_dir}/temp1_crit", 100000)
@@ -129,7 +154,61 @@ class Machine:
             put(f"{base}/cpuinfo_min_freq", 800000)
         put(f"{r}/etc/zcool.conf", config)
         os.makedirs(f"{r}/var/lib", exist_ok=True)
+        if nvidia:
+            self.pci(nvidia.bus, "0x030000" if nvidia.boot else "0x030200", "0x10de", nvidia.boot, "nvidia", nvidia.control, nvidia.status)
+            if not nvidia.boot:
+                self.pci("0000:00:02.0", "0x030000", "0x8086", True, "i915", "on", "active")
+            p = f"{r}/proc/driver/nvidia"
+            put(f"{p}/version", "NVRM version: fake")
+            put(f"{p}/gpus/{nvidia.bus}/information", "Model:           GeForce GTX 1650\nDevice Minor:    0\n")
+            put(f"{p}/gpus/{nvidia.bus}/power", f"Runtime D3 status:          {nvidia.d3}\nVideo Memory:               Active\n")
+            self.nvml = f"{r}/dev/nvml"
+            self.nv_dir = n = f"{self.nvml}/{nvidia.bus}"
+            for name, value in (("slowdown", nvidia.slowdown), ("gpumax", nvidia.gpumax), ("maxclock", nvidia.maxclock),
+                                ("clocks_ok", int(nvidia.clocks)), ("locked", 0), ("limit_ok", int(bool(nvidia.limit))),
+                                ("fans", nvidia.fans), ("temp", 0), ("power", 0), ("util", 0)):
+                put(f"{n}/{name}", value)
+            if nvidia.limit:
+                low, high, default = nvidia.limit
+                for name, value in (("lmin", low), ("lmax", high), ("ldef", default), ("limit", default)):
+                    put(f"{n}/{name}", value)
+            for i in range(nvidia.fans):
+                put(f"{n}/fan{i}", 30)
+                put(f"{n}/fan{i}_mode", "auto")
         self.publish()
+
+    def pci(self, bus, cls, vendor, boot, driver, control, status):
+        d = f"{self.root}/sys/bus/pci/devices/{bus}"
+        put(f"{d}/class", cls)
+        put(f"{d}/vendor", vendor)
+        put(f"{d}/boot_vga", int(boot))
+        put(f"{d}/power/control", control)
+        put(f"{d}/power/runtime_status", status)
+        os.makedirs(f"{self.root}/sys/bus/pci/drivers/{driver}", exist_ok=True)
+        os.symlink(f"../../../../bus/pci/drivers/{driver}", f"{d}/driver")
+
+    def nv_status(self, value=None):
+        path = f"{self.root}/sys/bus/pci/devices/{self.nv.bus}/power/runtime_status"
+        if value:
+            put(path, value)
+        return get(path)
+
+    def nv_reads(self):
+        path = f"{self.nv_dir}/reads"
+        return [int(x) for x in open(path).read().split()] if os.path.exists(path) else []
+
+    def helper_pid(self):
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                stat = open(f"/proc/{d}/stat").read()
+            except OSError:
+                continue
+            # the name can hold spaces, the fields after it cannot
+            if int(stat[stat.rindex(")") + 2:].split()[1]) == self.proc.pid:
+                return int(d)
+        return None
 
     def _write_temp(self, path, value):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
@@ -161,6 +240,11 @@ class Machine:
             self._write_temp(f"{self.cpu_dir}/temp2_input", self.cpu.temp + 1)
         if self.gpu:
             self._write_temp(f"{self.gpu_dir}/temp1_input", self.gpu.temp)
+        if self.nv and self.nv.chip and self.nv_status() != "suspended":
+            c, n = self.nv.chip, self.nv_dir
+            util = self.nv.util if self.nv.util is not None else (90 if c.load > 0 else 0)
+            for name, value in (("temp", round(c.temp)), ("power", int(c.power * 1000)), ("util", util)):
+                self._write_duty(f"{n}/{name}", value)
 
     def duty(self, directory, index, curve_base):
         pwm, enable = f"{directory}/pwm{index}", f"{directory}/pwm{index}_enable"
@@ -169,6 +253,12 @@ class Machine:
         if self.read(enable) != "1":
             # firmware's own curve, deliberately lazy
             temp = self.gpu.temp if directory == self.gpu_dir and self.gpu else (self.cpu.temp if self.cpu else 40)
+            if directory == self.board_dir:
+                # a laptop's fan cools the GPU with the CPU, and its firmware watches both
+                if self.nv and not self.nv.fans and self.nv.chip:
+                    temp = max(temp, self.nv.chip.temp)
+                if self.gpu and self.gpu_driver == "xe":
+                    temp = max(temp, self.gpu.temp)
             duty = min(255, max(curve_base, curve_base + (temp - 50) * 1.5))
             self._write_duty(pwm, duty)
             return duty
@@ -184,6 +274,9 @@ class Machine:
             time.sleep(tick)
             now = time.time()
             dt, last = now - last, now
+            board = self.duty(self.board_dir, 1, 70) if self.cpu_fan else 0
+            if self.cpu_fan and self.first_case is None and self.read(f"{self.board_dir}/pwm1_enable") == "1":
+                self.first_case = now
             if self.cpu:
                 cap = 1e9
                 speed = 1.0
@@ -197,26 +290,61 @@ class Machine:
                         speed = min(int(self.read(f"{self.root}/sys/devices/system/cpu/cpufreq/policy{i}/scaling_max_freq")) for i in range(self.cores)) / 5000000
                     except ValueError:
                         pass
-                duty = self.duty(self.board_dir, 1, 70) if self.cpu_fan else 0
+                duty = board
                 if self.pump and self.read(f"{self.board_dir}/pwm2_enable") != "1":
                     self._write_duty(f"{self.board_dir}/pwm2", 200)
                 self.cpu.step(dt, cap, speed, duty, limit_cpu)
                 if self.rapl:
                     self.energy += self.cpu.power * dt * 1e6
                     self._write_energy(f"{self.root}/sys/class/powercap/intel-rapl:0/energy_uj", self.energy)
-            if self.gpu:
+            if self.gpu and self.gpu_driver == "xe":
+                cap = 1e9
+                try:
+                    cap = int(self.read(f"{self.gpu_dir}/power1_max")) / 1e6
+                except ValueError:
+                    pass
+                self.gpu.step(dt, cap, 1.0, board, limit_gpu)
+            elif self.gpu:
                 cap = 1e9
                 try:
                     cap = int(self.read(f"{self.gpu_dir}/power1_cap")) / 1e6
                 except ValueError:
                     pass
-                self.gpu.step(dt, cap, 1.0, self.duty(self.gpu_dir, 1, 80), limit_gpu)
+                own = self.duty(self.gpu_dir, 1, 80)
+                if self.first_own_full is None and own >= 250:
+                    self.first_own_full = now
+                self.gpu.step(dt, cap, 1.0, own, limit_gpu, case_duty=board)
                 self._write_energy(f"{self.gpu_dir}/power1_average", self.gpu.power * 1e6)
+            if self.nv and self.nv.chip and self.nv_status() != "suspended":
+                self.step_nvidia(dt, board, limit_gpu, now)
             self.publish()
+
+    def step_nvidia(self, dt, board, limit, now):
+        nv, n = self.nv, self.nv_dir
+        cap, speed = 1e9, 1.0
+        try:
+            if nv.limit:
+                cap = int(self.read(f"{n}/limit")) / 1000
+            locked = int(self.read(f"{n}/locked"))
+            if locked > 0:
+                speed = min(1.0, locked / nv.maxclock)
+        except ValueError:
+            pass
+        duty = board
+        if nv.fans:
+            if self.read(f"{n}/fan0_mode") == "manual":
+                percent = int(self.read(f"{n}/fan0") or 30)
+            else:
+                percent = min(100, max(30, 30 + (nv.chip.temp - 50) * 1.2))
+                self._write_duty(f"{n}/fan0", percent)
+            duty = percent * 255 / 100
+            if self.first_own_full is None and percent >= 98:
+                self.first_own_full = now
+        nv.chip.step(dt, cap, speed, duty, limit, case_duty=board)
 
     def start(self, *args):
         self.logf = open(self.log, "ab")
-        self.proc = subprocess.Popen([ZCOOL, "run", "--root", self.root, *args], stdout=self.logf, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen([ZCOOL, "run", "--root", self.root, *args], stdout=self.logf, stderr=subprocess.STDOUT, env=self.env)
 
     def stop(self, sig=signal.SIGTERM):
         if self.proc and self.proc.poll() is None:
@@ -231,7 +359,7 @@ class Machine:
         return open(self.log).read() if os.path.exists(self.log) else ""
 
     def cmd(self, *args):
-        return subprocess.run([ZCOOL, *args, "--root", self.root], capture_output=True, text=True, timeout=10)
+        return subprocess.run([ZCOOL, *args, "--root", self.root], capture_output=True, text=True, timeout=20, env=self.env)
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -557,7 +685,9 @@ def each_chip_has_its_own_limit(r):
     # without its fan the cap alone holds the limit, lower and later: the peak check above can miss that
     r.check(m.read(f"{m.gpu_dir}/pwm1_enable") == "1", "the GPU fan should be managed")
     r.check(m.read(m.rapl_path) == "300000000", "a hot GPU must not throttle the CPU")
-    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "2", "a GPU with its own fan must not spin the case fan")
+    # the case fan may help, but only once the GPU's own fan has nothing left
+    r.check(m.first_case is None or (m.first_own_full is not None and m.first_case >= m.first_own_full - 0.3),
+            "the case fan joined before the GPU's own fan was at full")
     r.check(int(m.read(f"{m.gpu_dir}/power1_cap")) < 200000000, "should cap the GPU")
     r.check(int(m.read(f"{m.gpu_dir}/power1_cap")) >= 60000000, "cap below the driver minimum")
     r.note(f"gpu at 75: peak {m.gpu.peak:.1f} C, cap {int(m.read(f'{m.gpu_dir}/power1_cap')) / 1e6:.0f} W; cpu untouched")
@@ -651,6 +781,184 @@ def sandbox_blocks_the_rest_of_the_system(r):
     r.note(" | ".join(l for l in out.splitlines() if "sandbox" in l or "selftest" in l))
     r.check("sandbox: active" in out, out)
     r.check("/etc/passwd blocked" in out, out)
+    m.close()
+
+
+GPU_CONFIG = "cpu0.max = 85\ngpu0.max = 80\n"
+
+
+@scenario
+def a_laptop_gpu_shares_the_fan_then_gives_up_clocks(r):
+    # a laptop's GTX 1650: no fan of its own, no power limit from the driver, a clock limit it takes
+    nv = Nvidia(Chip(load=90, g_min=0.5, g_max=1.6, mass=15, temp=60))
+    m = Machine(cpu=Chip(load=15, g_max=2.0), nvidia=nv, config=GPU_CONFIG)
+    m.start()
+    m.advance(40, limit_cpu=85, limit_gpu=80)
+    log = m.text()
+    locked = int(m.read(f"{m.nv_dir}/locked"))
+    r.check("NVIDIA at 0000:01:00.0" in log, log[-400:])
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "1", "the shared fan should work for the GPU")
+    r.check(0 < locked < nv.maxclock, f"locked at {locked}")
+    r.check("a clock limit" in log, "should say how it holds the GPU")
+    r.check(nv.chip.peak <= 85, f"gpu peak {nv.chip.peak:.1f}")
+    r.check(m.read(m.rapl_path) == "300000000", "a hot GPU must not throttle the CPU")
+    r.note(f"gpu at 80: peak {nv.chip.peak:.1f} C, clocks {locked} of {nv.maxclock} MHz, speed {nv.chip.perf * 100:.1f}%")
+    m.stop()
+    r.check(get(f"{m.nv_dir}/locked") == "0", "clocks not given back")
+    r.check(get(f"{m.board_dir}/pwm1_enable") == "2", "fan not given back")
+    m.close()
+
+
+@scenario
+def a_desktop_gpu_uses_its_own_fan_then_the_case_fan_then_power(r):
+    nv = Nvidia(Chip(load=320, g_min=0.8, g_max=3.4, g_case=0.5, temp=60), fans=1, limit=(150000, 350000, 300000), boot=True)
+    m = Machine(cpu=Chip(load=40, g_max=3.0), nvidia=nv, config=GPU_CONFIG)
+    m.start()
+    m.advance(40, limit_cpu=85, limit_gpu=80)
+    log = m.text()
+    limit = int(m.read(f"{m.nv_dir}/limit"))
+    r.check(m.read(f"{m.nv_dir}/fan0_mode") == "manual", "its own fan should be managed")
+    r.check(m.first_case is not None, "the case fan should join once the GPU's fan is at full")
+    r.check(m.first_case is None or (m.first_own_full is not None and m.first_case >= m.first_own_full - 0.3),
+            "the case fan joined before the GPU's own fan was at full")
+    r.check(limit < 300000, "should lower the power limit")
+    r.check("its power limit" in log, log[-400:])
+    r.check(nv.chip.peak <= 86, f"gpu peak {nv.chip.peak:.1f}")
+    r.note(f"gpu at 80: peak {nv.chip.peak:.1f} C, its fan, then the case fan, then {limit / 1000:.0f} of 300 W")
+    m.stop()
+    r.check(get(f"{m.nv_dir}/fan0_mode") == "auto", "fan not given back")
+    r.check(get(f"{m.nv_dir}/limit") == "300000", f"limit not given back: {get(f'{m.nv_dir}/limit')}")
+    m.close()
+
+
+@scenario
+def a_sleeping_nvidia_gpu_is_never_touched(r):
+    nv = Nvidia(Chip(load=0, temp=45), control="auto", status="suspended")
+    m = Machine(cpu=Chip(load=5, temp=45), nvidia=nv, config=CONFIG)
+    # a frozen hot value: acting on it would mean the GPU was read
+    put(f"{m.nv_dir}/temp", 99)
+    m.start()
+    m.advance(6, limit_cpu=85)
+    out = m.cmd("list").stdout
+    r.check(not os.path.exists(f"{m.nv_dir}/woken"), "a sleeping GPU was reached")
+    r.check(not m.nv_reads(), "a sleeping GPU was read")
+    r.check(m.proc.poll() is None, "should keep running")
+    r.check("asleep" in out, out)
+    m.stop()
+    m.close()
+
+
+@scenario
+def an_idle_gpu_is_read_rarely_so_it_can_sleep(r):
+    nv = Nvidia(Chip(load=0, temp=45, g_max=1.6), control="auto")
+    m = Machine(cpu=Chip(load=5, temp=45), nvidia=nv, config=CONFIG)
+    m.start()
+    m.advance(26)
+    reads = m.nv_reads()
+    gaps = [b - a for a, b in zip(reads, reads[1:])]
+    r.check(len(reads) <= 8, f"{len(reads)} reads in 26 s of nothing")
+    r.check(bool(gaps) and gaps[-1] >= 8000, f"gaps {gaps}")
+    r.check(os.path.exists(f"{m.nvml}/shutdowns"), "NVIDIA's library was never let go of")
+    # asleep, then awake again for a game: looked at at once, and often while busy
+    m.nv_status("suspended")
+    m.advance(3)
+    before = len(m.nv_reads())
+    m.nv_status("active")
+    nv.chip.load = 90
+    m.advance(1.5)
+    r.check(len(m.nv_reads()) > before, "not read after waking")
+    m.advance(6)
+    busy = m.nv_reads()[-4:]
+    r.check(len(busy) == 4 and max(b - a for a, b in zip(busy, busy[1:])) <= 1500, f"a busy GPU read too rarely: {busy}")
+    r.note(f"idle: {len(reads)} reads in 26 s, the last {gaps[-1] / 1000 if gaps else 0:.0f} s apart; busy: every second")
+    m.stop()
+    m.close()
+
+
+@scenario
+def gpus_that_show_nothing_may_sleep_and_get_their_setting_back(r):
+    nv = Nvidia(Chip(load=0, temp=45), d3="Disabled by default")
+    m = Machine(cpu=Chip(load=5, temp=45), nvidia=nv, config=CONFIG)
+    dgpu = f"{m.root}/sys/bus/pci/devices/{nv.bus}/power/control"
+    igpu = f"{m.root}/sys/bus/pci/devices/0000:00:02.0/power/control"
+    m.start()
+    m.advance(2)
+    r.check(get(dgpu) == "auto", f"the GPU that shows nothing should may sleep: {get(dgpu)}")
+    r.check(get(igpu) == "on", "the GPU with the boot screen must stay as it was")
+    r.check("NVreg_DynamicPowerManagement=0x02" in m.text(), "should say what NVIDIA's driver needs")
+    m.stop()
+    r.check(get(dgpu) == "on", "setting not given back")
+    m.close()
+
+    m = Machine(cpu=Chip(load=5, temp=45), nvidia=Nvidia(Chip(load=0, temp=45)), config=CONFIG + "gpu.sleep = no\n")
+    m.start()
+    m.advance(2)
+    r.check(get(f"{m.root}/sys/bus/pci/devices/0000:01:00.0/power/control") == "on", "gpu.sleep = no was ignored")
+    m.stop()
+    m.close()
+
+
+@scenario
+def nvidia_settings_go_back_however_zcool_ends(r):
+    def hot():
+        nv = Nvidia(Chip(load=320, g_min=0.8, g_max=3.0, temp=78), fans=1, limit=(150000, 350000, 300000), boot=True)
+        m = Machine(cpu=Chip(load=20), nvidia=nv, config=GPU_CONFIG)
+        m.start()
+        m.advance(15, limit_gpu=80)
+        r.check(m.read(f"{m.nv_dir}/fan0_mode") == "manual" and int(m.read(f"{m.nv_dir}/limit")) < 300000,
+                "should have changed the fan and the limit first")
+        return m
+
+    m = hot()
+    m.proc.kill()
+    m.proc.wait()
+    time.sleep(3)
+    r.check(get(f"{m.nv_dir}/fan0_mode") == "auto", "zcool-nvidia did not give the fan back when zcool died")
+    r.check(get(f"{m.nv_dir}/limit") == "300000", "zcool-nvidia did not give the limit back when zcool died")
+    m.close()
+
+    # both killed: the list in /run/zcool/nvidia is what `zcool restore` goes by
+    m = hot()
+    helper = m.helper_pid()
+    r.check(helper is not None, "no zcool-nvidia found")
+    if helper:
+        os.kill(helper, signal.SIGKILL)
+    m.proc.kill()
+    m.proc.wait()
+    out = m.cmd("restore")
+    r.check(get(f"{m.nv_dir}/fan0_mode") == "auto" and get(f"{m.nv_dir}/limit") == "300000", out.stdout + out.stderr)
+    r.check("put back on 1 GPU" in out.stdout, out.stdout)
+    m.close()
+
+
+@scenario
+def list_shows_each_gpu_and_what_keeps_it_awake(r):
+    nv = Nvidia(Chip(load=0, temp=50), control="auto", d3="Disabled by default")
+    m = Machine(cpu=Chip(load=5, temp=45), nvidia=nv, config=CONFIG)
+    put(f"{m.root}/proc/4242/comm", "mango")
+    os.makedirs(f"{m.root}/proc/4242/fd")
+    os.symlink("/dev/nvidia0", f"{m.root}/proc/4242/fd/7")
+    out = m.cmd("list").stdout
+    r.check("0000:01:00.0" in out and "when idle" in out, out)
+    r.check("held open by mango (4242)" in out, out)
+    r.check("NVreg_DynamicPowerManagement=0x02" in out, out)
+    r.check("CPU's package power limit" in out, out)
+    r.check("gpu0" in out and "clocks" in out, out)
+    m.close()
+
+
+@scenario
+def an_intel_gpu_is_held_by_its_power_limit(r):
+    m = Machine(cpu=Chip(load=10, g_max=2.0), gpu=Chip(load=150, g_min=0.5, g_max=2.0, temp=70), gpu_driver="xe", config=GPU_CONFIG)
+    m.start()
+    m.advance(30, limit_gpu=80)
+    limit = int(m.read(f"{m.gpu_dir}/power1_max"))
+    r.check(m.read(f"{m.board_dir}/pwm1_enable") == "1", "the shared fan should work for the GPU first")
+    r.check(limit < 150000000, "should lower power1_max")
+    r.check(m.gpu.peak <= 85, f"gpu peak {m.gpu.peak:.1f}")
+    r.note(f"gpu at 80: peak {m.gpu.peak:.1f} C, {limit / 1e6:.0f} of 150 W")
+    m.stop()
+    r.check(get(f"{m.gpu_dir}/power1_max") == "150000000", "power1_max not given back")
     m.close()
 
 

@@ -176,6 +176,83 @@ fn sysClose(fd: i32) void {
     close(fd);
 }
 
+pub fn readLink(path: [:0]const u8, buf: []u8) ?[]u8 {
+    const n = ok(linux.syscall4(.readlinkat, at_fdcwd, @intFromPtr(path.ptr), @intFromPtr(buf.ptr), buf.len)) orelse return null;
+    return buf[0..n];
+}
+
+pub fn write(fd: i32, data: []const u8) bool {
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = ok(linux.syscall3(.write, @as(usize, @intCast(fd)), @intFromPtr(data[done..].ptr), data.len - done)) orelse return false;
+        if (n == 0) return false;
+        done += n;
+    }
+    return true;
+}
+
+pub fn read(fd: i32, buf: []u8) ?usize {
+    return ok(linux.syscall3(.read, @as(usize, @intCast(fd)), @intFromPtr(buf.ptr), buf.len));
+}
+
+/// A process with a pipe to its stdin and one from its stdout. Its stderr is ours.
+pub const Child = struct { pid: i32, to: i32, from: i32 };
+
+pub fn spawn(path: [:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) ?Child {
+    var down: [2]i32 = undefined;
+    var up: [2]i32 = undefined;
+    _ = ok(linux.pipe2(&down, .{ .CLOEXEC = true })) orelse return null;
+    _ = ok(linux.pipe2(&up, .{ .CLOEXEC = true })) orelse {
+        close(down[0]);
+        close(down[1]);
+        return null;
+    };
+    const pid = ok(linux.fork()) orelse {
+        for ([_]i32{ down[0], down[1], up[0], up[1] }) |fd| close(fd);
+        return null;
+    };
+    if (pid == 0) {
+        // the copies lose close-on-exec; every other end of the pipes closes at exec
+        _ = linux.dup2(down[0], 0);
+        _ = linux.dup2(up[1], 1);
+        _ = linux.execve(path.ptr, argv, envp);
+        linux.exit_group(127);
+    }
+    close(down[0]);
+    close(up[1]);
+    return .{ .pid = @intCast(pid), .to = down[1], .from = up[0] };
+}
+
+/// True when `fd` has something to read, or its other end is gone.
+pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
+    var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN }};
+    const n = ok(linux.poll(&fds, 1, timeout_ms)) orelse return false;
+    return n > 0;
+}
+
+/// Collects a child that has ended, or waits up to `ms` for it to end. True when it is gone.
+pub fn reap(pid: i32, ms: i64) bool {
+    var waited: i64 = 0;
+    while (true) {
+        var status: i32 = 0;
+        const rc = ok(linux.wait4(pid, &status, linux.W.NOHANG, null)) orelse return true;
+        if (rc != 0) return true;
+        if (waited >= ms) return false;
+        sleepMs(20);
+        waited += 20;
+    }
+}
+
+pub fn kill(pid: i32, signal: linux.SIG) void {
+    _ = linux.kill(pid, signal);
+}
+
+/// Ignores SIGPIPE: a write to a pipe whose reader is gone fails instead of ending the process.
+pub fn ignoreSigpipe() void {
+    var ignore = linux.Sigaction{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    _ = linux.sigaction(.PIPE, &ignore, null);
+}
+
 const Timespec = extern struct { sec: i64, nsec: i64 };
 
 pub fn nowMs() i64 {

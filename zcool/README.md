@@ -1,7 +1,9 @@
 # zcool
 
 Keeps every chip under the temperature you set, and gives up as little speed as it
-can. Pure Zig with no libc: a 90 KiB binary that uses 156 KiB of memory.
+can: the CPU, every GPU, NVMe. A GPU that shows nothing is let sleep when idle. Pure Zig
+with no libc: a 132 KiB binary that uses under 200 KiB of memory. NVIDIA's own driver
+needs one more, small program, see below.
 
 **It has not run on real hardware yet.** Everything below was checked against a
 thermal simulator. Start with `--dry-run`, which writes nothing.
@@ -13,6 +15,7 @@ software keeps it at your limit at full speed. So the order is:
 
 1. **Forecast.** It reacts to where the temperature is heading, not where it is.
 2. **Fans first.** They rise before the limit and reach full speed at it. Speed is not touched.
+   A GPU's own fans go first; the case fans join once those are at full.
 3. **Then a little power,** only when the fans have nothing left, and only as much as needed.
 4. **Give it back** as soon as there is room.
 
@@ -30,7 +33,7 @@ turn it off, and it keeps working if zcool is gone.
 ## Use it
 
 ```sh
-zcool list                # chips, limits, fans, what can be controlled
+zcool list                # chips, limits, fans, GPUs and what keeps them awake
 doas zcool run --dry-run  # says what it would do, writes nothing
 doas vi /etc/zcool.conf   # your limits
 doas ln -s /etc/sv/zcool /etc/runit/runsvdir/default/
@@ -55,12 +58,42 @@ is lowered, with a message.
 |---|---|---|
 | Intel CPU | `coretemp`, RAPL energy | fans, RAPL power limit, then frequency |
 | AMD CPU | `k10temp`, `zenpower` | fans, then frequency; RAPL if the firmware honors it |
-| AMD GPU | `amdgpu` | its own fan, `power1_cap` |
+| AMD GPU | `amdgpu` | its own fan, then case fans, `power1_cap` |
+| Intel discrete GPU | `xe`, `i915` | case fans, `power1_max` |
+| Intel integrated GPU | in the CPU package | the CPU's package power limit |
+| NVIDIA GPU, NVIDIA's driver | `zcool-nvidia` | its own fans, then case fans, its power limit, or a clock limit where it takes none |
+| NVIDIA GPU, nouveau | `nouveau` | its own fan if the driver offers one; no power control |
 | NVMe | `nvme`, every 5 s | case fans only |
 | Anything else in hwmon | watched | case fans, once you set a limit for it |
 
-**Not covered:** NVIDIA's proprietary driver has no sensors in `/sys`, and `zcool list`
-says so when it is loaded. Intel GPUs are watched, with no power control.
+In a laptop the fans belong to the board, so they cool the CPU and the GPU together and
+answer to whichever is hotter.
+
+### NVIDIA's driver
+
+It puts no sensors in `/sys`. Its library, `libnvidia-ml.so.1`, is the only way to read
+such a GPU or set its limits, and loading it needs libc. So that part lives in
+`zcool-nvidia`, which zcool starts only when that driver is loaded, before its own sandbox
+closes, and talks to over a pipe, one line per request. It opens the library without
+touching any GPU, reaches a GPU only when zcool asks, and zcool does not ask while the GPU
+sleeps. It sandboxes itself too. A desktop card usually takes a power limit; most laptop
+GPUs take none, and get a clock limit instead. Measured against a stand-in for the library
+it uses 1.7 MiB; NVIDIA's real library is larger.
+
+## Sleep
+
+A GPU that does not show the boot screen, a laptop's discrete GPU for one, can be powered
+off by the kernel while nothing uses it. zcool sets that up (`power/control` to `auto`) for
+every such GPU and puts the old value back when it stops; `gpu.sleep = no` turns that off.
+
+Every read of a sensor keeps a GPU awake, so an idle one is read less and less often, up
+to once in 10 s, and NVIDIA's library is let go of between reads. Asleep, it is not read
+at all. When it wakes, for a game say, it is read at once and every second while busy.
+
+What can still keep it awake, `zcool list` shows: the processes that hold it open, and on
+NVIDIA's driver whether that driver allows it. Turing cards (GTX 16xx, RTX 20xx) sleep only
+with `options nvidia NVreg_DynamicPowerManagement=0x02` in `/etc/modprobe.d`, and on boards
+that support it.
 
 ## Safety
 
@@ -69,11 +102,15 @@ says so when it is loaded. Intel GPUs are watched, with no power control.
   crash, a panic and `kill -9` all end in the originals: the last one through the
   runit `finish` script, or at the next start.
 - **Lost sensors hand everything back.** The daemon exits and runit restarts it.
+- **NVIDIA's settings go back however zcool ends.** When zcool goes, `zcool-nvidia`'s input
+  ends and it gives back every limit and fan it set. If both are killed, the GPUs it changed
+  are listed in `/run/zcool/nvidia`, and `zcool restore` (the runit `finish` script) puts them back.
 - **A chip is never pushed below 30% of its power.** Below that the hardware's own protection takes over.
 - **A power limit is not trusted:** if the temperature stays over the limit anyway,
   frequency limits join in.
-- **A sleeping GPU is not woken** to read its temperature.
+- **A sleeping GPU is not woken** to read its temperature or to give anything back.
 - **Sandboxed:** after setup Landlock confines it to `/sys`, `/run/zcool` and `/var/lib/zcool`.
+  `zcool-nvidia` is confined to reading the system, the NVIDIA device files and `/run/zcool`.
 
 Other thermal daemons (`thermald`, `tlp`, `fancontrol`) would fight with it. Run one.
 
@@ -100,13 +137,18 @@ Writing to the register has only been tested against a model of it, never on a C
 ```sh
 zig build test                                # the control logic against a model
 zig build -Doptimize=ReleaseSafe
-python3 tests/sim.py zig-out/bin/zcool        # the real binary against a fake /sys
+zig build fake-nvml                           # a stand-in for NVIDIA's library
+python3 tests/sim.py zig-out/bin/zcool        # the real binaries against a fake /sys
 ```
 
 The simulator covers overload, sudden load, recovery, crashes, `kill -9`, dead and
 bogus sensors, stalled and excluded fans, a fan that misses a read, power limits that are refused or ignored, a
-sleeping GPU, and a config with mistakes. It proves the logic. It proves nothing
-about any real driver, and a real chip's numbers will differ.
+sleeping GPU, and a config with mistakes. For GPUs: a laptop's NVIDIA GPU on the shared
+fan and a clock limit, a desktop one with its own fan, the case fan and its power limit,
+an Intel GPU's power1_max, an idle GPU read rarely enough to sleep, one asleep never
+reached, and NVIDIA's settings given back after `kill -9` of zcool and of both. It proves
+the logic. It proves nothing about any real driver or NVIDIA's real library, and a real
+chip's numbers will differ.
 
-On arm64 with a fake `/sys`: 156 KiB of memory, 0.067% of a CPU while limiting. Real
-sensors are slower to read than files, so expect more CPU time than that.
+On arm64 with a fake `/sys`: 188 KiB of memory. Real sensors are slower to read than
+files, so expect more CPU time than the simulator shows.

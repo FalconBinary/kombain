@@ -114,7 +114,7 @@ ok "non-ASCII SSID is hex" "$(iwd_file_name 'дом')" "=d0b4d0bed0bc.psk"
 guide=$repo/docs/void-install-guide.md
 for start in 'DISK=/dev/nvme0n1|cfdisk' 'REPO=https://' 'DISK=/dev/nvme0n1|echo voidbox' 'xbps-install -y intel-ucode' \
 	'xbps-install -y mesa-dri' 'cat > /etc/fstab' 'mkdir -p /etc/dracut.conf.d' 'mkdir -p /etc/kernel.d/post-install' \
-	'mkdir -p /etc/iwd' 'IF=enp3s0' "printf 'ignorepkg=dhcpcd" 'mkdir -p /etc/sysctl.d' 'cat > /etc/nftables.conf' 'mkdir -p /etc/sv/game-tune' \
+	'mkdir -p /etc/iwd' 'IF=enp3s0' "printf 'ignorepkg=dhcpcd" "echo 'options nvidia NVreg_DynamicPowerManagement" 'mkdir -p /etc/sysctl.d' 'cat > /etc/nftables.conf' 'mkdir -p /etc/sv/game-tune' \
 	'useradd -m -G wheel' 'xbps-reconfigure -fa' 'cat > /etc/modprobe.d/kombain.conf' 'doas sh -c'; do
 	first=${start%%|*}
 	second=
@@ -219,6 +219,7 @@ has "the host" "echo my-box > /etc/hostname"
 has "the zone" "/usr/share/zoneinfo/Europe/Berlin"
 has "the Intel driver" "mesa-vulkan-intel"
 hasnt "no AMD driver" "mesa-vulkan-radeon"
+hasnt "no NVIDIA sleep setting without NVIDIA" "NVreg_DynamicPowerManagement"
 has "lockdown stays on without NVIDIA" "lockdown=integrity"
 has "wired network" "IF=eth9"
 has "in Dev" "ln -sfn /etc/sv/dhcpcd-eth9 /etc/runit/runsvdir/default/"
@@ -247,6 +248,7 @@ has "the default /" "lvcreate -y -L 81920M -n root vg0"
 has "the NVIDIA card was found" "[3]:"
 has "NVIDIA is told about lockdown" "kernel lockdown stays off"
 has "the NVIDIA driver" "nvidia"
+has "it may sleep when idle" "options nvidia NVreg_DynamicPowerManagement=0x02"
 has "lockdown is replaced" "nvidia_drm.modeset=1"
 has "the desktop" "./install.sh --user dev"
 has "fdash" "chsh -s /usr/local/bin/fdash dev"

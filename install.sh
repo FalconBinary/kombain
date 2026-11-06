@@ -172,6 +172,8 @@ if [ "$zcool" -eq 1 ]; then
 			"$zig" build -Doptimize=ReleaseSafe --prefix "$work/out-zcool"
 	)
 	install -m 755 "$work/out-zcool/bin/zcool" /usr/local/bin/zcool
+	# zcool starts it only when NVIDIA's own driver is loaded
+	install -m 755 "$work/out-zcool/bin/zcool-nvidia" /usr/local/bin/zcool-nvidia
 	install -d /etc/sv/zcool/log
 	install -m 755 "$here/zcool/service/run" "$here/zcool/service/finish" /etc/sv/zcool/
 	install -m 755 "$here/zcool/service/log/run" /etc/sv/zcool/log/

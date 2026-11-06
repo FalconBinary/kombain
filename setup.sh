@@ -531,6 +531,8 @@ step_gpu() {
 		esac
 		line=$(printf '%s\n' "$lines" | grep -F "$pat") || die "the guide has no driver line for: $pat"
 		printf '%s\n' "$line"
+		# guide, step 4: Turing and newer sleep only when the driver is told they may
+		[ "$g" != 3 ] || block "echo 'options nvidia NVreg_DynamicPowerManagement"
 	done
 }
 

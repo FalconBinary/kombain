@@ -163,6 +163,14 @@ xbps-install -y nvidia580                                   # NVIDIA Maxwell, Pa
 
 Заголовки ядра для NVIDIA подтянутся сами, они в зависимостях `dkms`.
 
+**NVIDIA, Turing и новее.** Карты Turing (GTX 16xx, RTX 20xx) засыпают, только если драйверу это разрешить. Без этого дискретная видеокарта в ноутбуке работает всё время, даже на рабочем столе:
+
+```bash
+echo 'options nvidia NVreg_DynamicPowerManagement=0x02' > /etc/modprobe.d/nvidia-sleep.conf
+```
+
+Саму карту отпускает спать `zcool` (шаг 11). Если что-то держит её включённой, это видно в `zcool list`. На настольном ПК, где NVIDIA показывает экран, строка ничего не меняет.
+
 **`/etc/fstab`.** Подставьте UUID раздела EFI из `blkid "${DISK}p1"`.
 
 ```bash
@@ -640,7 +648,7 @@ zcool list
 doas zcool run --dry-run
 ```
 
-Лимиты задаются в `/etc/zcool.conf`, подробности в `zcool/README.md`. Если всё выглядит правильно, включите сервис в обоих режимах:
+Видеокарты он ведёт так же, как процессор: AMD и Intel через `/sys`, NVIDIA через `zcool-nvidia` и библиотеку её драйвера. Видеокарта, которая не показывает экран загрузки, засыпает, когда простаивает, и он её в это время не будит. Лимиты задаются в `/etc/zcool.conf`, подробности в `zcool/README.md`. Если всё выглядит правильно, включите сервис в обоих режимах:
 
 ```bash
 doas ln -s /etc/sv/zcool /etc/runit/runsvdir/default/

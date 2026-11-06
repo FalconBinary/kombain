@@ -89,6 +89,22 @@ pub const Throttle = struct {
     }
 };
 
+/// The longest a GPU that may sleep goes unread while it has nothing to do. Every read keeps
+/// it awake, and the kernel lets it sleep only after a few idle seconds (amdgpu: 5).
+pub const quiet_period_ms: i64 = 10_000;
+
+/// Nothing could need doing soon: well below the limit, no power taken, no fan held.
+pub fn isQuiet(forecast: f32, limit: f32, level: f32, fans_held: bool) bool {
+    return forecast < limit - fan_band - 10 and level >= 1 and !fans_held;
+}
+
+/// How long until the next read: `busy_ms` while there is something to watch, and while
+/// quiet a gap that doubles up to `quiet_period_ms`, long enough for the GPU to fall asleep.
+pub fn readPeriod(current_ms: i64, busy_ms: i64, quiet: bool) i64 {
+    if (!quiet) return busy_ms;
+    return @min(quiet_period_ms, @max(2 * current_ms, 2000));
+}
+
 /// Picks the limit a chip really gets: never above its critical point minus a margin.
 pub fn clampLimit(wanted: f32, crit: f32, fallback_ceiling: f32) f32 {
     const ceiling = if (crit > 0) crit - 5 else fallback_ceiling;
@@ -176,6 +192,23 @@ test "fans never go below the firmware speed and release after a while" {
     try std.testing.expect(fan.canRelease());
     fan.update(120, 0.5, 0.25);
     try std.testing.expect(!fan.canRelease());
+}
+
+test "an idle GPU is read less and less often, a busy one at once" {
+    try std.testing.expect(isQuiet(50, 85, 1, false));
+    try std.testing.expect(!isQuiet(70, 85, 1, false));
+    try std.testing.expect(!isQuiet(50, 85, 0.9, false));
+    try std.testing.expect(!isQuiet(50, 85, 1, true));
+    var period: i64 = 0;
+    var waited: i64 = 0;
+    while (period < quiet_period_ms) {
+        period = readPeriod(period, 0, true);
+        waited += period;
+    }
+    try std.testing.expectEqual(quiet_period_ms, period);
+    // asleep within the first half minute of doing nothing
+    try std.testing.expect(waited <= 30_000);
+    try std.testing.expectEqual(@as(i64, 1000), readPeriod(quiet_period_ms, 1000, false));
 }
 
 test "a limit cannot be set above the critical point minus the margin" {

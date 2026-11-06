@@ -24,7 +24,7 @@ mango, dependencies included, from the Void x86_64 index in November 2026.
 | Terminal | foot, as a server | 1 MiB | alacritty (8.6 MiB), kitty (80.5 MiB) |
 | Screen lock | swaylock | 0.1 MiB | |
 | Firewall | nftables, loaded before the network | 25.4 MiB | |
-| Temperatures | [zcool](zcool/): a limit per chip, fans first, then a little power | 0.1 MiB | |
+| Temperatures | [zcool](zcool/): a limit per chip, CPU and every GPU, fans first, then a little power; a GPU that shows nothing sleeps when idle | 0.1 MiB, 0.2 MiB more with NVIDIA's driver | |
 | Search | ripgrep, fd, fzf, jq | 15.3 MiB | |
 | Multiplexer | tmux | 1.6 MiB | zellij (49.3 MiB) |
 | Files | nnn | 0.4 MiB | yazi (41.2 MiB) |
@@ -119,7 +119,7 @@ terminal server, WirePlumber's camera and MIDI watchers, the package cache (also
 locales, wpa_supplicant (iwd does Wi-Fi and its addresses), dhcpcd without a cable, and with `setup.sh` the
 firmware of vendors the machine doesn't have and iwd without Wi-Fi.
 Fewer timers: no kernel watchdog or KFENCE sampling, fewer writeback and vmstat wakeups. In Dev mode idle PCI devices may sleep,
-except the GPU and USB. Gaming mode keeps everything at full speed.
+except GPUs and USB; zcool lets a GPU that shows nothing sleep, and does not wake it. Gaming mode keeps everything at full speed.
 
 The programs are built with `ReleaseSafe`: it keeps bounds checks, and against `ReleaseFast` it made no measurable difference
 to the panel's frame time. `ReleaseSmall` was about ten times slower per frame for under 0.1 MiB of memory.
@@ -134,7 +134,8 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
 - Firewall: `tests/firewall.sh` sends real traffic between network namespaces,
   including a broken config and a missing one.
 - gconv cache: `tests/gconv-cache.sh`, including a stale and a damaged cache.
-- zcool: unit tests and a thermal simulator, `zcool/tests/sim.py`.
+- zcool: unit tests and a thermal simulator, `zcool/tests/sim.py`, with AMD, Intel and
+  NVIDIA GPUs; NVIDIA's library is a stand-in there.
 - `setup.sh`: `tests/setup-logic.sh` checks its arithmetic and dry runs, with fake commands that
   fail if anything changing a disk is called. In a VM, on a disk with other device names,
   it is answered like a person, wrong answers first, and then gets the same checks as the guide;
@@ -173,7 +174,7 @@ Not checked yet:
   OVMF's.
 - **Power saving on real devices.** A device that misbehaves when asleep shows up only on real hardware. To
   turn it off: `rm /etc/runit/core-services/91-power-save.sh`.
-- **zcool on real sensors and fans.** Real drivers and chips differ from the model,
+- **zcool on real sensors and fans,** and with NVIDIA's real library. Real drivers and chips differ from the model,
   so start with `--dry-run`. Undervolting has not run on any CPU.
 
 ## Licenses

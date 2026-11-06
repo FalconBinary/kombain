@@ -4,6 +4,7 @@
 //!
 //!     cpu0.max = 85          limit for one chip, in degrees C
 //!     fan.exclude = nct6798/pwm3
+//!     gpu.sleep = no         keep GPUs that do not show the boot screen awake
 //!     undervolt.core = -50   millivolts, Intel only, see README
 //!     undervolt.cache = -50
 
@@ -22,6 +23,7 @@ pub const Config = struct {
     nexcludes: usize = 0,
     undervolt_core: i32 = 0,
     undervolt_cache: i32 = 0,
+    gpu_sleep: bool = true,
     bad_lines: u32 = 0,
 
     pub fn limitFor(self: *const Config, id: []const u8) ?f32 {
@@ -67,6 +69,10 @@ fn apply(c: *Config, key: []const u8, value: []const u8) bool {
         c.nexcludes += 1;
         return true;
     }
+    if (std.mem.eql(u8, key, "gpu.sleep")) {
+        if (std.mem.eql(u8, value, "yes")) c.gpu_sleep = true else if (std.mem.eql(u8, value, "no")) c.gpu_sleep = false else return false;
+        return true;
+    }
     if (std.mem.eql(u8, key, "undervolt.core") or std.mem.eql(u8, key, "undervolt.cache")) {
         const mv = std.fmt.parseInt(i32, value, 10) catch return false;
         if (mv > 0) return false; // this tool only ever lowers a voltage
@@ -100,6 +106,7 @@ test "parses limits, excludes and undervolt, and counts what it cannot read" {
         \\cpu1.max = hot
         \\undervolt.core = 50
         \\unknown = 1
+        \\gpu.sleep = maybe
     );
     try std.testing.expectEqual(@as(f32, 85), c.limitFor("cpu0").?);
     try std.testing.expectEqual(@as(f32, 80), c.limitFor("gpu0").?);
@@ -108,5 +115,7 @@ test "parses limits, excludes and undervolt, and counts what it cannot read" {
     try std.testing.expect(!c.isExcluded("nct6798/pwm2"));
     try std.testing.expectEqual(@as(i32, -50), c.undervolt_core);
     try std.testing.expectEqual(@as(i32, -40), c.undervolt_cache);
-    try std.testing.expectEqual(@as(u32, 4), c.bad_lines);
+    try std.testing.expectEqual(@as(u32, 5), c.bad_lines);
+    try std.testing.expect(c.gpu_sleep);
+    try std.testing.expect(!parse("gpu.sleep = no").gpu_sleep);
 }

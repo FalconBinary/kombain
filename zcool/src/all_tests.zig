@@ -4,4 +4,6 @@ test {
     _ = @import("control.zig");
     _ = @import("config.zig");
     _ = @import("undervolt_code.zig");
+    _ = @import("gpus.zig");
+    _ = @import("nvidia.zig");
 }

@@ -2,10 +2,11 @@
 
 //! zcool: keeps every chip under the temperature you set, with as little lost speed as possible.
 //!
-//! It only uses what the kernel exposes in /sys: hwmon for temperatures and fans,
-//! powercap and cpufreq for the CPU, the amdgpu power cap for the GPU. It never
-//! takes over a chip's own protection: PROCHOT and the thermal shutdown stay in
-//! hardware and keep working if this daemon is gone.
+//! It uses what the kernel exposes in /sys: hwmon for temperatures and fans, powercap
+//! and cpufreq for the CPU, a GPU's power cap, and runtime power management to let a GPU
+//! that shows nothing sleep. NVIDIA's own driver has nothing there; zcool-nvidia reads it
+//! through NVIDIA's library. It never takes over a chip's own protection: PROCHOT and the
+//! thermal shutdown stay in hardware and keep working if this daemon is gone.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -14,6 +15,8 @@ const config = @import("config.zig");
 const journal = @import("journal.zig");
 const undervolt = @import("undervolt.zig");
 const sandbox = @import("sandbox.zig");
+const gpus = @import("gpus.zig");
+const nvidia = @import("nvidia.zig");
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = false,
@@ -38,6 +41,8 @@ fn emergencyRestore() void {
     if (restoring) return;
     restoring = true;
     if (!dry_run) _ = journal.restore();
+    // zcool-nvidia puts NVIDIA's settings back when its input ends
+    nvidia.closeNow();
 }
 
 const max_chips = 16;
@@ -49,6 +54,29 @@ const max_packages = 8;
 const take_tries = 20;
 
 const Kind = enum { cpu, gpu, nvme, other };
+const Backend = enum { hwmon, nvidia };
+/// How a NVIDIA GPU is held under its limit, found the first time it is needed.
+const Lever = enum { unknown, limit, clocks, none };
+/// zcool-nvidia's answers take a library call; once a second is plenty for a GPU.
+const nvidia_period_ms = 1000;
+
+const Nv = struct {
+    /// a first reading came in: the limits, clocks and fans the driver reports are known
+    known: bool = false,
+    util: u32 = 0,
+    power_mw: u32 = 0,
+    limit: u32 = 0,
+    limit_min: u32 = 0,
+    limit_max: u32 = 0,
+    max_clock: u32 = 0,
+    reference: u32 = 0,
+    lever: Lever = .unknown,
+    /// a limit is set and not yet given back
+    changed: bool = false,
+    /// the helper has let go of the driver, so the GPU can sleep
+    rested: bool = false,
+    fan: [nvidia.max_fans]u8 = @splat(0),
+};
 
 const Sensor = struct {
     fd: i32,
@@ -90,6 +118,12 @@ const Chip = struct {
     cap_reference: i64 = 0,
     power_fd: i32 = -1,
     runtime_fd: i32 = -1,
+    backend: Backend = .hwmon,
+    /// for a GPU, its place in gpus.list
+    gpu: i8 = -1,
+    /// it may sleep: read only as often as needed, so that it can
+    sleepy: bool = false,
+    nv: Nv = .{},
 
     fn name(self: *const Chip) []const u8 {
         return self.id[0..self.id_len];
@@ -120,6 +154,8 @@ const Fan = struct {
     ctl: control.Fan = .{},
     stalled_for: f32 = 0,
     stall_logged: bool = false,
+    /// a fan NVIDIA's driver runs: zcool-nvidia sets it, in percent
+    nv_index: i8 = -1,
 
     fn name(self: *const Fan) []const u8 {
         return self.id[0..self.id_len];
@@ -167,6 +203,8 @@ var cfg = config.Config{};
 
 var dry_run: bool = false;
 var stop_requested: bool = false;
+/// `zcool list`: what the daemon says as it goes is left out of the tables.
+var listing: bool = false;
 
 // ---------------------------------------------------------------- discovery
 
@@ -254,7 +292,13 @@ fn scanHwmon(base: []const u8) void {
                     .other => setId(c, "{s}{d}", .{ chip_name, otherIndex(chip_name) }),
                 }
                 c.period_ms = if (kind == .nvme) 5000 else 0;
-                if (kind == .gpu) setUpGpu(c, base);
+                if (kind == .gpu) {
+                    setUpGpu(c, base);
+                    if (gpus.forHwmon(base)) |g| {
+                        c.gpu = @intCast(g);
+                        c.sleepy = gpus.list[g].may_sleep and !gpus.list[g].boot;
+                    }
+                }
                 nchips += 1;
             }
             const c = &chips[chip_index.?];
@@ -320,19 +364,20 @@ fn addFan(base: []const u8, chip_name: []const u8, digits: []const u8, kind: Kin
 
 fn setUpGpu(c: *Chip, base: []const u8) void {
     var path_buf: [256]u8 = undefined;
-    const cap = sys.join(&path_buf, &.{ base, "/power1_cap" });
-    if (cap.len > 0 and cap.len <= c.cap_path.len) {
-        if (sys.readInt(cap)) |value| {
-            if (value > 0) {
-                @memcpy(c.cap_path[0..cap.len], cap);
-                c.cap_len = @intCast(cap.len);
-                c.cap_base = value;
-                c.cap_min = sys.readInt(sys.join(&path_buf, &.{ base, "/power1_cap_min" })) orelse 0;
-                c.cap_reference = value;
-                c.power_fd = sys.openRead(sys.join(&path_buf, &.{ base, "/power1_average" })) orelse
-                    sys.openRead(sys.join(&path_buf, &.{ base, "/power1_input" })) orelse -1;
-            }
-        }
+    // amdgpu calls its power limit power1_cap, Intel's discrete GPUs power1_max
+    for ([_][]const u8{ "/power1_cap", "/power1_max" }) |file| {
+        const cap = sys.join(&path_buf, &.{ base, file });
+        if (cap.len == 0 or cap.len > c.cap_path.len) continue;
+        const value = sys.readInt(cap) orelse continue;
+        if (value <= 0) continue;
+        @memcpy(c.cap_path[0..cap.len], cap);
+        c.cap_len = @intCast(cap.len);
+        c.cap_base = value;
+        c.cap_min = sys.readInt(sys.join(&path_buf, &.{ base, file, "_min" })) orelse 0;
+        c.cap_reference = value;
+        c.power_fd = sys.openRead(sys.join(&path_buf, &.{ base, "/power1_average" })) orelse
+            sys.openRead(sys.join(&path_buf, &.{ base, "/power1_input" })) orelse -1;
+        break;
     }
     c.runtime_fd = sys.openRead(sys.join(&path_buf, &.{ base, "/device/power/runtime_status" })) orelse -1;
 }
@@ -435,12 +480,109 @@ fn discover() void {
     for (chips[0..nchips]) |*c| {
         c.no_actuator = c.kind != .cpu and c.cap_len == 0;
     }
+    addNvidiaChips();
+}
+
+/// A GPU on NVIDIA's own driver. Its limits and fans come with the first reading, which is
+/// not taken while it sleeps.
+fn addNvidiaChips() void {
+    for (gpus.list[0..gpus.count], 0..) |*g, i| {
+        if (!g.proprietary() or nchips == max_chips) continue;
+        var path_buf: [256]u8 = undefined;
+        if (!sys.exists(sys.join(&path_buf, &.{ sys.root, "/proc/driver/nvidia/gpus/", g.address(), "/information" }))) continue;
+        chips[nchips] = .{ .kind = .gpu, .backend = .nvidia, .gpu = @intCast(i) };
+        const c = &chips[nchips];
+        setId(c, "gpu{d}", .{count_of[@backingInt(Kind.gpu)]});
+        count_of[@backingInt(Kind.gpu)] += 1;
+        c.sleepy = g.may_sleep and !g.boot;
+        c.period_ms = nvidia_period_ms;
+        c.runtime_fd = sys.openRead(gpus.devicePath(&path_buf, g.address(), "power/runtime_status")) orelse -1;
+        nchips += 1;
+    }
+}
+
+fn hasNvidia() bool {
+    for (chips[0..nchips]) |*c| if (c.backend == .nvidia) return true;
+    return false;
+}
+
+fn busOf(c: *const Chip) []const u8 {
+    return gpus.list[@intCast(c.gpu)].address();
+}
+
+/// Sends a request that changes something; true when zcool-nvidia says it took.
+fn helperDid(comptime fmt: []const u8, args: anytype) bool {
+    var buf: [96]u8 = undefined;
+    const request = std.fmt.bufPrint(&buf, fmt, args) catch return false;
+    const reply = nvidia.ask(request, 5000) orelse return false;
+    return std.mem.eql(u8, reply, "ok");
+}
+
+/// What the driver says, and the first time also what it allows: the limit follows from its thresholds.
+fn readNvidia(c: *Chip, index: usize) ?f32 {
+    var buf: [48]u8 = undefined;
+    const request = std.fmt.bufPrint(&buf, "read {s}", .{busOf(c)}) catch return null;
+    const line = nvidia.ask(request, 5000) orelse return null;
+    const r = nvidia.parse(line) orelse return null;
+    c.nv.util = r.util orelse 0;
+    c.nv.power_mw = r.power_mw orelse 0;
+    c.nv.fan = r.fan;
+    c.nv.rested = false;
+    if (!c.nv.known) {
+        c.nv.known = true;
+        const slowdown = r.slowdown orelse 0;
+        c.crit = if (slowdown >= 50 and slowdown <= 130) slowdown else 0;
+        if (cfg.limitFor(c.name())) |wanted| {
+            c.limit = control.clampLimit(wanted, c.crit, 100);
+            if (c.limit != wanted) sys.printf("{s}: limit {d:.0} is outside the safe range, using {d:.0}\n", .{ c.name(), wanted, c.limit });
+        } else {
+            // the driver's own target, when it gives one with room below the slowdown point
+            const own = r.gpu_max orelse 0;
+            c.limit = if (c.crit > 0 and own >= 50 and own <= c.crit - 5) own else if (c.crit > 0) c.crit - 15 else 85;
+        }
+        c.nv.limit = r.limit orelse 0;
+        c.nv.limit_min = r.limit_min orelse 0;
+        c.nv.limit_max = r.limit_max orelse 0;
+        c.nv.max_clock = r.max_clock orelse 0;
+        addNvidiaFans(c, index, r.fans);
+        if (!listing) {
+            if (r.fans == 0) {
+                sys.printf("{s}: NVIDIA at {s}, limit {d:.0}C, shares the board's fans\n", .{ c.name(), busOf(c), c.limit });
+            } else {
+                sys.printf("{s}: NVIDIA at {s}, limit {d:.0}C, {d} fan(s) of its own\n", .{ c.name(), busOf(c), c.limit, r.fans });
+            }
+        }
+    }
+    if (c.crit > 0 and r.temp >= c.crit - 3) c.emergency = true;
+    return r.temp;
+}
+
+fn addNvidiaFans(c: *Chip, index: usize, count: u8) void {
+    var i: u8 = 0;
+    while (i < count and nfans < max_fans) : (i += 1) {
+        var id_buf: [40]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "{s}/fan{d}", .{ c.name(), i }) catch return;
+        if (cfg.isExcluded(id)) continue;
+        var fan = Fan{ .owner = @intCast(index), .nv_index = @intCast(i) };
+        @memcpy(fan.id[0..id.len], id);
+        fan.id_len = @intCast(id.len);
+        fans[nfans] = fan;
+        nfans += 1;
+        c.own_fans = true;
+    }
 }
 
 // ---------------------------------------------------------------- actuators
 
 /// Each value is read once: what the journal keeps is what `releaseFan` writes back.
 fn takeFan(fan: *Fan) bool {
+    if (fan.nv_index >= 0) {
+        // never below what the driver runs it at now, like any other fan
+        fan.floor = @as(f32, @floatFromInt(chips[@intCast(fan.owner)].nv.fan[@intCast(fan.nv_index)])) * 255 / 100;
+        fan.ctl = .{ .duty = fan.floor };
+        fan.written = -1;
+        return true;
+    }
     var pwm_buf: [200]u8 = undefined;
     var enable_buf: [200]u8 = undefined;
     const pwm = fan.pwmPath(&pwm_buf);
@@ -467,6 +609,12 @@ fn takeFan(fan: *Fan) bool {
 fn releaseFan(fan: *Fan) void {
     fan.managed = false;
     if (dry_run) return;
+    if (fan.nv_index >= 0) {
+        const c = &chips[@intCast(fan.owner)];
+        // asleep, the GPU has dropped it already, and asking would wake it
+        if (!c.asleep) _ = helperDid("fan {s} {d} auto", .{ busOf(c), fan.nv_index });
+        return;
+    }
     var pwm_buf: [200]u8 = undefined;
     var enable_buf: [200]u8 = undefined;
     if (fan.enable_len > 0) {
@@ -505,7 +653,11 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
     if (fan.written < 0 or @abs(duty - fan.written) >= 2 or (duty == 255 and fan.written != 255)) {
         if (!dry_run) {
             var pwm_buf: [200]u8 = undefined;
-            if (!sys.writeInt(fan.pwmPath(&pwm_buf), duty)) {
+            const done = if (fan.nv_index >= 0)
+                helperDid("fan {s} {d} {d}", .{ busOf(&chips[@intCast(fan.owner)]), fan.nv_index, @divTrunc(duty * 100 + 127, 255) })
+            else
+                sys.writeInt(fan.pwmPath(&pwm_buf), duty);
+            if (!done) {
                 sys.printf("{s}: write failed, leaving it to the firmware\n", .{fan.name()});
                 releaseFan(fan);
                 fan.unusable = true;
@@ -642,36 +794,111 @@ fn applyGpu(c: *Chip, level: f32) void {
     _ = sys.writeInt(path, @max(target, c.cap_min));
 }
 
+fn nvLimit(c: *Chip, level: f32, starting: bool) bool {
+    if (c.nv.limit_max == 0 or c.nv.limit_min >= c.nv.limit_max) return false;
+    if (level >= 1) return helperDid("limit {s} default", .{busOf(c)});
+    // a limit far above what the GPU draws does nothing: start from the real power
+    if (starting) c.nv.reference = if (c.nv.power_mw > 5000) @min(c.nv.power_mw, c.nv.limit) else c.nv.limit;
+    const wanted: u32 = @intFromFloat(@as(f32, @floatFromInt(c.nv.reference)) * level);
+    return helperDid("limit {s} {d}", .{ busOf(c), std.math.clamp(wanted, c.nv.limit_min, c.nv.limit_max) });
+}
+
+fn nvClocks(c: *Chip, level: f32) bool {
+    if (c.nv.max_clock == 0) return false;
+    if (level >= 1) return helperDid("clocks {s} reset", .{busOf(c)});
+    const wanted: u32 = @intFromFloat(@as(f32, @floatFromInt(c.nv.max_clock)) * level);
+    return helperDid("clocks {s} {d}", .{ busOf(c), wanted });
+}
+
+/// A power limit where the driver takes one (desktop cards); a clock limit where it does
+/// not (most laptops); else the GPU is left to its own protection.
+fn applyNvidia(c: *Chip, level: f32) void {
+    if (!c.nv.known or c.nv.lever == .none) return;
+    if (level == c.cap_applied or (level < 1 and @abs(level - c.cap_applied) < 0.01)) return;
+    const starting = c.cap_applied >= 1;
+    c.cap_applied = level;
+    if (level >= 1 and !c.nv.changed) return;
+    if (dry_run) return;
+    switch (c.nv.lever) {
+        .unknown => {
+            if (nvLimit(c, level, starting)) {
+                c.nv.lever = .limit;
+            } else if (nvClocks(c, level)) {
+                c.nv.lever = .clocks;
+            } else {
+                c.nv.lever = .none;
+                c.no_actuator = true;
+                sys.printf("{s}: the driver takes no power or clock limit: fans and its own protection only\n", .{c.name()});
+                return;
+            }
+            sys.printf("{s}: holding it with {s}\n", .{ c.name(), if (c.nv.lever == .limit) "its power limit" else "a clock limit" });
+        },
+        .limit => _ = nvLimit(c, level, starting),
+        .clocks => _ = nvClocks(c, level),
+        .none => return,
+    }
+    c.nv.changed = level < 1;
+}
+
 // ---------------------------------------------------------------- the loop
+
+/// Its state comes from the kernel, which reads nothing from the GPU: this does not wake it.
+fn isAsleep(c: *const Chip) bool {
+    var state: [16]u8 = undefined;
+    const n = sys.pread(c.runtime_fd, &state, 0) orelse 0;
+    return n >= 9 and std.mem.startsWith(u8, state[0..n], "suspended");
+}
+
+fn owns(fan: *const Fan, index: usize) bool {
+    return fan.owner >= 0 and @as(usize, @intCast(fan.owner)) == index;
+}
+
+fn ownFansHeld(index: usize) bool {
+    for (fans[0..nfans]) |*f| if (owns(f, index) and f.managed) return true;
+    return false;
+}
 
 fn readChips(now: i64) bool {
     for (chips[0..nchips], 0..) |*c, index| {
-        if (now < c.due_ms) continue;
-        c.due_ms = now + c.period_ms;
         if (c.runtime_fd >= 0) {
             // reading a sensor would wake a sleeping GPU and waste more power than it saves
-            var state: [16]u8 = undefined;
-            const n = sys.pread(c.runtime_fd, &state, 0) orelse 0;
-            c.asleep = n >= 9 and std.mem.startsWith(u8, state[0..n], "suspended");
-            if (c.asleep) continue;
+            const asleep = isAsleep(c);
+            if (asleep != c.asleep) {
+                c.asleep = asleep;
+                if (asleep) {
+                    // whatever was set on it is gone with its power, or comes back on its own
+                    if (c.nv.changed) c.cap_applied = -1;
+                } else {
+                    // awake again, maybe for a game: look at once
+                    c.period_ms = if (c.backend == .nvidia) nvidia_period_ms else 0;
+                    c.due_ms = now;
+                }
+            }
+            if (asleep) continue;
         }
-        var best: f32 = -1000;
-        var primary: f32 = -1000;
-        var good = false;
+        if (now < c.due_ms) continue;
+        c.due_ms = now + c.period_ms;
+        var reading: ?f32 = null;
         c.emergency = false;
-        for (sensors[0..nsensors]) |*s| {
-            if (s.chip != index) continue;
-            const milli = sys.readIntFd(s.fd) orelse continue;
-            const t = @as(f32, @floatFromInt(milli)) / 1000;
-            // some inputs are not wired to anything and read 0 or 127
-            if (t <= 0 or t >= 125) continue;
-            good = true;
-            s.last = t;
-            best = @max(best, t);
-            if (s.primary) primary = t;
-            if (s.crit > 0 and t >= s.crit - 3) c.emergency = true;
+        if (c.backend == .nvidia) {
+            reading = readNvidia(c, index);
+        } else {
+            var best: f32 = -1000;
+            var primary: f32 = -1000;
+            for (sensors[0..nsensors]) |*s| {
+                if (s.chip != index) continue;
+                const milli = sys.readIntFd(s.fd) orelse continue;
+                const t = @as(f32, @floatFromInt(milli)) / 1000;
+                // some inputs are not wired to anything and read 0 or 127
+                if (t <= 0 or t >= 125) continue;
+                s.last = t;
+                best = @max(best, t);
+                if (s.primary) primary = t;
+                if (s.crit > 0 and t >= s.crit - 3) c.emergency = true;
+            }
+            if (best > -1000) reading = if (c.has_primary and primary > -1000) primary else best;
         }
-        if (!good) {
+        if (reading == null) {
             c.failures +|= 1;
             if (c.failures < 5 or !c.controlled()) continue;
             if (c.thermal.ready) {
@@ -688,14 +915,38 @@ fn readChips(now: i64) bool {
         c.failures = 0;
         const dt = if (c.last_read_ms == 0) 0 else @as(f32, @floatFromInt(now - c.last_read_ms)) / 1000;
         c.last_read_ms = now;
-        c.thermal.update(if (c.has_primary and primary > -1000) primary else best, dt);
+        c.thermal.update(reading.?, dt);
+        if (c.sleepy) pace(c, index, now);
     }
     return true;
 }
 
+/// A GPU that may sleep is read less often while it has nothing to do, and NVIDIA's library
+/// is let go of: each read would keep it awake.
+fn pace(c: *Chip, index: usize, now: i64) void {
+    const limit = if (c.controlled()) c.limit else 85;
+    const quiet = control.isQuiet(c.thermal.forecast(), limit, c.throttle.level, ownFansHeld(index)) and c.nv.util == 0;
+    c.period_ms = control.readPeriod(c.period_ms, if (c.backend == .nvidia) nvidia_period_ms else 0, quiet);
+    c.due_ms = now + c.period_ms;
+    if (c.backend == .nvidia and quiet and !c.nv.rested and c.period_ms >= 4000) {
+        c.nv.rested = helperDid("rest", .{});
+    }
+}
+
+/// True when every fan of the chip's own is at full: then the shared fans help it too.
+fn ownFansSpent(index: usize) bool {
+    for (fans[0..nfans]) |*f| {
+        if (!owns(f, index) or f.unusable) continue;
+        if (!f.managed or f.ctl.duty < 254) return false;
+    }
+    return true;
+}
+
+/// A GPU's own fans serve only that GPU. The rest cool every chip that has none of its own,
+/// and one that has, once its own have nothing left: a case fan before taking power.
 fn fanServes(fan: *const Fan, index: usize) bool {
     if (fan.owner >= 0) return @as(usize, @intCast(fan.owner)) == index;
-    return !chips[index].own_fans;
+    return !chips[index].own_fans or ownFansSpent(index);
 }
 
 fn noMoreCooling(index: usize) bool {
@@ -730,7 +981,7 @@ fn step(dt: f32) void {
                 cpu_level = @min(cpu_level, c.throttle.level);
                 if (c.thermal.temp > c.limit + 2) cpu_over = true;
             },
-            .gpu => applyGpu(c, c.throttle.level),
+            .gpu => if (c.backend == .nvidia) applyNvidia(c, c.throttle.level) else applyGpu(c, c.throttle.level),
             else => {},
         }
     }
@@ -780,6 +1031,7 @@ fn installSignals() void {
     const linux = std.os.linux;
     var stop = linux.Sigaction{ .handler = .{ .handler = onStop }, .mask = linux.sigemptyset(), .flags = 0 };
     for ([_]linux.SIG{ .TERM, .INT, .HUP }) |signal| _ = linux.sigaction(signal, &stop, null);
+    sys.ignoreSigpipe();
     var crash = linux.Sigaction{ .handler = .{ .handler = onCrash }, .mask = linux.sigemptyset(), .flags = 0 };
     for ([_]linux.SIG{ .SEGV, .BUS, .ILL, .FPE, .ABRT }) |signal| _ = linux.sigaction(signal, &crash, null);
 }
@@ -810,9 +1062,20 @@ fn runDaemon(selftest: bool) u8 {
         // left over from a crash: back to the originals before reading them as the new originals
         const leftovers = journal.restore();
         if (leftovers > 0) sys.printf("restored {d} value(s) left by an earlier run\n", .{leftovers});
+        _ = nvidia.resetLeftovers();
     }
+    gpus.scan();
+    if (cfg.gpu_sleep) gpus.allowSleep(dry_run);
     discover();
     installSignals();
+    // started before the sandbox, which allows no programs to run
+    if (hasNvidia()) {
+        if (nvidia.start()) {
+            sys.print("zcool-nvidia: reading NVIDIA's GPUs through its library\n");
+        } else {
+            sys.print("zcool-nvidia did not start: NVIDIA's GPUs are left to their driver\n");
+        }
+    }
 
     var undervolted = false;
     if (dry_run) {
@@ -846,6 +1109,7 @@ fn runDaemon(selftest: bool) u8 {
         const dt = @as(f32, @floatFromInt(now - last)) / 1000;
         last = now;
         if (!readChips(now)) {
+            nvidia.stop();
             emergencyRestore();
             return 1;
         }
@@ -858,39 +1122,80 @@ fn runDaemon(selftest: bool) u8 {
         sys.sleepMs(tickMs());
     }
     if (undervolted) undervolt.markStable();
+    nvidia.stop();
     emergencyRestore();
     return 0;
 }
 
 fn listChips() void {
+    listing = true;
+    gpus.scan();
     discover();
+    if (hasNvidia()) _ = nvidia.start();
     const now = sys.nowMs();
     _ = readChips(now);
     sys.print("chip            now  limit   crit  power control\n");
-    for (chips[0..nchips], 0..) |*c, index| {
+    for (chips[0..nchips]) |*c| {
         const power: []const u8 = switch (c.kind) {
             .cpu => if (cpu_power.rapl_count > 0) "rapl" else if (cpu_power.npolicies > 0) "freq" else "none",
-            .gpu => if (c.cap_len > 0) "cap" else "none",
+            .gpu => if (c.backend == .nvidia)
+                (if (!c.nv.known) "?" else if (c.nv.limit_max > c.nv.limit_min) "limit" else if (c.nv.max_clock > 0) "clocks" else "none")
+            else if (c.cap_len > 0) "cap" else "none",
             else => "none",
         };
-        _ = index;
-        if (c.limit > 0) {
+        if (c.asleep) {
+            sys.printf("{s:<14} asleep, not woken to read it\n", .{c.name()});
+        } else if (c.limit > 0) {
             sys.printf("{s:<14} {d:>4.0}  {d:>5.0}  {d:>5.0}  {s}\n", .{ c.name(), c.thermal.temp, c.limit, c.crit, power });
         } else {
             sys.printf("{s:<14} {d:>4.0}  watch  {d:>5.0}  {s}\n", .{ c.name(), c.thermal.temp, c.crit, power });
         }
     }
-    var nvidia_buf: [256]u8 = undefined;
-    if (sys.exists(sys.join(&nvidia_buf, &.{ sys.root, "/proc/driver/nvidia/version" }))) {
-        sys.print("\nNVIDIA's proprietary driver has no sensors in /sys: that GPU is not covered\n");
+    if (hasNvidia() and !nvidia.running()) {
+        sys.print("\nzcool-nvidia or NVIDIA's library is missing: that GPU is left to its driver\n");
     }
+    listGpus();
     if (nfans == 0) sys.print("\nno controllable fans found\n") else sys.print("\nfan                       duty    rpm\n");
     for (fans[0..nfans]) |*f| {
+        if (f.nv_index >= 0) {
+            const c = &chips[@intCast(f.owner)];
+            sys.printf("{s:<24} {d:>4}%      -\n", .{ f.name(), c.nv.fan[@intCast(f.nv_index)] });
+            continue;
+        }
         var pwm_buf: [200]u8 = undefined;
-        const duty = sys.readInt(f.pwmPath(&pwm_buf)) orelse -1;
-        const rpm = if (f.input_fd >= 0) sys.readIntFd(f.input_fd) orelse -1 else -1;
-        sys.printf("{s:<24} {d:>5}  {d:>5}\n", .{ f.name(), duty, rpm });
+        var duty_buf: [8]u8 = undefined;
+        var rpm_buf: [8]u8 = undefined;
+        const duty = if (sys.readInt(f.pwmPath(&pwm_buf))) |v| std.fmt.bufPrint(&duty_buf, "{d}", .{v}) catch "?" else "?";
+        const rpm = if (f.input_fd >= 0) (if (sys.readIntFd(f.input_fd)) |v| std.fmt.bufPrint(&rpm_buf, "{d}", .{v}) catch "?" else "?") else "-";
+        sys.printf("{s:<24} {s:>5}  {s:>5}\n", .{ f.name(), duty, rpm });
     }
+    nvidia.stop();
+}
+
+/// Each GPU: whether it shows the boot screen, whether it may sleep, and what keeps it awake.
+fn listGpus() void {
+    if (gpus.count == 0) return;
+    sys.print("\ngpu            driver    screen  sleeps     now\n");
+    for (gpus.list[0..gpus.count]) |*g| {
+        var state_buf: [16]u8 = undefined;
+        const state = gpus.state(g, &state_buf);
+        const sleeps: []const u8 = if (g.boot) "no" else if (g.may_sleep) "when idle" else "no";
+        sys.printf("{s:<14} {s:<9} {s:<7} {s:<10} {s}\n", .{ g.address(), g.driverName(), if (g.boot) "boot" else "-", sleeps, state });
+        if (g.boot) {
+            if (g.vendor == .intel and !hasChipFor(g)) sys.print("  its heat counts in the CPU's package power limit\n");
+            continue;
+        }
+        if (!g.may_sleep) sys.print("  `zcool run` lets it sleep when idle; `gpu.sleep = no` keeps it awake\n");
+        gpus.explainNvidia(g, "  ");
+        if (!std.mem.eql(u8, state, "suspended")) gpus.printHolders(g);
+    }
+}
+
+fn hasChipFor(g: *const gpus.Gpu) bool {
+    for (chips[0..nchips]) |*c| {
+        if (c.gpu >= 0 and &gpus.list[@intCast(c.gpu)] == g) return true;
+    }
+    return false;
 }
 
 const usage =
@@ -909,6 +1214,7 @@ const usage =
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     const argv = init.args.vector;
+    nvidia.setEnvironment(init.environ.block.slice.ptr);
     var command: []const u8 = "";
     var sub: []const u8 = "";
     var config_path: ?[:0]const u8 = null;
@@ -936,6 +1242,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (std.mem.eql(u8, command, "restore")) {
         const n = journal.restore();
         sys.printf("restored {d} value(s)\n", .{n});
+        _ = nvidia.resetLeftovers();
         return 0;
     }
     if (std.mem.eql(u8, command, "list")) {

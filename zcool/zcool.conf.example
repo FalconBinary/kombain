@@ -6,6 +6,10 @@
 # gpu0.max = 80
 # nvme0.max = 65
 
+# A GPU that does not show the boot screen sleeps when idle. If one misbehaves
+# waking up, keep them all awake:
+# gpu.sleep = no
+
 # Fans zcool must never touch. It already never goes below the speed the firmware
 # had set, so this is for fans you simply want left alone.
 # fan.exclude = nct6798/pwm3

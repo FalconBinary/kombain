@@ -50,9 +50,10 @@ jobs:
       - name: zcool
         working-directory: zcool
         run: |
-          zig fmt --check src build.zig
+          zig fmt --check src build.zig tests/fake_nvml.zig
           zig test src/all_tests.zig
           zig build -Doptimize=ReleaseSafe
+          zig build fake-nvml
           chmod -R a+rX .
           python3 tests/sim.py zig-out/bin/zcool
       - name: Firewall, with real traffic between network namespaces
@@ -81,7 +82,7 @@ jobs:
           ./install.sh --user dev
       - name: What it should have left
         run: |
-          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool mango foot swaylock nft; do
+          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool zcool-nvidia mango foot swaylock nft; do
             command -v "$c"
           done
           su dev -s /usr/local/bin/fdash -c 'echo "fdash runs as $USER"'
