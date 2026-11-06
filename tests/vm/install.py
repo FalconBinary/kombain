@@ -829,6 +829,9 @@ class Run:
         self.boot_disk()
         time.sleep(20)
         self.boot_timeline("boot-dev")
+        print(self.out("k=$(uname -r); for v in 'sloppy:--hostonly-mode sloppy' 'strict without drm:--omit drm'; do "
+                       "dracut -q --force $(echo ${v#*:}) /tmp/variant.img $k 2>/dev/null; "
+                       "echo \"initramfs variant ${v%%:*}: $(($(stat -c %s /tmp/variant.img) / 1024)) KiB, $(lsinitrd /tmp/variant.img | grep -c '^-') files\"; done; rm -f /tmp/variant.img"), flush=True)
         self.unlock_cost()
         self.static_cost("boot-dev")
         self.sh("mv /etc/runit/1.timeless /etc/runit/1")
@@ -883,6 +886,10 @@ class Run:
         print(sleepers, flush=True)
         self.expect("Dev: idle PCI devices may sleep", any(l.endswith(" auto") for l in sleepers.splitlines()), sleepers[:200])
         self.expect("Dev: not the GPU", all(l.endswith(" on") for l in sleepers.splitlines() if l.startswith("0x03")), sleepers[:200])
+        loaded = self.out("cut -d' ' -f1 /proc/modules | grep -xE 'btrfs|raid6_pq|hci_vhci|cuse|nvram|userio'; dmesg | grep -m1 'raid6:'; true")
+        self.expect("Dev: no btrfs, RAID6 benchmark or test devices loaded at boot", loaded == "", loaded)
+        initramfs = self.out("lsinitrd -m /boot/initramfs-*.img | grep -xE 'virtfs|btrfs'; lsinitrd /boot/initramfs-*.img | grep -cE 'firmware/cxgb4|kernel/drivers/usb/storage'; true")
+        self.expect("Dev: the initramfs holds this machine's drivers only", initramfs == "0", initramfs)
         self.expect("Dev: the package locales stay out", self.out("ls /usr/share/locale | wc -l").isdigit() and int(self.out("du -sxm /usr/share/locale | cut -f1")) < 60, self.out("du -sxm /usr/share/locale"))
         self.measure("dev-console")
 

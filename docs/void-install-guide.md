@@ -186,12 +186,13 @@ EOF
 - `noauto` у `/home/dev` обязателен. Ошибка `mount -a` при загрузке Void приводит в аварийную оболочку, а в Gaming этого раздела нет.
 - `noexec` на `/home/gamer` и `/tmp` не ставьте, иначе не запустятся игры.
 
-**Initramfs.** `hostonly_cmdline="no"` нужен, чтобы параметры брались только из Limine и Gaming не спрашивал пароль от `p3`.
+**Initramfs.** `hostonly_cmdline="no"` нужен, чтобы параметры брались только из Limine и Gaming не спрашивал пароль от `p3`. `hostonly_mode="strict"` кладёт в initramfs только драйверы этой машины. В обычном режиме dracut добавляет ещё все драйверы клавиатур, USB, дисков и сетевых карт с их прошивками. После замены диска или его контроллера пересоберите initramfs с ISO: `xbps-reconfigure -f linux6.18` в `xchroot`.
 
 ```bash
 mkdir -p /etc/dracut.conf.d
 cat > /etc/dracut.conf.d/10-local.conf <<'EOF'
 hostonly="yes"
+hostonly_mode="strict"
 hostonly_cmdline="no"
 add_dracutmodules+=" crypt lvm "
 compress="zstd"
@@ -490,6 +491,13 @@ install x25 /bin/false
 install rose /bin/false
 install appletalk /bin/false
 install atm /bin/false
+# Void's stage 1 loads these at every boot only because each has a device file. Nothing here
+# uses them: btrfs alone costs 0.2 s for its RAID6 benchmark and 2 MB. `modprobe btrfs` still works.
+blacklist btrfs
+blacklist hci_vhci
+blacklist cuse
+blacklist nvram
+blacklist userio
 EOF
 
 cat > /etc/runit/core-services/91-power-save.sh <<'EOF'
