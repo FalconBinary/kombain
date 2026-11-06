@@ -829,32 +829,50 @@ class Run:
                 break
         self.expect("netline: shows mute from the server's event", items(before) != items(muted))
         self.zctl("mute")
-        time.sleep(1)
+        # A screen that has not caught up makes the next check meaningless: this one has run 25 s
+        # behind. Wait until it no longer shows the speaker muted.
+        speaker = lambda rows: [row[1060 * 3:1090 * 3] for row in rows[8:38]]
+        current = False
+        started = time.time()
+        while time.time() - started < 40:
+            if speaker(self.screenshot("mango-unmuted")) != speaker(muted):
+                current = True
+                break
+            time.sleep(1)
+        print(f"the screen caught up after {time.time() - started:.0f} s: {current}", flush=True)
 
         self.expect("zctl: finds the battery", "battery 50 " in status, status)
         # A change in the kernel, through the real udevd and the panel's filter on its broadcast.
         # Only the battery's own pixels count: the level bar next to it comes and goes by itself.
         battery = lambda rows: [row[1085 * 3:1160 * 3] for row in rows[8:38]]
         time.sleep(2)  # the level bar from the volume change above is gone by now
-        self.sh("(timeout 20 udevadm monitor --kernel --udev --property --subsystem-match=power_supply > /tmp/udev.log 2>&1 &)")
+        self.sh("(timeout 60 udevadm monitor --kernel --udev --property --subsystem-match=power_supply > /tmp/udev.log 2>&1 &)")
         time.sleep(1)
         before = self.screenshot("mango-battery-before")
+        # Apart from the screen: an idle netline reads nothing, and the event makes it read its
+        # socket and the battery's files. That shows whether it woke, however slow the screen is.
+        def reads():
+            text = self.out("awk '/^syscr/ {print $2}' /proc/$(pgrep -o -x netline)/io")
+            return int(text) if text.isdigit() else -1
+
+        idle_from = reads()
+        time.sleep(2)
+        idle = reads() - idle_from
+        start = reads()
         self.sh("echo 12 > /sys/module/test_power/parameters/battery_capacity")
+        time.sleep(1)
+        woke = reads() - start
+        print(f"netline's reads: {idle} in 2 s idle, {woke} in the second after the event", flush=True)
+        self.expect("netline: wakes up for a real battery event", woke >= 3 and woke > idle, (idle, woke))
         changed = False
-        # software rendering in a busy VM has kept the whole screen seconds behind before
-        for _ in range(10):
-            after = self.screenshot("mango-battery-after")
-            if battery(before) != battery(after):
+        started = time.time()
+        while time.time() - started < 40:
+            if battery(before) != battery(self.screenshot("mango-battery-after")):
                 changed = True
                 break
-        time.sleep(3)
+        print(f"the icon changed after {time.time() - started:.0f} s: {changed}", flush=True)
         print(self.out("cat /tmp/udev.log | grep -E '^(KERNEL|UDEV)|SUBSYSTEM|CAPACITY=' | head -20"), flush=True)
         self.expect("netline: a real battery event reaches the icon", changed)
-        if not changed:
-            # without the event, the clock's minute tick reads the battery anyway: which one is it?
-            time.sleep(62)
-            late = self.screenshot("mango-battery-minute")
-            print(f"after a minute tick the icon changed: {battery(before) != battery(late)}", flush=True)
         self.expect("zctl: reads the new charge", "battery 12 " in self.zctl("status"), self.zctl("status"))
 
         # the menu on mango: it comes out from under the panel by cropping, and takes the keyboard
