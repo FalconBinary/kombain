@@ -103,19 +103,45 @@ echo 'echo "kombain-boot end" >/dev/kmsg 2>/dev/null' >> /etc/runit/1
 grep -c kombain-boot /etc/runit/1
 """
 
-# Times since the kernel started: kernel log lines, and when each process started.
+# Times since the kernel started: kernel log lines, and when each process started. Then what the
+# initramfs holds, and the modules Void's stage 1 loads for their fixed device files. No tabs: the
+# serial console's bash would take them for completion.
 BOOT_TIMELINE = r"""
 echo "hz $(getconf CLK_TCK)"
-dmesg | sed -nE 's/^\[ *([0-9]+\.[0-9]+)\] (Run \/init as init process|kombain-boot .*|XFS \(.*\): Ending clean mount|Freeing unused kernel image.*)$/mark \1 \2/p'
+dmesg | sed -nE 's/^\[ *([0-9]+\.[0-9]+)\] (Run \/init as init process|kombain-boot .*|XFS \(.*\): Ending clean mount|Freeing unused kernel image.*|raid6: .*|xor: .*)$/mark \1 \2/p'
 for p in /proc/[0-9]*; do
-	c=$(tr '\0' ' ' <$p/cmdline 2>/dev/null | cut -c1-70)
-	[ -n "$c" ] || continue
-	echo "proc $(sed 's/.*) //' $p/stat | cut -d' ' -f20) $(cat $p/comm) $c"
+ c=$(tr '\0' ' ' <$p/cmdline 2>/dev/null | cut -c1-70)
+ [ -n "$c" ] || continue
+ echo "proc $(sed 's/.*) //' $p/stat | cut -d' ' -f20) $(cat $p/comm) $c"
 done | sort -k2,2n
+for f in /sys/firmware/acpi/fpdt/boot/*_ns; do [ -r "$f" ] && echo "fpdt ${f##*/} $(cat $f)"; done
 ls -l /boot | awk '/vmlinuz|initramfs/ {printf "file %s %d KiB\n", $NF, $5 / 1024}'
-for d in $(blkid -t TYPE=crypto_LUKS -o device); do
-	echo "luks $d $(cryptsetup luksDump $d | awk '/PBKDF:/ {k=$2} /Time cost:/ {t=$3} /Memory:/ {m=$2} /Threads:/ {n=$2} END {print k, "time=" t, "memory_kib=" m, "threads=" n}')"
+img=$(ls /boot/initramfs-*.img | head -n 1)
+echo "initramfs magic $(/usr/lib/dracut/skipcpio $img 2>/dev/null | head -c 4 | od -An -tx1 | tr -d ' ')"
+lsinitrd $img 2>/dev/null | grep -m1 '^Arguments:' | sed 's/^/initramfs /'
+lsinitrd -m $img 2>/dev/null | awk '/^dracut modules:/ {on = 1; next} /^=+$/ {on = 0} on {printf "%s ", $0} END {print ""}' | sed 's/^/initramfs dracut /'
+lsinitrd $img 2>/dev/null | awk '$1 ~ /^-/ && $5 ~ /^[0-9]+$/ {t += $5; n++} END {printf "initramfs total %d files, %d KiB unpacked\n", n, t / 1024}'
+lsinitrd $img 2>/dev/null | awk '$1 ~ /^-/ && $5 ~ /^[0-9]+$/ {split($9, p, "/"); s[p[1] "/" p[2] "/" p[3] "/" p[4]] += $5} END {for (d in s) printf "%d %s\n", s[d] / 1024, d}' | sort -rn | head -n 12 | sed 's/^/initramfs dir KiB /'
+lsinitrd $img 2>/dev/null | awk '$1 ~ /^-/ && $5 ~ /^[0-9]+$/ {print int($5 / 1024), $9}' | sort -rn | head -n 12 | sed 's/^/initramfs file KiB /'
+kmod static-nodes -f devname 2>/dev/null | while read -r m n s; do
+ u=$(echo $m | tr - _)
+ echo "static $m /dev/$n $(awk -v m=$u '$1 == m {print $2 " bytes, used by " $3}' /proc/modules)"
 done
+for d in $(blkid -t TYPE=crypto_LUKS -o device); do
+ echo "luks $d $(cryptsetup luksDump $d | awk '/PBKDF:/ {k=$2} /Time cost:/ {t=$3} /Memory:/ {m=$2} /Threads:/ {n=$2} END {print k, "time=" t, "memory_kib=" m, "threads=" n}')"
+done
+"""
+
+# What each module Void's stage 1 loads for a fixed device file costs: unloaded, then loaded again, timed.
+STATIC_COST = r"""
+for m in $(kmod static-nodes -f devname 2>/dev/null | cut -d' ' -f1 | sort -u); do
+ u=$(echo $m | tr - _)
+ grep -q "^$u " /proc/modules || { echo "cost $m not loaded"; continue; }
+ modprobe -r $m 2>/dev/null || { echo "cost $m in use"; continue; }
+ a=$(date +%s%N); modprobe -b $m; b=$(date +%s%N)
+ echo "cost $m $(( (b - a) / 1000000 )) ms"
+done
+dmesg | grep -E 'raid6|xor' | tail -n 6
 """
 
 
@@ -674,6 +700,7 @@ class Run:
         self.boot_disk()
         time.sleep(10)
         self.boot_timeline("boot-stock")
+        self.static_cost("boot-stock")
         self.vm.send("poweroff\n")
         try:
             self.vm.wait_exit(120)
@@ -771,12 +798,19 @@ class Run:
                 if t is not None and tty1 is not None:
                     n[f"tty1_to_{name}_s"] = t - tty1
             self.metrics[label] = {k: f"{v:.2f}" if isinstance(v, float) else v for k, v in n.items()}
-            for line in re.findall(r"^(?:file|luks) .*$", text, re.M):
+            for line in re.findall(r"^(?:file|luks|fpdt|initramfs (?:magic|total)) .*$", text, re.M):
                 key, rest = line.split(" ", 1)
                 self.metrics[label][f"{key} {rest.split(' ', 1)[0]}"] = rest.split(" ", 1)[1]
             print("\n".join(f"{k}: {v}" for k, v in self.metrics[label].items()), flush=True)
         except (Failed, AttributeError, ValueError, IndexError, TypeError) as e:
             print(f"boot timeline {label}: {e!r}", flush=True)
+
+    def static_cost(self, label):
+        text = self.out(STATIC_COST)
+        print(f"=== static-node modules: {label}\n{text}", flush=True)
+        costs = re.findall(r"^cost (\S+) (\d+) ms$", text, re.M)
+        if costs:
+            self.metrics.setdefault(label, {})["static_node_modules_ms"] = ", ".join(f"{m} {ms}" for m, ms in sorted(costs, key=lambda c: -int(c[1])))
 
     def unlock_cost(self):
         """How long each LUKS volume's key derivation takes on this CPU, with nothing else running."""
@@ -796,6 +830,7 @@ class Run:
         time.sleep(20)
         self.boot_timeline("boot-dev")
         self.unlock_cost()
+        self.static_cost("boot-dev")
         self.sh("mv /etc/runit/1.timeless /etc/runit/1")
         self.desktop_login(False)
 

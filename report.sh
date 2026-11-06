@@ -115,6 +115,43 @@ machine() {
 	grep -hv '^[[:space:]]*#' /etc/modprobe.d/*.conf 2>/dev/null | grep . | sed 's/^/  /'
 }
 
+# Where the last boot's time went: the firmware's own record of it, then the kernel's log and
+# when the first programs started, all in seconds since the kernel started.
+boot() {
+	section "boot"
+	f=/sys/firmware/acpi/fpdt/boot
+	if [ -r "$f/bootloader_load_ns" ]; then
+		awk -v r="$(val $f/firmware_start_ns)" -v l="$(val $f/bootloader_load_ns)" -v s="$(val $f/bootloader_launch_ns)" \
+			-v e="$(val $f/exitbootservice_start_ns)" -v x="$(val $f/exitbootservice_end_ns)" 'BEGIN {
+			printf "firmware, from power on to loading the boot loader: %.2f s\n", l / 1e9
+			printf "boot loader, its menu included, until the kernel takes over: %.2f s\n", (x - s) / 1e9
+			printf "(raw: reset end %d, loader load %d, launch %d, exit boot services %d to %d ns)\n", r, l, s, e, x
+		}'
+	else
+		echo "firmware: no performance record (ACPI FPDT) here"
+	fi
+	if needs_root; then
+		dmesg | sed -nE 's/^\[ *([0-9]+\.[0-9]+)\] (Run \/init as init process|.*: Ending clean mount|EXT4-fs .*: mounted .*|raid6: .*|xor: .*)$/\1 \2/p' | head -n 12
+	fi
+	hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+	for p in /proc/[0-9]*; do
+		c=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null | cut -c1-60)
+		case $c in runsvdir*|runsv\ *tty1*|login*|mango*|netline*|gamescope*|*game-session*|pipewire\ *|pipewire) ;; *) continue ;; esac
+		echo "$(sed 's/.*) //' "$p/stat" | cut -d' ' -f20) $c"
+	done | sort -n | awk -v hz="$hz" '{t = $1 / hz; $1 = ""; printf "%7.2f %s\n", t, $0}'
+	echo "initramfs: $(ls -l /boot/initramfs-* 2>/dev/null | awk '{printf "%s %d KiB ", $NF, $5 / 1024}')"
+	if needs_root && have lsinitrd; then
+		img=$(ls /boot/initramfs-*.img | head -n 1)
+		lsinitrd -m "$img" 2>/dev/null | awk '/^dracut modules:/ {on = 1; next} /^=+$/ {on = 0} on {printf "%s ", $0} END {print ""}' | sed 's/^/dracut modules: /'
+		lsinitrd "$img" 2>/dev/null | awk '$1 ~ /^-/ && $5 ~ /^[0-9]+$/ {split($9, p, "/"); s[p[1] "/" p[2] "/" p[3] "/" p[4]] += $5} END {for (d in s) printf "%d KiB %s\n", s[d] / 1024, d}' | sort -rn | head -n 10 | sed 's/^/  /'
+	fi
+	echo "modules loaded at boot for a fixed device file:"
+	kmod static-nodes -f devname 2>/dev/null | while read -r m n x; do
+		u=$(echo "$m" | tr - _)
+		awk -v m="$u" -v n="$n" '$1 == m {printf "  %s for /dev/%s, %d KiB\n", m, n, $2 / 1024}' /proc/modules
+	done
+}
+
 devices() {
 	section "devices"
 	if have lspci; then
@@ -376,6 +413,7 @@ system() {
 report() {
 	echo "kombain-report: $mode, $(date '+%Y-%m-%d %H:%M')"
 	machine
+	boot
 	section "GPUs before anything else touches them"
 	gpu_states
 	rest
