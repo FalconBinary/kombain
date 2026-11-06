@@ -27,6 +27,12 @@ cd kombain
 
 Заодно он убирает то, что этой машине не нужно: прошивки чужих производителей (NVIDIA, AMD или Intel, если их нет ни в процессоре, ни в видеокарте) `iwd`, если нет Wi-Fi, и `dhcpcd`, если вы отказались от кабеля. Если потом поставите такую видеокарту, удалите `/etc/xbps.d/11-firmware.conf` и выполните `xbps-install -Su linux-firmware`. Для Wi-Fi: `ln -s /etc/sv/iwd /etc/runit/runsvdir/default/`. Для кабеля: конец шага 6.
 
+Если пакеты качаются медленно или загрузка замирает (из России стандартное зеркало бывает недоступно), прервите `Ctrl+C` и запустите с ближним зеркалом из списка на `xmirror.voidlinux.org`. Повторный запуск сам закроет то, что осталось от прерванного, а зеркало останется и для обновлений:
+
+```
+./setup.sh --mirror https://mirror.yandex.ru/mirrors/voidlinux
+```
+
 До ввода имени диска ничего не меняется. Вопросы на английском: в консоли live ISO нет кириллического шрифта. Пароли LUKS и пароли пользователей вы вводите прямо в `cryptsetup` и `passwd`: скрипт их не видит. Только пароль Wi-Fi, если он его спросит, сохраняется для `iwd` на зашифрованном диске.
 
 `./setup.sh --dry-run` задаст те же вопросы и покажет все команды, ничего не меняя.
@@ -120,8 +126,12 @@ mkdir -p /mnt/var/db/xbps/keys /mnt/etc/xbps.d
 cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
 printf 'noextract=%s\n' '/usr/share/locale/*' '!/usr/share/locale/ru/*' '!/usr/share/locale/en*' > /mnt/etc/xbps.d/20-noextract.conf
 XBPS_ARCH=x86_64 xbps-install -S -r /mnt -R "$REPO" base-system cryptsetup lvm2 xfsprogs zstd limine efibootmgr iwd openresolv dbus elogind polkit chrony nftables zramen snooze run-parts opendoas xtools git pipewire wireplumber flatpak gamescope void-repo-nonfree
+printf 'repository=%s\n' "$REPO" > /mnt/etc/xbps.d/00-repository-main.conf
+printf 'repository=%s/nonfree\n' "$REPO" > /mnt/etc/xbps.d/10-repository-nonfree.conf
 xchroot /mnt /bin/bash
 ```
+
+`REPO` — зеркало Void. Если пакеты качаются медленно или загрузка замирает (из России стандартное зеркало бывает недоступно), возьмите ближнее из списка на `xmirror.voidlinux.org`, например `REPO=https://mirror.yandex.ru/mirrors/voidlinux/current`. Две строки `printf` оставляют это зеркало и для обновлений установленной системы.
 
 `resolv.conf` в систему не копируется: внутри `xchroot` работают DNS-серверы live-системы, а установленная система получит свой файл от `resolvconf` при первом подключении. Скопированный файл `resolvconf` считал бы чужим и не обновлял, и DNS остался бы от сети, в которой шла установка.
 

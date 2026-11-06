@@ -111,7 +111,7 @@ jobs:
         include:
           - { title: by the guide, flow: guide, bus: nvme, size: 600G, artifact: vm-install, extra: --secure-boot }
           - { title: by setup.sh, flow: setup, bus: virtio, size: 200G, artifact: vm-setup }
-          - { title: by setup.sh without a cable, flow: setup, bus: nvme, size: 300G, artifact: vm-setup-wifi, extra: --no-cable }
+          - { title: by setup.sh without a cable, flow: setup, bus: nvme, size: 300G, artifact: vm-setup-wifi, extra: --no-cable --mirror https://repo-fastly.voidlinux.org }
           - { title: of plain Void to compare with, flow: stock, bus: nvme, size: 200G, artifact: vm-stock }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

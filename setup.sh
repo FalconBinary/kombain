@@ -3,10 +3,11 @@
 # sizes, the user and so on, erases the disk only after you type its name, and then runs
 # the commands of docs/void-install-guide.md with your answers. Run as root from the repository:
 #
-#   ./setup.sh [--dry-run] [--serial]
+#   ./setup.sh [--dry-run] [--serial] [--mirror URL]
 #
-#   --dry-run  ask everything, print the commands, change nothing
-#   --serial   also a console and a login on the first serial port
+#   --dry-run     ask everything, print the commands, change nothing
+#   --serial      also a console and a login on the first serial port
+#   --mirror URL  packages from this Void mirror (see xmirror.voidlinux.org), now and for updates
 #
 # The commands live in the guide alone, so the two cannot drift apart. If the guide is rewritten
 # in a way this script doesn't recognize, it stops before touching the disk.
@@ -26,6 +27,8 @@ MIN_DEV=1024
 
 dry_run=0
 serial=0
+DEFAULT_MIRROR=https://repo-default.voidlinux.org
+mirror=$DEFAULT_MIRROR
 
 # The answers
 disk= suffix= disk_mib=0 disk_model=
@@ -385,6 +388,14 @@ iwd_file_name() {
 	fi
 }
 
+# It goes into the guide's commands as it is, so it may hold nothing a shell would read.
+set_mirror() {
+	m=${1%/}
+	printf '%s\n' "$m" | grep -Eq '^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~-]+)*$' ||
+		die "--mirror takes an https address from xmirror.voidlinux.org, like https://mirror.yandex.ru/mirrors/voidlinux"
+	mirror=$m
+}
+
 # ---------------------------------------------------------------- the guide's commands
 
 # The guide's block whose first line starts with $1 (and second with $2, if given). It must be
@@ -468,6 +479,7 @@ step_base() {
 	esac
 	t=$(printf '%s\n' "$t" | sed '$d')
 	t=$(swap "$t" 'xbps-install -S -r /mnt' 'xbps-install -Sy -r /mnt')
+	t=$(swap "$t" "REPO=$DEFAULT_MIRROR/current" "REPO=$mirror/current")
 	printf '%s\n' "$t"
 }
 
@@ -697,7 +709,8 @@ check_system() {
 	[ "$(uname -m)" = x86_64 ] || die "this is for x86_64"
 	# Known to everyone, so it goes first: the ISO's SSH accepts root with the password voidlinux.
 	sv down sshd >/dev/null 2>&1 || true
-	getent hosts repo-default.voidlinux.org >/dev/null || die "no network. See step 1 of the guide for Wi-Fi."
+	host=${mirror#https://}
+	getent hosts "${host%%/*}" >/dev/null || die "no network, or no such mirror. See step 1 of the guide for Wi-Fi."
 }
 
 check_vg() {
@@ -710,6 +723,7 @@ confirm_erase() {
 	name=${disk##*/}
 	show_layout
 	echo "User $user, host $hostname, time zone $timezone, graphics $gpus."
+	echo "Packages from $mirror."
 	echo
 	lsblk -o NAME,SIZE,FSTYPE,LABEL "$disk" 2>/dev/null || true
 	echo
@@ -783,8 +797,13 @@ main() {
 		case $1 in
 		--dry-run) dry_run=1 ;;
 		--serial) serial=1 ;;
+		--mirror)
+			[ $# -ge 2 ] || die "--mirror needs an address"
+			set_mirror "$2"
+			shift
+			;;
 		-h | --help)
-			sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+			sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 			exit 0
 			;;
 		*) die "unknown option: $1" ;;

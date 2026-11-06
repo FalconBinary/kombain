@@ -109,6 +109,19 @@ ok "plain SSID" "$(iwd_file_name 'My Home-5G')" "My Home-5G.psk"
 ok "SSID with other characters is hex" "$(iwd_file_name "a'b")" "=612762.psk"
 ok "non-ASCII SSID is hex" "$(iwd_file_name 'дом')" "=d0b4d0bed0bc.psk"
 
+mirror_is() {
+	(set_mirror "$1" 2>/dev/null && echo "$mirror")
+}
+ok "a mirror" "$(mirror_is https://mirror.yandex.ru/mirrors/voidlinux)" https://mirror.yandex.ru/mirrors/voidlinux
+ok "its slash at the end goes" "$(mirror_is https://mirror.yandex.ru/mirrors/voidlinux/)" https://mirror.yandex.ru/mirrors/voidlinux
+ok "a port" "$(mirror_is https://void.example.org:8443/void)" https://void.example.org:8443/void
+ok "no plain http: the package lists are not signed" "$(mirror_is http://ftp.debian.ru/mirrors/voidlinux)" ""
+ok "nothing a shell would read" "$(mirror_is 'https://a.org/x;reboot')" ""
+ok "no spaces" "$(mirror_is 'https://a.org/x y')" ""
+ok "no quotes" "$(mirror_is "https://a.org/x'y")" ""
+ok "no substitutions" "$(mirror_is 'https://a.org/$(reboot)')" ""
+ok "not empty" "$(mirror_is '')" ""
+
 # ---------------------------------------------------------------- the guide
 
 guide=$repo/docs/void-install-guide.md
@@ -255,6 +268,25 @@ has "fdash" "chsh -s /usr/local/bin/fdash dev"
 hasnt "the NVIDIA card keeps its firmware" "linux-firmware-nvidia"
 has "NVMe partitions in commands" 'cryptsetup luksFormat --batch-mode --verify-passphrase --type luks2 "${DISK}p2"'
 ok "again nothing was called" "$(cat "$work/called" 2>/dev/null)" ""
+
+has "the default mirror" "REPO=https://repo-default.voidlinux.org/current"
+has "kept for updates" "/mnt/etc/xbps.d/00-repository-main.conf"
+has "nonfree too" "/mnt/etc/xbps.d/10-repository-nonfree.conf"
+
+# ------ another mirror
+printf '%s\n' 1 '' '' '' '' y '' '' '' y y | PATH="$work/bin:$PATH" KOMBAIN_NET="$work/net" KOMBAIN_PCI="$work/pci" KOMBAIN_CPUINFO="$work/cpuinfo" \
+	sh "$repo/setup.sh" --dry-run --mirror https://mirror.yandex.ru/mirrors/voidlinux/ >"$work/run7" 2>&1
+ok "the dialog with a mirror finishes" $? 0
+cat "$work/run7" >"$work/r"
+has "step 3 takes it" "REPO=https://mirror.yandex.ru/mirrors/voidlinux/current"
+hasnt "and nothing else" "repo-default"
+has "and keeps it for updates" "/mnt/etc/xbps.d/00-repository-main.conf"
+sh "$repo/setup.sh" --dry-run --mirror 'https://a.org/x;reboot' </dev/null >"$work/run8" 2>&1
+yes_ "a mirror a shell would read is refused" [ $? -ne 0 ]
+grep -q "takes an https address" "$work/run8"
+ok "with an example" $? 0
+sh "$repo/setup.sh" --dry-run --mirror </dev/null >"$work/run8" 2>&1
+yes_ "--mirror without an address is refused" [ $? -ne 0 ]
 
 # ------ no cable: dhcpcd goes, as the guide's step 6 says
 dialog "$work/run6" 1 '' '' '' '' y '' '' '' n y
