@@ -229,10 +229,16 @@ class Machine:
     def read(self, path):
         """Reads a file zcool may be writing as sysfs shows it: the old value or the new, never the
         empty file between its truncate and write. Only while zcool runs: after that an empty file is a fault."""
-        value = get(path)
-        if value:
-            self.seen[path] = value
-        return self.seen.get(path, value)
+        # a file read for the first time has no older value to fall back on: wait for the new one
+        for _ in range(100):
+            value = get(path)
+            if value:
+                self.seen[path] = value
+                return value
+            if path in self.seen:
+                return self.seen[path]
+            time.sleep(0.001)
+        return value
 
     def publish(self):
         if self.cpu:
