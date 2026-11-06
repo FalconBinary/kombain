@@ -82,12 +82,14 @@ jobs:
           ./install.sh --user dev
       - name: What it should have left
         run: |
-          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool zcool-nvidia mango foot swaylock nft; do
+          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool zcool-nvidia kombain-report mango foot swaylock nft; do
             command -v "$c"
           done
           su dev -s /usr/local/bin/fdash -c 'echo "fdash runs as $USER"'
           su dev -s /bin/sh -c 'mango -p'
           zcool list
+          kombain-report --seconds 2 --out /tmp/report.txt
+          ! grep 'kombain-report: [0-9]*:' /tmp/report.txt
           test ! -e /etc/runit/runsvdir/default/zcool
           test -s /etc/nftables.conf
           test -s /etc/sysctl.d/90-local.conf

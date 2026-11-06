@@ -39,13 +39,33 @@ pub fn setPlane(port: anytype, plane: u6, mv: i32) bool {
     return decodeOffset(back) == mv;
 }
 
+pub const Probe = enum { open, locked, failed };
+
+/// Whether the CPU takes offsets at all: moves the plane by 1 mV, reads it back and puts back
+/// what was there. `failed` when the register could not be read, or the old value not put back.
+pub fn probe(port: anytype, plane: u6) Probe {
+    if (!port.write(encodeRead(plane))) return .failed;
+    const now = decodeOffset(port.read() orelse return .failed);
+    const step = if (now > max_offset_mv) now - 1 else now + 1;
+    if (!setPlane(port, plane, step)) {
+        // a locked CPU kept its value; anything else is a register that does not answer as expected
+        if (!port.write(encodeRead(plane))) return .failed;
+        const back = port.read() orelse return .failed;
+        return if (decodeOffset(back) == now) .locked else .failed;
+    }
+    return if (setPlane(port, plane, now)) .open else .failed;
+}
+
 /// Behaves like the register: a read request is answered with the plane's current offset.
 const FakeCpu = struct {
     locked: bool = false,
+    /// A register that refuses every write, like a CPU without it under a hypervisor.
+    broken: bool = false,
     offsets: [8]u64 = @splat(0),
     latch: u64 = 0,
 
     fn write(self: *FakeCpu, value: u64) bool {
+        if (self.broken) return false;
         const plane: u3 = @truncate(value >> 40);
         if ((value >> 32) & 1 == 1 and !self.locked) self.offsets[plane] = value & 0xffe00000;
         self.latch = self.offsets[plane];
@@ -71,6 +91,24 @@ test "a CPU locked by firmware is detected, not assumed to have worked" {
     var cpu = FakeCpu{ .locked = true };
     try std.testing.expect(!setPlane(&cpu, core_plane, -80));
     try std.testing.expectEqual(@as(u64, 0), cpu.offsets[core_plane]);
+}
+
+test "a probe tells an open CPU from a locked one and leaves the offset as it was" {
+    var open = FakeCpu{};
+    try std.testing.expect(setPlane(&open, core_plane, -80));
+    try std.testing.expectEqual(Probe.open, probe(&open, core_plane));
+    try std.testing.expectEqual(@as(i32, -80), decodeOffset(open.offsets[core_plane]));
+    // at the deepest offset allowed, the step goes the other way
+    try std.testing.expect(setPlane(&open, core_plane, max_offset_mv));
+    try std.testing.expectEqual(Probe.open, probe(&open, core_plane));
+    try std.testing.expectEqual(max_offset_mv, decodeOffset(open.offsets[core_plane]));
+
+    var locked = FakeCpu{ .locked = true };
+    try std.testing.expectEqual(Probe.locked, probe(&locked, core_plane));
+    try std.testing.expectEqual(@as(u64, 0), locked.offsets[core_plane]);
+
+    var gone = FakeCpu{ .broken = true };
+    try std.testing.expectEqual(Probe.failed, probe(&gone, core_plane));
 }
 
 test "matches the values the undervolt tools publish" {

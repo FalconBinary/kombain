@@ -186,6 +186,9 @@ if [ "$zcool" -eq 1 ]; then
 	echo "zcool is installed but not running. Start with: zcool list, then zcool run --dry-run (see zcool/README.md)"
 fi
 
+# what a real machine says about itself: the guide's step 14
+install -m 755 "$here/report.sh" /usr/local/bin/kombain-report
+
 if [ -n "$user" ]; then
 	echo "==> configuration for $user"
 	home=$(getent passwd "$user" | cut -d: -f6)

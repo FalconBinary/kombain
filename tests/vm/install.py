@@ -790,7 +790,29 @@ class Run:
         strip = lambda rows: [row[40 * 3:210 * 3] for row in rows[12:34]]
         self.expect("netline: follows the tag mango switched to", strip(tag3) != strip(tag4))
         self.check_panel_modules(body, tag4)
+        self.check_report()
         self.desktop_login(False)
+
+    def check_report(self):
+        """The guide's step 14 on the running desktop: what it names must be what is really here."""
+        command = block("doas kombain-report")
+        self.sh(f"cd /root; rm -f kombain-report-*.txt; {command.replace('doas ', '')}", timeout=300, what="guide step 14: kombain-report")
+        path = self.out("ls /root/kombain-report-dev-*.txt")
+        print(self.out(f"wc -l {path}; grep -E '^(mode|lockdown|probe:)|^  mango |draw|^test_battery|per second|^power' {path}"), flush=True)
+        self.expect("report: no shell errors", self.out(f"grep -c 'kombain-report: [0-9]*:' {path}; true") == "0")
+        # by PCI class: the card number depends on whether the firmware's framebuffer came first
+        gpu = self.out("for d in /sys/bus/pci/devices/*; do grep -q '^0x03' $d/class && basename $d; done; true")
+        mango = self.out(f"grep '^  mango [0-9]*:' {path}; true")
+        self.expect("report: names the GPU mango draws on", f"={gpu}" in mango, (gpu, mango))
+        self.expect("report: sees the battery", self.out(f"grep -c '^test_battery Battery' {path}; true") == "1")
+        # CI runners are Intel or AMD: either way the probe must stop before writing anything
+        stop = "lockdown" if self.out("grep -c GenuineIntel /proc/cpuinfo; true") != "0" else "only Intel"
+        probe = self.out(f"grep '^probe:' {path}; true")
+        self.expect("report: sees lockdown, and the undervolt probe stops before any write", "[integrity]" in self.out(f"grep '^lockdown' {path}") and stop in probe, probe)
+        leaks = self.out(f"for v in $(cat /sys/class/net/*/address | grep -v '^00:00:00:00:00:00$') $(blkid -s UUID -o value); do grep -qiF \"$v\" {path} && echo \"$v\"; done; true")
+        self.expect("report: no MAC address or UUID of this machine in it", leaks == "", leaks)
+        mine = self.out("su - dev -c 'kombain-report --seconds 2 --out /tmp/report-dev.txt' >/dev/null 2>&1; echo $?; grep -c 'needs root' /tmp/report-dev.txt; grep '^  mango [0-9]*:' /tmp/report-dev.txt; true").splitlines()
+        self.expect("report: runs without root, and still sees its own user's GPU files", len(mine) == 3 and mine[0] == "0" and mine[1] != "0" and f"={gpu}" in mine[2], mine)
 
     def desktop_login(self, on):
         """dev logged in on tty1 by itself, so mango starts the way the guide's own login starts it."""
@@ -1108,6 +1130,8 @@ class Run:
         self.expect("Gaming: tuning service is up", self.out("sv status /etc/sv/game-tune").startswith("run:"))
         self.expect("Gaming: firewall loaded", self.out("nft list ruleset").count("policy drop") == 2)
         self.measure("gaming-console")
+        mode = self.out("su - gamer -s /bin/sh -c 'kombain-report --seconds 2 --out -' 2>/dev/null | grep '^mode'; true")
+        self.expect("report: runs as gamer in Gaming", mode.split() == ["mode", "gaming"], mode)
         self.expect("Gaming: dev's home is not reachable by gamer", "denied" in self.out("su - gamer -s /bin/sh -c 'ls /home/dev' 2>&1; true") or self.out("ls -A /home/dev | wc -l") == "0")
         # This VM has no Vulkan device, so gamescope cannot start. A real install gets the
         # same with a missing driver, or before Steam is installed.

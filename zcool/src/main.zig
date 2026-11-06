@@ -1206,6 +1206,7 @@ const usage =
     \\  zcool restore             puts back everything an earlier run changed
     \\  zcool undervolt           shows the current offsets
     \\  zcool undervolt off       clears them
+    \\  zcool undervolt probe     whether firmware allows offsets: 1 mV, then back
     \\  zcool undervolt reset     forgets that a run with an offset did not end cleanly
     \\
     \\Limits and other settings live in /etc/zcool.conf, see the README.
@@ -1263,6 +1264,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             sys.print("could not clear the offsets; a reboot does\n");
             return 1;
         }
+        if (std.mem.eql(u8, sub, "probe")) return if (undervolt.probe()) 0 else 1;
         if (std.mem.eql(u8, sub, "reset")) {
             undervolt.markStable();
             return 0;

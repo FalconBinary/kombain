@@ -177,6 +177,17 @@ Not checked yet:
 - **zcool on real sensors and fans,** and with NVIDIA's real library. Real drivers and chips differ from the model,
   so start with `--dry-run`. Undervolting has not run on any CPU.
 
+What a real machine says about all of this, `kombain-report` collects into one file (the guide's step 14). The file shows:
+
+- which GPU draws the screen and which runs the games;
+- what sleeps;
+- power and wakeups at rest;
+- sensors and fans;
+- whether firmware allows undervolting;
+- the Secure Boot state.
+
+The VM test runs the report on its desktop and checks it against what is there.
+
 ## Licenses
 
 [GPL-3.0-or-later](LICENSE). The vendored code keeps its own licenses, which allow

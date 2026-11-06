@@ -2,7 +2,7 @@
 
 Keeps every chip under the temperature you set, and gives up as little speed as it
 can: the CPU, every GPU, NVMe. A GPU that shows nothing is let sleep when idle. Pure Zig
-with no libc: a 132 KiB binary that uses under 200 KiB of memory. NVIDIA's own driver
+with no libc: a 134 KiB binary that uses under 200 KiB of memory. NVIDIA's own driver
 needs one more, small program, see below.
 
 **It has not run on real hardware yet.** Everything below was checked against a
@@ -131,6 +131,8 @@ lockdown, and is the only way on AMD and on many recent Intel CPUs.
   value under load, in steps, with backups.
 
 Writing to the register has only been tested against a model of it, never on a CPU.
+`zcool undervolt probe` tells whether firmware lets offsets through. It moves the core
+offset by 1 mV, reads it back, and puts back what was there.
 
 ## Checks
 

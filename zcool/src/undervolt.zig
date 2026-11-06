@@ -123,6 +123,33 @@ pub fn clear() bool {
     return setPlane(fd, code.core_plane, 0) and setPlane(fd, code.cache_plane, 0);
 }
 
+/// `zcool undervolt probe`: whether firmware lets offsets through, for the cost of 1 mV for a moment.
+pub fn probe() bool {
+    if (!isIntel()) {
+        sys.printf("{s}\n", .{explain(.not_intel)});
+        return false;
+    }
+    if (lockdownActive()) {
+        sys.printf("{s}\n", .{explain(.lockdown)});
+        return false;
+    }
+    var msr_buf: [256]u8 = undefined;
+    const fd = sys.openReadWrite(sys.join(&msr_buf, &.{ sys.root, "/dev/cpu/0/msr" })) orelse {
+        sys.printf("{s}\n", .{explain(.no_msr)});
+        return false;
+    };
+    defer sys.close(fd);
+    switch (code.probe(MsrPort{ .fd = fd }, code.core_plane)) {
+        .open => {
+            sys.print("open: the CPU took a 1 mV step and is back where it was, so `undervolt.core` can work\n");
+            return true;
+        },
+        .locked => sys.printf("{s}\n", .{explain(.locked_by_firmware)}),
+        .failed => sys.print("the register did not answer as expected; nothing is left changed past a reboot\n"),
+    }
+    return false;
+}
+
 pub fn report() void {
     var msr_buf: [256]u8 = undefined;
     var pending_buf: [256]u8 = undefined;
