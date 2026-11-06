@@ -940,15 +940,29 @@ class Run:
         terms = self.out("ps -eo user,comm | grep -E 'foot|fdash' | sort -u")
         print(terms, flush=True)
         self.expect("mango: Alt+Return opens a terminal with fdash", "fdash" in terms, terms)
-        self.screenshot("mango-terminal")
-        # Tags 3 and 4 are both empty, so only netline can make these two frames differ
+        terminal = self.screenshot("mango-terminal")
+        # Tags 3 and 4 are both empty, so only netline can make these two frames differ. The VM's
+        # screen can be seconds behind: tag 3 is taken once it has left tag 1's frame and two frames
+        # agree, and tag 4 is waited for.
+        strip = lambda rows: [row[40 * 3:210 * 3] for row in rows[12:34]]
         self.monitor_cmd("sendkey ctrl-3")
         time.sleep(3)
         tag3 = self.screenshot("mango-tag3")
+        started = time.time()
+        while time.time() - started < 40:
+            time.sleep(2)
+            again = self.screenshot("mango-tag3")
+            if strip(again) == strip(tag3) != strip(terminal):
+                break
+            tag3 = again
         self.monitor_cmd("sendkey ctrl-4")
-        time.sleep(3)
-        tag4 = self.screenshot("mango-tag4")
-        strip = lambda rows: [row[40 * 3:210 * 3] for row in rows[12:34]]
+        started = time.time()
+        while True:
+            time.sleep(2)
+            tag4 = self.screenshot("mango-tag4")
+            if strip(tag4) != strip(tag3) or time.time() - started > 40:
+                break
+        print(f"tag 4 reached the screen after {time.time() - started:.0f} s", flush=True)
         self.expect("netline: follows the tag mango switched to", strip(tag3) != strip(tag4))
         self.check_panel_modules(body, tag4)
         self.check_report()
