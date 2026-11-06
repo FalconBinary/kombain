@@ -124,6 +124,39 @@ except GPUs and USB; zcool lets a GPU that shows nothing sleep, and does not wak
 The programs are built with `ReleaseSafe`: it keeps bounds checks, and against `ReleaseFast` it made no measurable difference
 to the panel's frame time. `ReleaseSmall` was about ten times slower per frame for under 0.1 MiB of memory.
 
+### Boot
+
+The same VM test splits every boot into its steps. These numbers are from one run of the guide's install. The time a
+prompt waits for its passphrase is left out.
+
+| Seconds since QEMU started | Dev | Gaming | Plain Void |
+|---|---|---|---|
+| Firmware and Limine, its 2 s menu included | 3.4 | 3.5 | 1.2 |
+| Kernel | 0.8 | 0.5 | 0.6 |
+| Initramfs, until it asks for a passphrase | 0.9 | 0.9 | 1.0, all of it |
+| Unlocking LUKS | 2.6 + 3.4 | 3.2 | |
+| runit's stage 1 | 0.7 | 0.7 | 0.8 |
+| **To the login prompt** | **12.0** | **8.9** | **3.6** |
+
+After logging in, mango starts within 0.2 s and netline within 0.7 s.
+
+Most of the difference is on purpose:
+
+- **LUKS.** Each volume's key takes about 2 s to derive. cryptsetup sets argon2id with 1 GiB of memory to take
+  that long on the CPU that formatted it. Dev has two volumes.
+- **Limine.** Its menu waits 2 s, so Gaming can be picked.
+
+Two things cost time for nothing, and are gone:
+
+- **The initramfs.** dracut's default host-only mode still adds every keyboard, USB, disk and SCSI driver, with
+  network cards' firmware. Its strict mode keeps this machine's drivers only: 20 MiB instead of 35.
+- **btrfs.** Void's stage 1 loads every module that has a fixed device file, at every boot. btrfs spent
+  0.2 s on that, most of it benchmarking RAID6 code. It is blacklisted, with four test and legacy devices; stage 1
+  went from 1.2 s to 0.7 s.
+
+Real firmware is usually slower than the VM's. `kombain-report` reads its time from the firmware's own record, when
+the firmware keeps one.
+
 ## Status
 
 CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
