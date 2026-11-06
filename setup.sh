@@ -760,6 +760,8 @@ finish() {
 	fi
 	root_uuid=$(blkid -s UUID -o value "${disk}${suffix}2")
 	dev_uuid=$(blkid -s UUID -o value "${disk}${suffix}3")
+	# guide, step 11: the empty resolv.conf xchroot leaves would stop resolvconf from writing its own
+	rm -f /mnt/etc/resolv.conf
 	umount -R /mnt
 	cat <<EOF
 
