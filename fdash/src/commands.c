@@ -1117,31 +1117,24 @@ int fccmd(int argc, char **argv)
 		const char *e, *old = NULL, *eq = NULL;
 		int status;
 
-		if (i < argc && (eq = strchr(argv[i], '='))) {
+		if (i < argc && (eq = strchr(argv[i], '=')))
 			old = argv[i++];
-		}
-		e = fc_entry(i < argc ? fc_find(argv[i]) : n);
+		if (!(e = fc_entry(i < argc ? fc_find(argv[i]) : n)))
+			sh_error("fc: no such command");
+		sb_str(&cmd, e);
 		if (old && eq > old) {
-			const char *eqp = strchr(old, '=');
-			size_t olen = (size_t)(eqp - old);
-			const char *at = NULL;
+			/* the first old in it becomes new */
+			struct sb pat = {0};
+			const char *at;
 
-			{
-				struct sb pat = {0};
-
-				sb_add(&pat, old, olen);
-				at = strstr(e, pat.s);
-				free(pat.s);
-			}
-			if (at) {
+			sb_add(&pat, old, (size_t)(eq - old));
+			if ((at = strstr(e, pat.s))) {
+				sb_clear(&cmd);
 				sb_add(&cmd, e, (size_t)(at - e));
-				sb_str(&cmd, eqp + 1);
-				sb_str(&cmd, at + olen);
-			} else {
-				sb_str(&cmd, e);
+				sb_str(&cmd, eq + 1);
+				sb_str(&cmd, at + pat.len);
 			}
-		} else {
-			sb_str(&cmd, e);
+			free(pat.s);
 		}
 		status = fc_run(cmd.s, 1);
 		free(cmd.s);
@@ -1151,7 +1144,7 @@ int fccmd(int argc, char **argv)
 		ops[nops++] = argv[i++];
 	if (list) {
 		first = ops[0] ? fc_find(ops[0]) : (n > 16 ? n - 15 : 1);
-		last = ops[1] ? fc_find(ops[1]) : (ops[0] ? n : n);
+		last = ops[1] ? fc_find(ops[1]) : n;
 	} else {
 		first = ops[0] ? fc_find(ops[0]) : n;
 		last = ops[1] ? fc_find(ops[1]) : first;
