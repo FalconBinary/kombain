@@ -60,7 +60,12 @@ histcmd		-u fc
 
 #ifdef FDASH
 abbrcmd		-u abbr
+cdhcmd		-u cdh
+dirhcmd		-u dirh
 historycmd	-u history
+nextdcmd	-u nextd
+prevdcmd	-u prevd
+universalcmd	-u universal
 #endif
 
 breakcmd	-s break -s continue

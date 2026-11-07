@@ -1,0 +1,5 @@
+-u @users	User
+-s	Run a shell
+-n	Never ask for a password
+-L	Forget the remembered password
+-C	Check a config file

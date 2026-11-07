@@ -1,0 +1,13 @@
+#!/bin/sh
+# Packages in the repository indexes xbps synced last, with their descriptions.
+# Reads only local files, never the network; fdash keeps the list until a sync.
+echo '#cache' /var/db/xbps /var/db/xbps/*/*-repodata
+xbps-query -Rs '' 2>/dev/null | awk '
+{
+	name = $2
+	sub(/-[^-]*$/, "", name)
+	desc = $0
+	sub(/^\[.\] [^ ]+ */, "", desc)
+	if (!seen[name]++)
+		print name "\t" desc
+}'

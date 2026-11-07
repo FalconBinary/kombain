@@ -3,3 +3,5 @@
 --remove-orphans	Remove orphans
 --yes	Assume yes
 --dry-run	Show what would happen
+... @xbps-installed	Installed package
+--force-revdeps	Remove even if others depend on it

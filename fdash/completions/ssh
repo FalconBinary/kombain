@@ -1,0 +1,12 @@
+@hosts	Host
+-p	Port
+-l	Login name
+-i	Identity file
+-J	Jump through this host
+-L	Forward a local port
+-R	Forward a remote port
+-D	Dynamic SOCKS forwarding
+-N	No remote command
+-v	Verbose
+-A	Forward the agent
+-X	Forward X11

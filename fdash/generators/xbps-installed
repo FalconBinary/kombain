@@ -1,0 +1,12 @@
+#!/bin/sh
+# Installed packages with their descriptions; fdash keeps the list until the
+# package database changes.
+echo '#cache' /var/db/xbps /var/db/xbps/pkgdb-*.plist
+xbps-query -l 2>/dev/null | awk '
+{
+	name = $2
+	sub(/-[^-]*$/, "", name)
+	desc = $0
+	sub(/^[^ ]+ [^ ]+ */, "", desc)
+	print name "\t" desc
+}'

@@ -7,6 +7,12 @@ int fdash_read(char *buf, int n);
 
 /* var.c owns the variable table. */
 void fdash_setstatus(int status);
+int fdash_setvar(const char *name, const char *val, int export);
+
+/* commands.c */
+void fdash_startup(void);
+void fdash_dirh_update(void);
+void fdash_uvars_check(void);
 
 /* exec.c and alias.c own their tables, so the listings live there. */
 int fdash_isfunction(const char *name);

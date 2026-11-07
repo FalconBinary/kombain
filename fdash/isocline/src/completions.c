@@ -194,11 +194,36 @@ ic_private ssize_t completions_apply( completions_t* cms, ssize_t index, stringb
 }
 
 
+// fdash: file-2 before file-10, case ignored
+static int natural_compare(const char* a, const char* b) {
+  while (*a != 0 && *b != 0) {
+    if (*a >= '0' && *a <= '9' && *b >= '0' && *b <= '9') {
+      while (*a == '0') a++;
+      while (*b == '0') b++;
+      size_t na = strspn(a, "0123456789");
+      size_t nb = strspn(b, "0123456789");
+      if (na != nb) return (na < nb ? -1 : 1);
+      int c = strncmp(a, b, na);
+      if (c != 0) return c;
+      a += na;
+      b += nb;
+      continue;
+    }
+    int ca = ic_tolower(*a), cb = ic_tolower(*b);
+    if (ca != cb) return (ca < cb ? -1 : 1);
+    a++;
+    b++;
+  }
+  return (*a != 0) - (*b != 0);
+}
+
 static int completion_compare(const void* p1, const void* p2) {
   if (p1 == NULL || p2 == NULL) return 0;
   const completion_t* cm1 = (const completion_t*)p1;
   const completion_t* cm2 = (const completion_t*)p2;  
-  return ic_stricmp(cm1->replacement, cm2->replacement);
+  // fdash: alphabetical with numbers in order, as fish lists them (ic_stricmp puts shorter words first)
+  int c = natural_compare(cm1->replacement, cm2->replacement);
+  return (c != 0 ? c : strcmp(cm1->replacement, cm2->replacement));
 }
 
 ic_private void completions_sort(completions_t* cms) {

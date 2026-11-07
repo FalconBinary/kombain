@@ -4,3 +4,11 @@ down	Stop a service
 restart	Restart a service
 once	Start once, without restarting
 check	Check that a service is up
+start	Start, then wait until it runs
+stop	Stop, then wait until it is down
+reload	Send HUP
+kill	Send KILL
+term	Send TERM
+* ... @services	Service
+-v	Wait for the change and report
+-w	Seconds to wait with -v

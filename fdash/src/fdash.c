@@ -37,93 +37,10 @@
 
 #include "isocline.h"
 #include "fdash.h"
-
-#ifndef FDASH_DATADIR
-#define FDASH_DATADIR "/usr/local/share/fdash"
-#endif
+#include "util.h"
 
 #define HISTORY_MAX 10000
 #define SLOW_COMMAND_SECONDS 3
-
-/* ---------------------------------------------------------------- strings */
-
-struct sb {
-	char *s;
-	size_t len, cap;
-};
-
-static void sb_add(struct sb *b, const char *s, size_t n)
-{
-	if (b->len + n + 1 > b->cap) {
-		size_t cap = b->cap ? b->cap * 2 : 128;
-		char *p;
-
-		while (cap < b->len + n + 1)
-			cap *= 2;
-		p = realloc(b->s, cap);
-		if (!p) {
-			static const char msg[] = "fdash: out of memory\n";
-
-			if (write(2, msg, sizeof(msg) - 1) < 0)
-				_exit(2);
-			_exit(2);
-		}
-		b->s = p;
-		b->cap = cap;
-	}
-	memcpy(b->s + b->len, s, n);
-	b->len += n;
-	b->s[b->len] = 0;
-}
-
-static void sb_str(struct sb *b, const char *s)
-{
-	sb_add(b, s, strlen(s));
-}
-
-static void sb_chr(struct sb *b, char c)
-{
-	sb_add(b, &c, 1);
-}
-
-static void sb_clear(struct sb *b)
-{
-	b->len = 0;
-	sb_add(b, "", 0);
-}
-
-/* Length of a C0, DEL or UTF-8 encoded C1 control at s, which a terminal would act on. */
-static int control_len(const char *s)
-{
-	unsigned char c = (unsigned char)s[0];
-
-	if (c < 0x20 || c == 0x7f)
-		return 1;
-	if (c == 0xc2 && (unsigned char)s[1] >= 0x80 && (unsigned char)s[1] <= 0x9f)
-		return 2;
-	return 0;
-}
-
-/*
- * Text for the prompt or a menu: isocline reads these as markup. It may come
- * from a file name or a repository, so it can never reach the terminal as a
- * control sequence.
- */
-static void sb_markup(struct sb *b, const char *s)
-{
-	while (*s) {
-		int ctl = control_len(s);
-
-		if (ctl) {
-			sb_chr(b, '?');
-			s += ctl;
-			continue;
-		}
-		if (*s == '[' || *s == '\\')
-			sb_chr(b, '\\');
-		sb_chr(b, *s++);
-	}
-}
 
 /* --------------------------------------------------------------- commands */
 
@@ -271,13 +188,6 @@ static int is_keyword(const char *word, size_t n)
 		if (strlen(keywords[i]) == n && !strncmp(keywords[i], word, n))
 			return 1;
 	return 0;
-}
-
-static int is_dir(const char *path)
-{
-	struct stat st;
-
-	return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 /* True for what the shell would run on its own, without implicit cd. */
@@ -733,6 +643,18 @@ static void complete_variables(ic_completion_env_t *cenv, const char *name, size
 	popstackmark(&mark);
 }
 
+/* A backslash before anything the shell would treat specially. */
+static void sb_escape(struct sb *b, const char *s, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		if (s[i] && strchr(" \t\n'\"\\$`&|;()<>*?[]#~!{}=", s[i]))
+			sb_chr(b, '\\');
+		sb_chr(b, s[i]);
+	}
+}
+
 /*
  * Files for the word [word, word + len), which may hold escapes or an opening
  * quote. Only the part after the last slash gets replaced. A tab press also
@@ -809,9 +731,10 @@ static void complete_files(ic_completion_env_t *cenv, const char *word, size_t l
 			if (dirs_only && !isdir)
 				continue;
 			sb_clear(&rep);
-			for (p = n; *p; p++) {
-				if (quote ? (*p == quote || (quote == '"' && strchr("$`\\", *p)))
-				          : strchr(" \t\n'\"\\$`&|;()<>*?[]#~!{}=", *p) != NULL)
+			if (!quote)
+				sb_escape(&rep, n, strlen(n));
+			for (p = n; quote && *p; p++) {
+				if (*p == quote || (quote == '"' && strchr("$`\\", *p)))
 					sb_chr(&rep, '\\');
 				sb_chr(&rep, *p);
 			}
@@ -841,123 +764,240 @@ static char spec_name[64];
 static char *spec_text;
 
 /*
- * Opens a regular file. A name in a directory someone else made can be a FIFO or
- * a link to the terminal, and opening or reading those would hang the prompt.
+ * Hand-written specs win over ones generated from man pages; the user's own
+ * win over the shipped ones.
  */
-static int open_regular(const char *path, off_t *size)
-{
-	struct stat st;
-	int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-
-	if (fd < 0)
-		return -1;
-	if (fstat(fd, &st) || !S_ISREG(st.st_mode)) {
-		close(fd);
-		return -1;
-	}
-	if (size)
-		*size = st.st_size;
-	return fd;
-}
-
-static char *read_text(const char *path)
-{
-	off_t size = 0;
-	int fd = open_regular(path, &size);
-	char *buf = NULL;
-
-	if (fd < 0)
-		return NULL;
-	if (size < (1 << 20) && (buf = malloc((size_t)size + 1))) {
-		ssize_t n = read(fd, buf, (size_t)size);
-
-		buf[n > 0 ? n : 0] = 0;
-	}
-	close(fd);
-	return buf;
-}
-
 static const char *spec_load(const char *cmd)
 {
-	struct sb path = {0};
-	const char *cfg;
+	static struct sb path;
+	int k;
 
-	if (strchr(cmd, '/') || strlen(cmd) >= sizeof(spec_name))
+	if (strchr(cmd, '/') || *cmd == '.' || strlen(cmd) >= sizeof(spec_name))
 		return NULL;
 	if (!strcmp(spec_name, cmd))
 		return spec_text;
 	strcpy(spec_name, cmd);
 	free(spec_text);
-	if ((cfg = lookupvar("XDG_CONFIG_HOME")) && *cfg) {
-		sb_str(&path, cfg);
-	} else if ((cfg = lookupvar("HOME"))) {
-		sb_str(&path, cfg);
-		sb_str(&path, "/.config");
-	}
-	sb_str(&path, "/fdash/completions/");
-	sb_str(&path, cmd);
-	spec_text = read_text(path.s);
-	if (!spec_text) {
-		sb_clear(&path);
-		sb_str(&path, FDASH_DATADIR "/completions/");
+	spec_text = NULL;
+	for (k = 0; k < 4 && !spec_text; k++) {
+		if (k == 0 && !config_dir(&path))
+			continue;
+		if (k == 2 && !data_dir(&path))
+			continue;
+		if (k == 1 || k == 3) {
+			sb_clear(&path);
+			sb_str(&path, FDASH_DATADIR);
+		}
+		sb_str(&path, k < 2 ? "/completions/" : "/generated_completions/");
 		sb_str(&path, cmd);
-		spec_text = read_text(path.s);
+		spec_text = read_text(path.s, 1 << 20);
 	}
-	free(path.s);
 	return spec_text;
 }
 
-/*
- * Spec lines are "[subcommand ...] word<TAB>description": a word is offered
- * when the subcommands match the words typed before it.
- */
-static int complete_spec(ic_completion_env_t *cenv, const char *spec, const char *args,
-			 const char *word, size_t len)
-{
-	struct sb w = {0}, help = {0};
-	size_t nargs = strlen(args);
-	int found = 0;
+/* The words typed after the command, apart from options, and the options. */
+#define MAX_TYPED 64
 
-	while (*spec) {
+struct typed {
+	const char *words[MAX_TYPED];
+	const char *opts[MAX_TYPED];
+	int nwords, nopts;
+};
+
+/* Was the option typed? "-R" also matches inside a cluster such as -Rs. */
+static int opt_typed(const struct typed *ty, const char *o, size_t n)
+{
+	int i;
+
+	for (i = 0; i < ty->nopts; i++) {
+		const char *t = ty->opts[i];
+
+		if (n == 2 && o[1] != '-' && t[1] != '-' && strchr(t + 1, o[1]))
+			return 1;
+		if (!strncmp(t, o, n) && (t[n] == 0 || t[n] == '='))
+			return 1;
+	}
+	return 0;
+}
+
+/* "-R|--repository" holds when one of them was typed, "!-R|--repository" when none was. */
+static int cond_holds(const char *p, size_t n, const struct typed *ty)
+{
+	int neg = *p == '!', found = 0;
+	const char *end = p + n;
+
+	for (p += neg; p < end && !found; ) {
+		size_t k = 0;
+
+		while (p + k < end && p[k] != '|')
+			k++;
+		found = k > 1 && opt_typed(ty, p, k);
+		p += k + 1;
+	}
+	return found != neg;
+}
+
+static int alt_has(const char *p, size_t n, const char *word)
+{
+	const char *end = p + n;
+	size_t wl = strlen(word);
+
+	while (p < end) {
+		size_t k = 0;
+
+		while (p + k < end && p[k] != '|')
+			k++;
+		if (k == wl && !strncmp(p, word, k))
+			return 1;
+		p += k + 1;
+	}
+	return 0;
+}
+
+/*
+ * The pattern before a spec line's item: subcommands ("a|b" for either), "*"
+ * for any one word, a final "..." for any further words, and option
+ * conditions that take no word. Options are offered after further words too.
+ */
+static int spec_matches(const char *p, size_t plen, int is_option, const struct typed *ty)
+{
+	const char *end = p + plen;
+	int i = 0, rest = is_option;
+
+	while (p < end) {
+		size_t n = 0;
+
+		while (p < end && *p == ' ')
+			p++;
+		while (p + n < end && p[n] != ' ')
+			n++;
+		if (!n)
+			break;
+		if (*p == '-' || *p == '!') {
+			if (!cond_holds(p, n, ty))
+				return 0;
+		} else if (n == 3 && !strncmp(p, "...", 3)) {
+			rest = 1;
+		} else {
+			if (i >= ty->nwords || !((n == 1 && *p == '*') || alt_has(p, n, ty->words[i])))
+				return 0;
+			i++;
+		}
+		p += n;
+	}
+	return rest ? i <= ty->nwords : i == ty->nwords;
+}
+
+struct spec_ctx {
+	ic_completion_env_t *cenv;
+	const char *raw;	/* the word being completed, as typed */
+	size_t rawlen;
+	const char *text;	/* and as the shell reads it */
+	size_t len;
+	const char *help;	/* the spec line's description */
+	int found;
+};
+
+static int spec_cand(const char *w, size_t n, const char *help, void *arg)
+{
+	static struct sb rep, disp, desc, tmp;
+	struct spec_ctx *c = arg;
+	size_t i;
+
+	if (n < c->len || strncmp(w, c->text, c->len))
+		return 1;
+	for (i = 0; i < n; i++)
+		if (control_len(w + i))
+			return 1;
+	sb_clear(&rep);
+	sb_escape(&rep, w, n);
+	sb_clear(&tmp);
+	sb_add(&tmp, w, n);
+	sb_clear(&disp);
+	sb_markup(&disp, tmp.s);
+	sb_clear(&desc);
+	if (help || c->help)
+		sb_markup(&desc, help ? help : c->help);
+	c->found = 1;
+	return ic_add_completion_prim(c->cenv, rep.s, disp.s, desc.len ? desc.s : NULL, (long)c->rawlen, 0);
+}
+
+static void complete_commands(ic_completion_env_t *cenv, const char *word, size_t len);
+static void complete_files(ic_completion_env_t *cenv, const char *word, size_t len, int dirs_only);
+
+/* Items from a generator: @files, @dirs and @commands, or a list from gen.c. */
+static void spec_generate(struct spec_ctx *c, const char *name)
+{
+	ic_completion_env_t *cenv = c->cenv;
+
+	if (!strcmp(name, "files") || !strcmp(name, "dirs")) {
+		complete_files(cenv, c->raw, c->rawlen, name[0] == 'd');
+		c->found |= ic_has_completions(cenv);
+	} else if (!strcmp(name, "commands")) {
+		if (c->rawlen || !ic_completion_is_hint())
+			complete_commands(cenv, c->raw, c->rawlen);
+		c->found |= ic_has_completions(cenv);
+	} else {
+		gen_run(name, ic_completion_is_hint(), spec_cand, c);
+	}
+}
+
+/*
+ * Spec lines are "[pattern ...] item<TAB>description". The item is a word to
+ * offer, or @name for the words a generator gives.
+ */
+static int complete_spec(struct spec_ctx *c, const char *spec, const struct typed *ty)
+{
+	static struct sb item, help;
+
+	/* a suggestion only appends: it cannot line up with a quoted word */
+	if (ic_completion_is_hint() && (c->rawlen != c->len || strncmp(c->raw, c->text, c->len)))
+		return 0;
+	while (*spec && !ic_stop_completing(c->cenv)) {
 		const char *eol = strchr(spec, '\n');
 		const char *tab, *last, *p;
 		size_t n = eol ? (size_t)(eol - spec) : strlen(spec);
 
 		tab = memchr(spec, '\t', n);
 		p = tab ? tab : spec + n;
+		while (p > spec && p[-1] == ' ')
+			p--;
 		for (last = p; last > spec && last[-1] != ' '; last--)
 			;
-		if (n && spec[0] != '#'
-		    && (size_t)(last - spec) == nargs && !strncmp(spec, args, nargs)
-		    && (size_t)(p - last) >= len && !strncmp(last, word, len)) {
-			sb_clear(&w);
-			sb_add(&w, last, (size_t)(p - last));
+		/* options only when the word starts with a dash, as in fish */
+		if (n && spec[0] != '#' && p > last && (*last == '-') == (c->text[0] == '-')
+		    && spec_matches(spec, (size_t)(last - spec), *last == '-', ty)) {
 			sb_clear(&help);
 			if (tab)
 				sb_add(&help, tab + 1, (size_t)(spec + n - tab - 1));
-			found = 1;
-			if (!ic_add_completion_prim(cenv, w.s, NULL, tab ? help.s : NULL, (long)len, 0))
-				break;
+			c->help = tab && help.len ? help.s : NULL;
+			sb_clear(&item);
+			sb_add(&item, last, (size_t)(p - last));
+			if (*last == '@' && p - last > 1)
+				spec_generate(c, item.s + 1);
+			else
+				spec_cand(item.s, item.len, NULL, c);
 		}
 		spec += n + (eol ? 1 : 0);
 	}
-	free(w.s);
-	free(help.s);
-	return found;
+	return c->found;
 }
 
 static void completer(ic_completion_env_t *cenv, const char *input)
 {
-	static struct sb cmd, args, text;
+	static struct sb cmd, text, words, cur;
+	static struct typed ty;
+	size_t offs[2 * MAX_TYPED];
 	struct state st = { 1, 0, 0 };
 	struct token t;
 	long lim = (long)strlen(input), i = 0, wstart = lim;
 	const char *word, *dollar;
 	size_t len;
-	int after_word = 0;
+	int nw = 0, no = 0, k, dashdash = 0;
+	char kinds[2 * MAX_TYPED];
 
 	sb_clear(&cmd);
-	sb_clear(&args);
+	sb_clear(&words);
 	for (;;) {
 		struct state before = st;
 
@@ -968,30 +1008,53 @@ static void completer(ic_completion_env_t *cenv, const char *input)
 			return;
 		if (t.type == T_WORD && t.end == lim) {
 			wstart = t.start;
-			after_word = 1;
 			break;
 		}
 		state_step(&st, input, &t);
 		if (t.type == T_SEP) {
 			sb_clear(&cmd);
-			sb_clear(&args);
+			sb_clear(&words);
+			nw = no = dashdash = 0;
 		} else if (t.type == T_WORD && !before.redir) {
 			size_t n = (size_t)(t.end - t.start);
+			int known;
 
 			if (before.cmdpos && !before.wrapper && is_assignment(input + t.start, n))
 				continue;
+			known = word_text(input, t.start, t.end, &text);
 			if (before.cmdpos) {
-				if (word_text(input, t.start, t.end, &text)) {
+				if (known) {
 					sb_clear(&cmd);
 					sb_str(&cmd, text.s);
 				}
-			} else if (input[t.start] != '-') {
-				sb_add(&args, input + t.start, n);
-				sb_chr(&args, ' ');
+				sb_clear(&words);
+				nw = no = dashdash = 0;
+			} else if (nw + no < 2 * MAX_TYPED - 1 && (nw < MAX_TYPED && no < MAX_TYPED)) {
+				int opt = !dashdash && input[t.start] == '-' && n > 1;
+
+				if (n == 2 && !strncmp(input + t.start, "--", 2))
+					dashdash = 1;
+				offs[nw + no] = words.len;
+				kinds[nw + no] = (char)opt;
+				if (known)
+					sb_str(&words, text.s);
+				else
+					sb_add(&words, input + t.start, n);
+				sb_chr(&words, 0);
+				if (opt)
+					no++;
+				else
+					nw++;
 			}
 		}
 	}
-	(void)after_word;
+	ty.nwords = ty.nopts = 0;
+	for (k = 0; k < nw + no; k++) {
+		if (kinds[k])
+			ty.opts[ty.nopts++] = words.s + offs[k];
+		else
+			ty.words[ty.nwords++] = words.s + offs[k];
+	}
 	word = input + wstart;
 	len = (size_t)(lim - wstart);
 
@@ -1020,8 +1083,12 @@ static void completer(ic_completion_env_t *cenv, const char *input)
 	if (!st.cmdpos && cmd.len) {
 		const char *spec = spec_load(cmd.s);
 
-		if (spec && complete_spec(cenv, spec, args.s, word, len))
-			return;
+		if (spec && word_text(input, wstart, lim, &cur)) {
+			struct spec_ctx c = { cenv, word, len, cur.s, cur.len, NULL, 0 };
+
+			if (complete_spec(&c, spec, &ty))
+				return;
+		}
 		if (word[0] == '-')
 			return;
 	}
@@ -1172,22 +1239,6 @@ static void add_short_path(struct sb *out, const char *cwd)
 	}
 	sb_markup(out, p);
 	free(path.s);
-}
-
-static int read_first_line(const char *path, char *buf, size_t size)
-{
-	int fd = open_regular(path, NULL);
-	ssize_t n;
-
-	if (fd < 0)
-		return 0;
-	n = read(fd, buf, size - 1);
-	close(fd);
-	if (n <= 0)
-		return 0;
-	buf[n] = 0;
-	buf[strcspn(buf, "\n")] = 0;
-	return 1;
 }
 
 /* The current git branch, read from .git/HEAD: no fork, so it costs nothing per prompt. */
@@ -1483,6 +1534,8 @@ int fdash_read(char *buf, int n)
 		if (whichprompt == 1) {
 			fdash_setstatus(exitstatus);
 			cmds_check();
+			fdash_dirh_update();
+			fdash_uvars_check();
 		}
 		prompt = make_prompt();
 		flushall();
