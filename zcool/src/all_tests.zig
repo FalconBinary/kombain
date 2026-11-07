@@ -6,4 +6,6 @@ test {
     _ = @import("undervolt_code.zig");
     _ = @import("gpus.zig");
     _ = @import("nvidia.zig");
+    _ = @import("ec.zig");
+    _ = @import("journal.zig");
 }

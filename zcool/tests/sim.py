@@ -85,12 +85,24 @@ class Nvidia:
         self.bus = "0000:01:00.0"
 
 
+class Ec:
+    """An MSI laptop's embedded controller as ec_sys shows it: 256 bytes with the firmware version
+    at 0xa0. Cooler Boost (0x98, bit 7) runs both fans at full; off, the firmware's curve runs them.
+    The other bits of 0x98 are the firmware's own and must survive."""
+
+    BOOST, PROFILE, CHARGE, CPU_TEMP, GPU_TEMP = 0x98, 0xf2, 0xef, 0x68, 0x80
+
+    def __init__(self, firmware="16R5EMS1.102", writable=True, boost=0x05, profile=0xc1, charge=0x80, mains=True):
+        self.firmware, self.writable, self.mains = firmware, writable, mains
+        self.initial = {self.BOOST: boost, self.PROFILE: profile, self.CHARGE: charge}
+
+
 class Machine:
     def __init__(self, cpu=None, gpu=None, rapl=True, rapl_enforced=True, rapl_writable=True, freq=True, cpu_fan=True, pump=False, config="",
-                 cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu"):
+                 cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu", ec=None):
         self.root = tempfile.mkdtemp(prefix="zcool-")
-        self.cpu, self.gpu, self.nv, self.gpu_driver = cpu, gpu, nvidia, gpu_driver
-        self.first_case = self.first_own_full = None
+        self.cpu, self.gpu, self.nv, self.gpu_driver, self.ec = cpu, gpu, nvidia, gpu_driver, ec
+        self.first_case = self.first_own_full = self.first_boost = self.first_trim = None
         self.env = dict(os.environ, LD_LIBRARY_PATH=FAKE_LIB, FAKE_NVML=f"{self.root}/dev/nvml", FAKE_NVML_SYS=self.root)
         self.rapl, self.rapl_enforced, self.cpu_fan, self.pump = rapl, rapl_enforced, cpu_fan, pump
         self.energy = 0.0
@@ -152,6 +164,20 @@ class Machine:
             put(f"{base}/scaling_max_freq", 5000000)
             put(f"{base}/cpuinfo_max_freq", 5000000)
             put(f"{base}/cpuinfo_min_freq", 800000)
+        if ec:
+            self.ec_path = f"{r}/sys/kernel/debug/ec/ec0/io"
+            data = bytearray(256)
+            data[0xa0:0xa0 + len(ec.firmware)] = ec.firmware.encode()
+            for addr, value in ec.initial.items():
+                data[addr] = value
+            os.makedirs(os.path.dirname(self.ec_path), exist_ok=True)
+            with open(self.ec_path, "wb") as f:
+                f.write(data)
+            put(f"{r}/sys/module/ec_sys/parameters/write_support", "Y" if ec.writable else "N")
+            put(f"{r}/sys/class/dmi/id/sys_vendor", "Micro-Star International Co., Ltd.")
+            put(f"{r}/sys/class/power_supply/ADP1/type", "Mains")
+            put(f"{r}/sys/class/power_supply/ADP1/online", int(ec.mains))
+            put(f"{r}/sys/class/power_supply/BAT1/type", "Battery")
         put(f"{r}/etc/zcool.conf", config)
         os.makedirs(f"{r}/var/lib", exist_ok=True)
         if nvidia:
@@ -186,6 +212,28 @@ class Machine:
         put(f"{d}/power/runtime_status", status)
         os.makedirs(f"{self.root}/sys/bus/pci/drivers/{driver}", exist_ok=True)
         os.symlink(f"../../../../bus/pci/drivers/{driver}", f"{d}/driver")
+
+    def ec_byte(self, addr):
+        with open(self.ec_path, "rb") as f:
+            f.seek(addr)
+            return f.read(1)[0]
+
+    def ec_set(self, addr, value):
+        fd = os.open(self.ec_path, os.O_WRONLY)
+        os.pwrite(fd, bytes([value]), addr)
+        os.close(fd)
+
+    def boost(self):
+        return bool(self.ec_byte(Ec.BOOST) & 0x80)
+
+    def ec_duty(self):
+        """Both fans at full with Cooler Boost, else the firmware's own curve for the hotter chip."""
+        if self.boost():
+            return 255
+        temp = self.cpu.temp if self.cpu else 40
+        if self.nv and self.nv.chip:
+            temp = max(temp, self.nv.chip.temp)
+        return min(255, max(70, 70 + (temp - 50) * 1.5))
 
     def nv_status(self, value=None):
         path = f"{self.root}/sys/bus/pci/devices/{self.nv.bus}/power/runtime_status"
@@ -241,6 +289,11 @@ class Machine:
         return value
 
     def publish(self):
+        if self.ec:
+            if self.cpu:
+                self.ec_set(Ec.CPU_TEMP, int(self.cpu.temp))
+            if self.nv and self.nv.chip:
+                self.ec_set(Ec.GPU_TEMP, int(self.nv.chip.temp))
         if self.cpu:
             self._write_temp(f"{self.cpu_dir}/temp1_input", self.cpu.temp)
             self._write_temp(f"{self.cpu_dir}/temp2_input", self.cpu.temp + 1)
@@ -281,6 +334,10 @@ class Machine:
             now = time.time()
             dt, last = now - last, now
             board = self.duty(self.board_dir, 1, 70) if self.cpu_fan else 0
+            if self.ec:
+                board = self.ec_duty()
+                if board == 255 and self.first_boost is None and self.boost():
+                    self.first_boost = now
             if self.cpu_fan and self.first_case is None and self.read(f"{self.board_dir}/pwm1_enable") == "1":
                 self.first_case = now
             if self.cpu:
@@ -291,6 +348,8 @@ class Machine:
                         cap = int(self.read(self.rapl_path)) / 1e6
                     except ValueError:
                         pass
+                    if cap < 300 and self.first_trim is None:
+                        self.first_trim = now
                 if self.freq:
                     try:
                         speed = min(int(self.read(f"{self.root}/sys/devices/system/cpu/cpufreq/policy{i}/scaling_max_freq")) for i in range(self.cores)) / 5000000
@@ -1047,6 +1106,177 @@ def undervolt_is_skipped_after_a_crash(r):
     out = m.cmd("undervolt", "reset")
     r.check(out.returncode == 0, out.stderr)
     r.check(not os.path.exists(f"{m.root}/var/lib/zcool/undervolt-pending"), "reset should clear it")
+    m.close()
+
+
+EC_CONFIG = "cpu0.max = 85\n"
+
+
+@scenario
+def an_msi_laptop_boosts_its_fans_before_taking_power(r):
+    # no fan in hwmon: only the EC's Cooler Boost, and more heat than the fans can carry
+    m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+    m.start()
+    m.advance(40, limit_cpu=85)
+    log = m.text()
+    r.check("ec/cooler_boost: on, both fans at full" in log, log[-500:])
+    r.check(m.first_boost is not None and (m.first_trim is None or m.first_boost < m.first_trim),
+            f"boost at {m.first_boost}, power trimmed at {m.first_trim}")
+    r.check(m.ec_byte(Ec.BOOST) == 0x85, f"0x98 is {m.ec_byte(Ec.BOOST):#x}: only bit 7 should change")
+    r.check(m.cpu.peak <= 87, f"peak {m.cpu.peak:.1f}")
+    r.note(f"peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
+    m.cpu.load = 10
+    m.advance(55, limit_cpu=85)
+    log = m.text()
+    # off by itself as the fans come down, or handed back with the rest once there is nothing to do
+    r.check("ec/cooler_boost: off" in log or "ec/cooler_boost: back to the firmware" in log, log[-500:])
+    r.check(m.ec_byte(Ec.BOOST) == 0x05, f"0x98 is {m.ec_byte(Ec.BOOST):#x} after the heat")
+    m.stop()
+    m.close()
+
+
+@scenario
+def cooler_boost_goes_back_however_zcool_ends(r):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+        m.start()
+        m.advance(25, limit_cpu=85)
+        r.check(m.boost(), f"{sig.name}: boost never came on")
+        # the firmware changes its own bits meanwhile: they must stay as it left them
+        m.ec_set(Ec.BOOST, m.ec_byte(Ec.BOOST) | 0x02)
+        m.stop(sig)
+        if sig == signal.SIGKILL:
+            r.check(m.boost(), "kill -9 cannot put anything back by itself")
+            m.cmd("restore")
+        r.check(m.ec_byte(Ec.BOOST) == 0x07, f"{sig.name}: 0x98 is {m.ec_byte(Ec.BOOST):#x}, should be 0x07")
+        r.check(get(m.rapl_path) == "300000000", f"{sig.name}: power not given back")
+        m.close()
+
+
+@scenario
+def a_boost_the_user_turned_on_stays_on(r):
+    m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(boost=0x85), config=EC_CONFIG)
+    m.start()
+    m.advance(25, limit_cpu=85)
+    m.cpu.load = 10
+    m.advance(35, limit_cpu=85)
+    r.check(m.boost(), "the boost the user turned on was turned off")
+    m.stop()
+    r.check(m.boost(), "the boost the user turned on was turned off at the end")
+    m.close()
+
+
+@scenario
+def the_charge_limit_is_set_and_stays(r):
+    m = Machine(cpu=Chip(load=10), cpu_fan=False, ec=Ec(), config="battery.max = 80\n")
+    m.start()
+    m.advance(3)
+    r.check(m.ec_byte(Ec.CHARGE) == 0x80 | 80, f"0xef is {m.ec_byte(Ec.CHARGE):#x}")
+    r.check("charges up to 80%" in m.text(), m.text()[-300:])
+    m.stop()
+    r.check(m.ec_byte(Ec.CHARGE) == 0x80 | 80, "the limit must hold while the laptop is off")
+    m.close()
+    # an EC without one is left alone; the kernel's own setting wins where there is one
+    m = Machine(cpu=Chip(load=10), cpu_fan=False, ec=Ec(charge=0x00), config="battery.max = 80\n")
+    m.start()
+    m.advance(2)
+    r.check(m.ec_byte(Ec.CHARGE) == 0x00, "an EC that takes no limit was written")
+    r.check("takes no charge limit" in m.text(), m.text()[-300:])
+    m.stop()
+    m.close()
+    m = Machine(cpu=Chip(load=10), cpu_fan=False, ec=Ec(), config="battery.max = 60\n")
+    put(f"{m.root}/sys/class/power_supply/BAT1/charge_control_end_threshold", 100)
+    m.start()
+    m.advance(2)
+    r.check(get(f"{m.root}/sys/class/power_supply/BAT1/charge_control_end_threshold") == "60", "the kernel's limit was not set")
+    r.check(m.ec_byte(Ec.CHARGE) == 0x80, "the EC was written next to the kernel's setting")
+    m.stop()
+    m.close()
+
+
+@scenario
+def the_ec_profile_follows_the_power_source(r):
+    m = Machine(cpu=Chip(load=10), cpu_fan=False, ec=Ec(), config="mode.ac = sport\nmode.battery = eco\n")
+    m.start()
+    m.advance(3)
+    r.check(m.ec_byte(Ec.PROFILE) == 0xc0, f"on mains: {m.ec_byte(Ec.PROFILE):#x}")
+    put(f"{m.root}/sys/class/power_supply/ADP1/online", 0)
+    m.advance(4)
+    r.check(m.ec_byte(Ec.PROFILE) == 0xc2, f"on battery: {m.ec_byte(Ec.PROFILE):#x}")
+    r.check("eco profile on battery" in m.text(), m.text()[-300:])
+    m.stop()
+    r.check(m.ec_byte(Ec.PROFILE) == 0xc1, f"the original profile should come back: {m.ec_byte(Ec.PROFILE):#x}")
+    m.close()
+    # only one source named: the other gets the firmware's own profile back
+    m = Machine(cpu=Chip(load=10), cpu_fan=False, ec=Ec(mains=False), config="mode.battery = eco\n")
+    m.start()
+    m.advance(3)
+    r.check(m.ec_byte(Ec.PROFILE) == 0xc2, f"on battery: {m.ec_byte(Ec.PROFILE):#x}")
+    put(f"{m.root}/sys/class/power_supply/ADP1/online", 1)
+    m.advance(4)
+    r.check(m.ec_byte(Ec.PROFILE) == 0xc1, f"back on mains: {m.ec_byte(Ec.PROFILE):#x}")
+    m.stop()
+    m.close()
+
+
+@scenario
+def an_ec_zcool_does_not_know_or_cannot_write_is_left_alone(r):
+    for ec, said in ((Ec(firmware="16R5EMS1.999"), "not one zcool knows"), (Ec(writable=False), "read only")):
+        m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=ec,
+                    config=EC_CONFIG + "battery.max = 80\nmode.ac = sport\n")
+        before = open(m.ec_path, "rb").read()
+        out = m.cmd("list").stdout
+        r.check(said in out, out)
+        m.start()
+        m.advance(15, limit_cpu=85)
+        m.stop()
+        after = open(m.ec_path, "rb").read()
+        changed = [hex(i) for i in range(256) if before[i] != after[i] and i not in (Ec.CPU_TEMP, Ec.GPU_TEMP)]
+        r.check(not changed, f"{ec.firmware}: written at {changed}")
+        m.close()
+
+
+@scenario
+def list_shows_the_ec(r):
+    m = Machine(cpu=Chip(load=10, temp=55), cpu_fan=False, ec=Ec(charge=0x80 | 80))
+    m.ec_set(0x71, 45)
+    out = m.cmd("list").stdout
+    r.check("ec: 16R5EMS1.102, GF63/GF65 Thin" in out, out)
+    r.check("cooler boost off, profile comfort, charge limit 80%" in out, out)
+    r.check("ec/cooler_boost" in out and "auto" in out, out)
+    r.check("cpu 55C, fan 45%" in out, out)
+    m.close()
+
+
+@scenario
+def nvidia_its_library_cannot_read_is_read_through_the_ec(r):
+    nv = Nvidia(Chip(load=90, g_min=0.5, g_max=1.6, mass=15, temp=60))
+    m = Machine(cpu=Chip(load=15, g_max=2.0), cpu_fan=False, nvidia=nv, ec=Ec(), config=GPU_CONFIG)
+    put(f"{m.nv_dir}/no_temp", 1)
+    m.start()
+    m.advance(30, limit_cpu=85, limit_gpu=80)
+    log = m.text()
+    r.check("NVIDIA's library answers \"err no temperature" in log, log[-500:])
+    r.check("gpu0: read through the EC instead, limit 80C" in log, log[-500:])
+    r.check(m.first_boost is not None, "the hot GPU should have brought Cooler Boost on")
+    out = m.cmd("list").stdout
+    r.check("ec, fans" in out, out)
+    m.stop()
+    r.check(not m.boost(), "boost not given back")
+    m.close()
+
+
+@scenario
+def nvidia_that_reads_only_attached_is_attached(r):
+    nv = Nvidia(Chip(load=90, g_min=0.5, g_max=1.6, mass=15, temp=60))
+    m = Machine(cpu=Chip(load=15, g_max=2.0), nvidia=nv, config=GPU_CONFIG)
+    put(f"{m.nv_dir}/needs_attach", 1)
+    out = m.cmd("list").stdout
+    r.check("gpu0" in out and "clocks" in out, out)
+    m.start()
+    m.advance(20, limit_cpu=85, limit_gpu=80)
+    r.check("NVIDIA at 0000:01:00.0" in m.text(), m.text()[-400:])
+    m.stop()
     m.close()
 
 

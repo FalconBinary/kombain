@@ -15,6 +15,8 @@ const not_supported: c_int = 3;
 const not_found: c_int = 6;
 
 var buses: [8][16]u8 = undefined;
+/// Whether the last init attached the GPUs: a GPU with needs_attach reads nothing until it did.
+var attached = false;
 var bus_lens: [8]u8 = undefined;
 var nbuses: usize = 0;
 
@@ -98,12 +100,13 @@ fn supported(bus: []const u8, file: []const u8) bool {
 }
 
 export fn nvmlInitWithFlags(flags: c_uint) c_int {
-    _ = flags;
+    attached = flags & 2 == 0;
     noteTop("inits");
     return success;
 }
 
 export fn nvmlInit_v2() c_int {
+    attached = true;
     noteTop("inits");
     return success;
 }
@@ -135,6 +138,9 @@ const Temperature = extern struct { version: c_uint, sensor: c_int, temperature:
 
 export fn nvmlDeviceGetTemperatureV(dev: ?*anyopaque, t: *Temperature) c_int {
     const bus = busOf(dev);
+    // a GPU this library cannot read, or not without attaching it first
+    if (supported(bus, "no_temp")) return not_supported;
+    if (supported(bus, "needs_attach") and !attached) return 999;
     t.temperature = @intCast(readNum(bus, "temp") orelse return not_found);
     note(bus, "reads");
     return success;
