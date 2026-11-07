@@ -141,6 +141,12 @@ pub fn profile() ?Profile {
     return profileOf(l, read(l.profile) orelse return null);
 }
 
+/// 0x80 is what the EC holds until a program sets a profile: it then runs its own.
+pub fn profileName(l: *const Layout, byte: u8) []const u8 {
+    if (profileOf(l, byte)) |p| return @tagName(p);
+    return if (byte == 0x80) "the firmware's own" else "unknown";
+}
+
 pub fn profileOf(l: *const Layout, byte: u8) ?Profile {
     for (l.profiles, 0..) |p, i| if (p == byte) return @fromBackingInt(@intCast(i));
     return null;
@@ -222,4 +228,7 @@ test "profiles are read back by their byte" {
     try std.testing.expectEqual(Profile.eco, profileOf(l, 0xc2).?);
     try std.testing.expectEqual(Profile.turbo, profileOf(l, 0xc4).?);
     try std.testing.expect(profileOf(l, 0x00) == null);
+    try std.testing.expectEqualStrings("comfort", profileName(l, 0xc1));
+    try std.testing.expectEqualStrings("the firmware's own", profileName(l, 0x80));
+    try std.testing.expectEqualStrings("unknown", profileName(l, 0x13));
 }

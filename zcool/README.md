@@ -14,7 +14,9 @@ thermal simulator. Start with `--dry-run`, which writes nothing.
 Heat has to go somewhere. If a cooler can carry 180 W and the chip draws 280 W, no
 software keeps it at your limit at full speed. So the order is:
 
-1. **Forecast.** It reacts to where the temperature is heading, not where it is.
+1. **Forecast.** It reacts to where the temperature is heading, not where it is, but at most
+   8 C ahead of it: a CPU's die jumps 20 C within a second when work starts and levels off as
+   soon, and following that slope further took power at 65 C on a real laptop.
 2. **Fans first.** They rise before the limit and reach full speed at it. Speed is not touched.
    A GPU's own fans go first; the case fans join once those are at full.
 3. **Then a little power,** only when the fans have nothing left, and only as much as needed.

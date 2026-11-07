@@ -10,6 +10,10 @@ const std = @import("std");
 
 /// How far ahead the temperature is forecast, in seconds.
 pub const horizon: f32 = 4;
+/// How far the forecast may run ahead of the temperature. A CPU's die jumps 20 C within a
+/// second when a burst of work starts, and levels off as soon after: following that slope any
+/// further spun fans and took power for heat that never came (seen on a real laptop at 65 C).
+pub const max_lead: f32 = 8;
 /// Fans start this far below the limit and reach full speed at the limit.
 pub const fan_band: f32 = 8;
 /// A chip is never throttled below this level; below that the hardware protects itself.
@@ -36,7 +40,7 @@ pub const Thermal = struct {
 
     /// Only a rising temperature moves the forecast: a falling one must not relax anything early.
     pub fn forecast(self: *const Thermal) f32 {
-        return self.temp + @max(self.slope, 0) * horizon;
+        return self.temp + std.math.clamp(self.slope * horizon, 0, max_lead);
     }
 };
 
@@ -167,6 +171,16 @@ test "forecast only looks at a rising temperature" {
     t.update(80, 1);
     t.update(70, 1);
     try std.testing.expect(t.forecast() <= t.temp);
+}
+
+test "a burst far below the limit forecasts nothing near it" {
+    var t = Thermal{};
+    t.update(45, 0.25);
+    // 45 to 65 C in a second, as a real laptop CPU does when work starts
+    var temp: f32 = 45;
+    while (temp < 65) : (temp += 5) t.update(temp, 0.25);
+    try std.testing.expect(t.forecast() <= t.temp + max_lead);
+    try std.testing.expect(fanDemand(t.forecast(), 90) == 0);
 }
 
 test "near the critical point power drops at once" {
