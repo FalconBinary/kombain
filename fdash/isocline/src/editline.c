@@ -63,7 +63,7 @@ ic_private char* ic_editline(ic_env_t* env, const char* prompt_text) {
   char* line = edit_line(env,prompt_text);
   term_end_raw(env->term,false);
   tty_end_raw(env->tty);
-  term_writeln(env->term,"");
+  if (!env->key_ran) term_writeln(env->term,"");  // fdash: a key's command takes the place of the input
   term_flush(env->term);
   return line;
 }
@@ -552,6 +552,22 @@ static void edit_expand_abbr(ic_env_t* env, editor_t* eb) {
   eb->pos = sbuf_insert_at(eb->input, rep, start);
 }
 
+// fdash: the name a key handler sees: "alt-e", "alt-left", "f1"; false for other keys
+static bool key_name(code_t c, char* buf, size_t size) {
+  static const char* const arrows[] = { "up", "down", "left", "right" };
+  code_t k = KEY_NO_MODS(c);
+  if (KEY_MODS(c) == KEY_MOD_ALT) {
+    if (k > ' ' && k < 0x7F) { snprintf(buf, size, "alt-%c", (char)k); return true; }
+    if (k >= KEY_UP && k <= KEY_RIGHT) { snprintf(buf, size, "alt-%s", arrows[k - KEY_UP]); return true; }
+    return false;
+  }
+  if (KEY_MODS(c) == 0 && k >= KEY_F1 && k <= KEY_F1 + 11) {
+    snprintf(buf, size, "f%d", (int)(k - KEY_F1) + 1);
+    return true;
+  }
+  return false;
+}
+
 static void edit_history_prev(ic_env_t* env, editor_t* eb);
 static void edit_history_next(ic_env_t* env, editor_t* eb);
 
@@ -921,8 +937,18 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
     eb.attrs_extra = attrbuf_new(env->mem);
   }
   
+  // fdash: start with the input a key's command left behind
+  env->key_ran = false;
+  if (env->initial_input != NULL) {
+    sbuf_replace(eb.input, env->initial_input);
+    eb.pos = (env->initial_pos < 0 || env->initial_pos > sbuf_len(eb.input) ? sbuf_len(eb.input) : env->initial_pos);
+    mem_free(env->mem, env->initial_input);
+    env->initial_input = NULL;
+  }
+
   // show prompt
   edit_write_prompt(env, &eb, 0, false);   
+  if (sbuf_len(eb.input) > 0) edit_refresh(env, &eb);
 
   // always a history entry for the current input
   history_sync(env->history);
@@ -931,6 +957,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
   // process keys
   code_t c;          // current key code
   bool queued = false; // fdash: was more input waiting behind the previous key?
+  char* ran = NULL;    // fdash: a command a key asked for
   while(true) {    
     // read a character
     term_flush(env->term);
@@ -966,6 +993,28 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
     // fdash: everything queued up counts as one edit, so one undo step covers a paste
     eb.burst = queued;
     queued = tty_has_input(env->tty);
+
+    // fdash: Alt and function keys go to the shell first
+    if (env->key_fun != NULL) {
+      char name[32];
+      const char* text = NULL;
+      long npos = -1;
+      ic_key_action_t act = (key_name(c, name, sizeof(name))
+        ? env->key_fun(name, sbuf_string(eb.input), (long)eb.pos, &text, &npos, env->key_arg) : IC_KEY_IGNORE);
+      if (act == IC_KEY_EDITED && text != NULL) {
+        editor_start_modify(&eb);
+        sbuf_replace(eb.input, text);
+        eb.pos = (npos < 0 || npos > sbuf_len(eb.input) ? sbuf_len(eb.input) : npos);
+        sbuf_clear(eb.hint);
+        sbuf_clear(eb.hint_help);
+        edit_refresh_hint(env, &eb);
+        continue;
+      }
+      if (act == IC_KEY_RUN && text != NULL) {
+        ran = mem_strdup(env->mem, text);
+        break;
+      }
+    }
 
     // fdash: right, end, ctrl+F and ctrl+E take the suggestion, the word movements its next word
     const bool had_hint = (sbuf_len(eb.hint) > 0);
@@ -1085,11 +1134,13 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
         break;
       case KEY_CTRL_LEFT:
       case WITH_SHIFT(KEY_LEFT):    
+      case WITH_ALT(KEY_LEFT):
       case WITH_ALT('b'):
         edit_cursor_prev_word(env,&eb);
         break;
       case KEY_CTRL_RIGHT:
       case WITH_SHIFT(KEY_RIGHT):      
+      case WITH_ALT(KEY_RIGHT):
       case WITH_ALT('f'):
         if (eb.pos == sbuf_len(eb.input)) { 
           edit_generate_completions( env, &eb, false );
@@ -1169,6 +1220,18 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
 
   }
 
+  char* res; 
+  if (ran != NULL) {
+    // fdash: the command takes the place of the prompt and input on the screen
+    edit_clear(env, &eb);
+    term_start_of_line(env->term);
+    term_up(env->term, eb.cur_row);
+    env->key_ran = true;
+    res = ran;
+    ic_history_remove_last();
+    goto done;
+  }
+
   // goto end
   eb.pos = sbuf_len(eb.input);
 
@@ -1179,7 +1242,6 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
   env->no_bracematch = bm;
   
   // save result
-  char* res; 
   if ((c == KEY_CTRL_D && sbuf_len(eb.input) == 0) || c == KEY_EVENT_STOP) {
     res = NULL;
   }
@@ -1195,6 +1257,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
   // fdash: a line starting with a space stays out of the history, as in fish
   if (res == NULL || sbuf_len(eb.input) <= 1 || sbuf_string(eb.input)[0] == ' ') { ic_history_remove_last(); } // no empty or single-char entries
   else { history_append_last(env->history); }
+done:
   mem_free(env->mem, eb.hprefix);
 
   // free resources 

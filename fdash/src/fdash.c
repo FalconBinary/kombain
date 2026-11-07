@@ -1471,6 +1471,289 @@ static void announce_prompt(void)
 		return;
 }
 
+/* ------------------------------------------------------------------- keys */
+
+/*
+ * Keys as in fish. Those that need the shell (prevd, man, ls, the editor)
+ * hand it a command: the input leaves the screen, the command runs as if
+ * typed, but stays out of the history and keeps $?, and the input comes back
+ * at the next prompt. bind adds keys of the same kind; commandline reads and
+ * changes the input from their commands.
+ */
+struct binding {
+	char *key, *command;
+	struct binding *next;
+};
+
+static struct binding *bindings;
+static struct sb kept_input;	/* the input while a key's command runs */
+static long kept_pos = -1;
+static int key_pending;		/* the line being run came from a key */
+static int key_status;		/* $? before it */
+static char *edit_file;		/* Alt+E: the file the editor works on */
+
+/* The simple command the cursor is in: its name, its first argument, and the word at the cursor. */
+static void line_at(const char *input, long pos, struct sb *cmd, struct sb *arg, struct sb *word)
+{
+	struct state st = { 1, 0, 0 };
+	struct token t;
+	long lim = (long)strlen(input), i = 0;
+
+	sb_clear(cmd);
+	sb_clear(arg);
+	sb_clear(word);
+	for (;;) {
+		struct state before = st;
+
+		i = next_token(input, i, lim, &t);
+		if (t.type == T_END || t.type == T_COMMENT || t.start > pos)
+			break;
+		state_step(&st, input, &t);
+		if (t.type == T_SEP) {
+			if (t.end <= pos) {
+				sb_clear(cmd);
+				sb_clear(arg);
+			}
+			continue;
+		}
+		if (t.type != T_WORD || before.redir)
+			continue;
+		if (pos <= t.end && !word_text(input, t.start, t.end, word))
+			sb_clear(word);
+		if (before.cmdpos && !(before.wrapper && input[t.start] == '-')) {
+			if (!is_assignment(input + t.start, (size_t)(t.end - t.start)) && word_text(input, t.start, t.end, cmd))
+				sb_clear(arg);
+		} else if (cmd->len && !arg->len && input[t.start] != '-' && t.end < pos) {
+			word_text(input, t.start, t.end, arg);
+		}
+	}
+}
+
+static ic_key_action_t run_for_key(const char *input, long pos, const char *command, const char **text)
+{
+	sb_clear(&kept_input);
+	sb_str(&kept_input, input);
+	kept_pos = pos;
+	key_pending = 1;
+	*text = command;
+	return IC_KEY_RUN;
+}
+
+static ic_key_action_t key_handler(const char *name, const char *input, long pos,
+				   const char **text, long *newpos, void *arg)
+{
+	static struct sb out, cmd, sub, word;
+	struct binding *b;
+	const char *p;
+
+	(void)arg;
+	sb_clear(&out);
+	for (b = bindings; b; b = b->next)
+		if (!strcmp(b->key, name))
+			return whichprompt == 1 ? run_for_key(input, pos, b->command, text) : IC_KEY_IGNORE;
+	if (!strcmp(name, "alt-s")) {
+		/* doas in front, or off again; on an empty line, before the last command */
+		const char *pre = is_runnable("doas") || !is_runnable("sudo") ? "doas " : "sudo ";
+		const char *prev = ic_history_get(1);
+
+		if (!strncmp(input, pre, 5)) {
+			sb_str(&out, input + 5);
+			*newpos = pos > 5 ? pos - 5 : 0;
+		} else {
+			sb_str(&out, pre);
+			sb_str(&out, *input || !prev ? input : prev);
+			*newpos = *input ? pos + 5 : -1;
+		}
+		*text = out.s;
+		return IC_KEY_EDITED;
+	}
+	if (whichprompt != 1)
+		return IC_KEY_IGNORE;
+	for (p = input; *p == ' ' || *p == '\t'; p++)
+		;
+	if (!strcmp(name, "alt-left") || !strcmp(name, "alt-right")) {
+		if (*p)
+			return IC_KEY_IGNORE;	/* the editor moves by words */
+		return run_for_key(input, pos, name[4] == 'l' ? "prevd 2>/dev/null" : "nextd 2>/dev/null", text);
+	}
+	if (!strcmp(name, "alt-e") || !strcmp(name, "alt-v")) {
+		const char *tmp = lookupvar("TMPDIR");
+		int fd;
+
+		sb_str(&out, tmp && *tmp == '/' ? tmp : "/tmp");
+		sb_str(&out, "/fdash-line.XXXXXX.sh");
+		if ((fd = mkstemps(out.s, 3)) < 0)
+			return IC_KEY_IGNORE;
+		if (write(fd, input, strlen(input)) < 0 || write(fd, "\n", 1) < 0) {
+			close(fd);
+			unlink(out.s);
+			return IC_KEY_IGNORE;
+		}
+		close(fd);
+		free(edit_file);
+		edit_file = strdup(out.s);
+		sb_clear(&cmd);
+		sb_str(&cmd, "${VISUAL:-${EDITOR:-vi}} ");
+		sb_quote(&cmd, out.s);
+		return run_for_key(input, pos, cmd.s, text);
+	}
+	line_at(input, pos, &cmd, &sub, &word);
+	if (!strcmp(name, "alt-h") || !strcmp(name, "f1")) {
+		/* git commit: git-commit(1) if there is one */
+		if (!cmd.len)
+			return IC_KEY_IGNORE;
+		sb_str(&out, "man -- ");
+		if (sub.len) {
+			sb_clear(&word);
+			sb_str(&word, cmd.s);
+			sb_chr(&word, '-');
+			sb_str(&word, sub.s);
+			sb_quote(&out, word.s);
+			sb_str(&out, " 2>/dev/null || man -- ");
+		}
+		sb_quote(&out, cmd.s);
+		return run_for_key(input, pos, out.s, text);
+	}
+	if (!strcmp(name, "alt-l")) {
+		sb_str(&out, "ls");
+		if (word.len && is_dir(word.s)) {
+			sb_str(&out, " -- ");
+			sb_quote(&out, word.s);
+		}
+		return run_for_key(input, pos, out.s, text);
+	}
+	if (!strcmp(name, "alt-w")) {
+		if (!cmd.len)
+			return IC_KEY_IGNORE;
+		sb_str(&out, "whatis -- ");
+		sb_quote(&out, cmd.s);
+		sb_str(&out, " 2>/dev/null || type ");
+		sb_quote(&out, cmd.s);
+		return run_for_key(input, pos, out.s, text);
+	}
+	return IC_KEY_IGNORE;
+}
+
+/* At the prompt after a key's command: its input comes back, and $? is what it was. */
+static void key_done(void)
+{
+	char *text;
+
+	if (!key_pending)
+		return;
+	key_pending = 0;
+	exitstatus = key_status;
+	if (edit_file) {
+		if ((text = read_text(edit_file, 1 << 20))) {
+			size_t n = strlen(text);
+
+			while (n && text[n - 1] == '\n')
+				text[--n] = 0;
+			sb_clear(&kept_input);
+			sb_str(&kept_input, text);
+			kept_pos = -1;
+			free(text);
+		}
+		unlink(edit_file);
+		free(edit_file);
+		edit_file = NULL;
+	}
+	ic_set_initial_input(kept_input.s ? kept_input.s : "", kept_pos);
+}
+
+static int key_ok(const char *k)
+{
+	static const char *const arrows[] = { "alt-up", "alt-down", "alt-left", "alt-right" };
+	size_t i;
+
+	if (!strncmp(k, "alt-", 4) && k[4] > ' ' && k[4] < 0x7f && !k[5])
+		return 1;
+	for (i = 0; i < 4; i++)
+		if (!strcmp(k, arrows[i]))
+			return 1;
+	return k[0] == 'f' && atoi(k + 1) >= 1 && atoi(k + 1) <= 12 && strspn(k + 1, "0123456789") == strlen(k + 1);
+}
+
+/* bind KEY COMMAND, bind -e KEY, bind: list. KEY is alt-x, alt-left and the like, or f1 to f12. */
+int bindcmd(int argc, char **argv)
+{
+	struct binding **bp, *b;
+
+	if (argc < 2) {
+		for (b = bindings; b; b = b->next)
+			out1fmt("bind %s %s\n", b->key, single_quote(b->command));
+		return 0;
+	}
+	if (!strcmp(argv[1], "-e")) {
+		if (argc < 3)
+			sh_error("usage: bind -e key");
+		for (bp = &bindings; *bp; bp = &(*bp)->next) {
+			if (!strcmp((*bp)->key, argv[2])) {
+				b = *bp;
+				*bp = b->next;
+				free(b->key);
+				free(b->command);
+				free(b);
+				return 0;
+			}
+		}
+		return 1;
+	}
+	if (argc != 3 || !key_ok(argv[1]))
+		sh_error("usage: bind alt-x|alt-left|f1... command | bind -e key");
+	for (b = bindings; b && strcmp(b->key, argv[1]); b = b->next)
+		;
+	if (!b) {
+		if (!(b = calloc(1, sizeof(*b))))
+			return 1;
+		b->key = strdup(argv[1]);
+		b->next = bindings;
+		bindings = b;
+	}
+	free(b->command);
+	b->command = strdup(argv[2]);
+	return 0;
+}
+
+/*
+ * In a key's command: commandline prints the input, commandline TEXT replaces
+ * it, -i TEXT inserts at the cursor, -C prints or sets the cursor.
+ */
+int commandlinecmd(int argc, char **argv)
+{
+	struct sb text = {0};
+	long len = kept_input.s ? (long)kept_input.len : 0;
+	long pos = kept_pos < 0 || kept_pos > len ? len : kept_pos;
+
+	if (argc < 2) {
+		out1fmt("%s\n", kept_input.s ? kept_input.s : "");
+		return 0;
+	}
+	if (!strcmp(argv[1], "-C")) {
+		if (argc < 3) {
+			out1fmt("%ld\n", pos);
+			return 0;
+		}
+		kept_pos = number(argv[2]);
+		return 0;
+	}
+	if (!strcmp(argv[1], "-i") && argc == 3) {
+		sb_add(&text, kept_input.s ? kept_input.s : "", (size_t)pos);
+		sb_str(&text, argv[2]);
+		kept_pos = (long)text.len;
+		sb_str(&text, kept_input.s ? kept_input.s + pos : "");
+	} else if (argc == 2) {
+		sb_str(&text, argv[1]);
+		kept_pos = -1;
+	} else {
+		sh_error("usage: commandline [-i] [text] | commandline -C [position]");
+	}
+	sb_clear(&kept_input);
+	sb_str(&kept_input, text.s);
+	free(text.s);
+	return 0;
+}
+
 /* -------------------------------------------------------------- reading */
 
 static void setup(void)
@@ -1496,6 +1779,7 @@ static void setup(void)
 	ic_set_default_highlighter(highlighter, NULL);
 	ic_set_default_completer(completer, NULL);
 	ic_set_abbr_expander(abbr_expand, NULL);
+	ic_set_key_handler(key_handler, NULL);
 	ic_enable_hint(true);
 	ic_set_hint_delay(0);
 	ic_enable_inline_help(false);
@@ -1579,6 +1863,7 @@ int fdash_read(char *buf, int n)
 			setup();
 		pushstackmark(&mark, stackblocksize());
 		if (whichprompt == 1) {
+			key_done();
 			fdash_setstatus(exitstatus);
 			cmds_check();
 			fdash_dirh_update();
@@ -1596,13 +1881,20 @@ int fdash_read(char *buf, int n)
 			INTON;
 			return 0;
 		}
-		line = implicit_cd(res, &rewritten);
+		if (key_pending) {
+			/* a key's command: the prompt shows how the user's own command went */
+			key_status = exitstatus;
+			line = res;
+			command_started = 0;
+		} else {
+			line = implicit_cd(res, &rewritten);
+			command_started = time(NULL);
+		}
 		sb_clear(&pending);
 		sb_str(&pending, line);
 		sb_chr(&pending, '\n');
 		off = 0;
 		ic_free(res);
-		command_started = time(NULL);
 		INTON;
 	}
 	left = pending.len - off;

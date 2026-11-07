@@ -60,7 +60,9 @@ histcmd		-u fc
 
 #ifdef FDASH
 abbrcmd		-u abbr
+bindcmd		-u bind
 cdhcmd		-u cdh
+commandlinecmd	-u commandline
 dirhcmd		-u dirh
 historycmd	-u history
 nextdcmd	-u nextd
