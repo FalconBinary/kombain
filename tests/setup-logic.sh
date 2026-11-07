@@ -279,6 +279,7 @@ has "NVIDIA is told about lockdown" "kernel lockdown stays off"
 has "the NVIDIA driver" "nvidia"
 has "it may sleep when idle" "options nvidia NVreg_DynamicPowerManagement=0x02"
 has "lockdown is replaced" "nvidia_drm.modeset=1"
+has "NVIDIA stays out of the initramfs" 'omit_drivers+=" nouveau nova_core nova_drm nvidia '
 has "the desktop" "./install.sh --user dev"
 has "fdash" "chsh -s /usr/local/bin/fdash dev"
 hasnt "the NVIDIA card keeps its firmware" "linux-firmware-nvidia"

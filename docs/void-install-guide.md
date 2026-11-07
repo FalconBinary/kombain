@@ -198,7 +198,7 @@ EOF
 - `noauto` у `/home/dev` обязателен. Ошибка `mount -a` при загрузке Void приводит в аварийную оболочку, а в Gaming этого раздела нет.
 - `noexec` на `/home/gamer` и `/tmp` не ставьте, иначе не запустятся игры.
 
-**Initramfs.** `hostonly_cmdline="no"` нужен, чтобы параметры брались только из Limine и Gaming не спрашивал пароль от `p3`. `hostonly_mode="strict"` кладёт в initramfs только драйверы этой машины. В обычном режиме dracut добавляет ещё все драйверы клавиатур, USB, дисков и сетевых карт с их прошивками. После замены диска или его контроллера пересоберите initramfs с ISO: `xbps-reconfigure -f linux6.18` в `xchroot`.
+**Initramfs.** `hostonly_cmdline="no"` нужен, чтобы параметры брались только из Limine и Gaming не спрашивал пароль от `p3`. `hostonly_mode="strict"` кладёт в initramfs только драйверы этой машины. В обычном режиме dracut добавляет ещё все драйверы клавиатур, USB, дисков и сетевых карт с их прошивками. `omit_drivers` не пускает туда драйверы NVIDIA с их прошивками: экран загрузки и пароль LUKS показывает встроенная видеокарта или прошивка, а драйвер NVIDIA загружается уже с диска. Без этой строки на ноутбуке с GTX 1650 initramfs весил 209 МиБ вместо 20, и в `/boot` помещалось всего четыре ядра. После замены диска или его контроллера пересоберите initramfs с ISO: `xbps-reconfigure -f linux6.18` в `xchroot`.
 
 ```bash
 mkdir -p /etc/dracut.conf.d
@@ -207,6 +207,7 @@ hostonly="yes"
 hostonly_mode="strict"
 hostonly_cmdline="no"
 add_dracutmodules+=" crypt lvm "
+omit_drivers+=" nouveau nova_core nova_drm nvidia nvidia_drm nvidia_modeset nvidia_uvm "
 compress="zstd"
 EOF
 ```

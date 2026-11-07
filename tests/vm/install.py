@@ -905,6 +905,13 @@ class Run:
         self.expect("Dev: no btrfs, RAID6 benchmark or test devices loaded at boot", loaded == "", loaded)
         initramfs = self.out("lsinitrd -m /boot/initramfs-*.img | grep -xE 'virtfs|btrfs' || true; lsinitrd /boot/initramfs-*.img | grep -cE 'firmware/cxgb4|kernel/drivers/usb/storage'; true")
         self.expect("Dev: the initramfs holds this machine's drivers only", initramfs == "0", initramfs)
+        # A build for any machine takes every GPU driver: NVIDIA's, with their firmware, must still stay out.
+        every = self.sh("dracut -q --force --no-hostonly --no-compress /var/tmp/every.img $(uname -r); "
+                        "lsinitrd /var/tmp/every.img | grep -cE '/(nouveau|nova_core|nova_drm|nvidia[a-z_]*)[.]ko'; "
+                        "lsinitrd /var/tmp/every.img | grep -cE '/i915[.]ko'; rm -f /var/tmp/every.img",
+                        check=False, timeout=600).strip().splitlines()[-2:]
+        self.expect("Dev: NVIDIA's drivers stay out of the initramfs, even built for any machine",
+                    len(every) == 2 and every[0] == "0" and every[1].isdigit() and int(every[1]) > 0, every)
         self.expect("Dev: the package locales stay out", self.out("ls /usr/share/locale | wc -l").isdigit() and int(self.out("du -sxm /usr/share/locale | cut -f1")) < 60, self.out("du -sxm /usr/share/locale"))
         self.measure("dev-console")
 
