@@ -1148,7 +1148,7 @@ static void completer(ic_completion_env_t *cenv, const char *input)
 				}
 				sb_clear(&words);
 				nw = no = dashdash = 0;
-			} else if (nw + no < 2 * MAX_TYPED - 1 && (nw < MAX_TYPED && no < MAX_TYPED)) {
+			} else if (nw < MAX_TYPED && no < MAX_TYPED) {
 				int opt = !dashdash && input[t.start] == '-' && n > 1;
 
 				if (n == 2 && !strncmp(input + t.start, "--", 2))
