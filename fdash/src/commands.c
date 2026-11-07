@@ -710,21 +710,41 @@ int fdash_autoload_exists(const char *name)
 }
 
 /* exec.c, when a command is not found: a saved function loads in interactive shells. */
+/* Runs line, or reads file, with a guard that is down again even after an error. */
+static int guarded(int *guard, char *line, const char *file)
+{
+	struct jmploc jmploc, *volatile savehandler = handler;
+	volatile int status = 0;
+	int failed = 0;
+
+	*guard = 1;
+	if (!setjmp(jmploc.loc)) {
+		handler = &jmploc;
+		if (file)
+			readcmdfile((char *)file);
+		else
+			status = evalstring(line, 0);
+	} else {
+		failed = 1;
+	}
+	handler = savehandler;
+	*guard = 0;
+	if (failed)
+		longjmp(handler->loc, 1);
+	return status;
+}
+
 int fdash_autoload(const char *name)
 {
 	static int loading;
 	struct sb path = {0};
-	int ok = 0;
 
 	if (loading || !fdash_active() || !fdash_autoload_exists(name))
 		return 0;
-	loading = 1;
 	functions_path(&path, name);
-	readcmdfile(path.s);
-	loading = 0;
-	ok = fdash_isfunction(name);
+	guarded(&loading, NULL, path.s);
 	free(path.s);
-	return ok;
+	return fdash_isfunction(name);
 }
 
 void fdash_listautoload(void (*fn)(const char *, void *), void *arg)
@@ -927,17 +947,19 @@ static int on_path(const char *prog, struct sb *out)
 
 static int call_handler(int argc, char **argv)
 {
-	struct sb line = {0};
-	int i, status;
+	static int running;	/* a command the handler cannot find gets the plain message */
+	static struct sb line;
+	int i;
 
+	if (running)
+		return 127;
+	sb_clear(&line);
 	sb_str(&line, "fdash_command_not_found");
 	for (i = 0; i < argc; i++) {
 		sb_chr(&line, ' ');
 		sb_quote(&line, argv[i]);
 	}
-	status = evalstring(line.s, 0);
-	free(line.s);
-	return status;
+	return guarded(&running, line.s, NULL);
 }
 
 /*
