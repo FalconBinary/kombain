@@ -52,6 +52,11 @@ struct ic_env_s {
   bool            hinting;          // fdash: completers run for a suggestion
   ic_abbr_fun_t*  abbr_fun;         // fdash: abbreviation hook
   void*           abbr_arg;         // fdash: user state for the abbreviation hook
+  ic_key_fun_t*   key_fun;          // fdash: Alt and function keys go here first
+  void*           key_arg;          // fdash: user state for the key handler
+  char*           initial_input;    // fdash: what the next ic_readline starts with
+  ssize_t         initial_pos;
+  bool            key_ran;          // fdash: the last line is a command a key asked for
 };
 
 ic_private char*        ic_editline(ic_env_t* env, const char* prompt_text);

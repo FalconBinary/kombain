@@ -159,6 +159,21 @@ bool ic_completion_is_hint(void);
 /// fdash: set the character that continues a line on enter (0 disables it).
 void ic_set_multiline_eol( char eol );
 
+/// fdash: what a key handler did with a key.
+typedef enum ic_key_action_e { IC_KEY_IGNORE, IC_KEY_EDITED, IC_KEY_RUN } ic_key_action_t;
+
+/// fdash: called for Alt and function keys before the editor sees them; `name` is "alt-e",
+/// "alt-left", "f1" and so on. To replace the input, set *text and *pos and return IC_KEY_EDITED.
+/// To run a command, set *text to it and return IC_KEY_RUN: ic_readline erases the input from
+/// the screen and returns the command, without adding it to the history.
+typedef ic_key_action_t (ic_key_fun_t)( const char* name, const char* input, long pos, const char** text, long* newpos, void* arg );
+
+/// fdash: set the key handler.
+void ic_set_key_handler( ic_key_fun_t* fun, void* arg );
+
+/// fdash: the input (and cursor position) the next ic_readline starts with.
+void ic_set_initial_input( const char* input, long pos );
+
 /// \}
 
 //--------------------------------------------------------------

@@ -267,6 +267,19 @@ ic_public void ic_set_abbr_expander( ic_abbr_fun_t* fun, void* arg ) {
   env->abbr_arg = arg;
 }
 
+ic_public void ic_set_key_handler( ic_key_fun_t* fun, void* arg ) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return;
+  env->key_fun = fun;
+  env->key_arg = arg;
+}
+
+ic_public void ic_set_initial_input( const char* input, long pos ) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return;
+  mem_free(env->mem, env->initial_input);
+  env->initial_input = (input != NULL ? mem_strdup(env->mem, input) : NULL);
+  env->initial_pos = pos;
+}
+
 ic_public bool ic_completion_is_hint(void) {
   ic_env_t* env = ic_get_env(); if (env==NULL) return false;
   return env->hinting;
