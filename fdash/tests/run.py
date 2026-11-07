@@ -1481,7 +1481,9 @@ def tables_in_pipelines_as_in_nushell(h):
     r = no_tty([os.path.join(HERE, "data.sh")], env={"LANG": "C.UTF-8"})
     # a directory's size depends on the file system
     got = re.sub(r"sub\tdir\t\d+", "sub\tdir\tN", r.stdout)
-    expect(got == DATA_EXPECTED.replace("sub\tdir\t4096", "sub\tdir\tN"), f"got:\n{r.stdout}{r.stderr}")
+    # psx names the shell as the kernel does: the binary's name, at most 15 bytes (fdash-asan in CI)
+    want = DATA_EXPECTED.replace("sub\tdir\t4096", "sub\tdir\tN").replace("name\nfdash\n", f"name\n{os.path.basename(FDASH)[:15]}\n")
+    expect(got == want, f"got:\n{r.stdout}{r.stderr}")
     expect("no column nosuch" in r.stderr, r.stderr)
     # on a terminal the last command draws the table
     sh = Shell(h, env={"LANG": "C.UTF-8"})
