@@ -11,7 +11,7 @@ ZIG_SHA256_X86_64=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b1
 ZIG_SHA256_AARCH64=a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795
 NETLINE_REPO=https://github.com/FalconBinary/netline.git
 # Pinned: a build runs code from what it builds. Move this forward on purpose.
-NETLINE_COMMIT=9c02981ae199e25f648adfe687008e5dff6570a4
+NETLINE_COMMIT=8da5eb7a9c190151a97918ff769e19b9a71d8c6b
 
 user=
 gui=1
