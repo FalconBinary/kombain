@@ -174,6 +174,9 @@ void ic_set_key_handler( ic_key_fun_t* fun, void* arg );
 /// fdash: the input (and cursor position) the next ic_readline starts with.
 void ic_set_initial_input( const char* input, long pos );
 
+/// fdash: markup shown at the right end of the first line of the prompt while the input leaves room (NULL for none).
+void ic_set_right_prompt( const char* markup );
+
 /// \}
 
 //--------------------------------------------------------------

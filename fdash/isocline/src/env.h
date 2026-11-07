@@ -57,6 +57,7 @@ struct ic_env_s {
   char*           initial_input;    // fdash: what the next ic_readline starts with
   ssize_t         initial_pos;
   bool            key_ran;          // fdash: the last line is a command a key asked for
+  char*           rprompt;          // fdash: the right prompt, as markup
 };
 
 ic_private char*        ic_editline(ic_env_t* env, const char* prompt_text);

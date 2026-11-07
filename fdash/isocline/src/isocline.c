@@ -215,6 +215,7 @@ ic_public void ic_history_remove_last(void) {
 ic_public void ic_history_add( const char* entry ) {
   ic_env_t* env = ic_get_env(); if (env==NULL) return;
   history_push( env->history, entry );
+  history_append_last( env->history );  // fdash: in the file too, for the other shells
 }
 
 ic_public void ic_history_clear(void) {
@@ -278,6 +279,12 @@ ic_public void ic_set_initial_input( const char* input, long pos ) {
   mem_free(env->mem, env->initial_input);
   env->initial_input = (input != NULL ? mem_strdup(env->mem, input) : NULL);
   env->initial_pos = pos;
+}
+
+ic_public void ic_set_right_prompt( const char* markup ) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return;
+  mem_free(env->mem, env->rprompt);
+  env->rprompt = (markup != NULL && *markup != 0 ? mem_strdup(env->mem, markup) : NULL);
 }
 
 ic_public bool ic_completion_is_hint(void) {
