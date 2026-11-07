@@ -1,10 +1,13 @@
 # zcool
 
 Keeps every chip under the temperature you set, and gives up as little speed as it
-can: the CPU, every GPU, NVMe. A GPU that shows nothing is let sleep when idle. On MSI
-laptops it also drives the embedded controller: Cooler Boost, the battery charge limit and
-the EC's power profiles. Pure Zig with no libc: a 144 KiB binary that uses under 200 KiB of
-memory. NVIDIA's own driver needs one more, small program, see below.
+can: the CPU, every GPU, NVMe. It learns how much power the cooler carries, and next time
+goes straight there. On battery it can lower the limits, turn turbo off, make the CPU
+prefer efficient clocks and the fans quiet. A GPU that shows nothing is let sleep when
+idle. On MSI laptops it also drives the embedded controller: Cooler Boost, the battery
+charge limit and the EC's power profiles. `zcool menu` shows every setting on one screen.
+Pure Zig with no libc: a 225 KiB binary that uses under 200 KiB of memory. NVIDIA's own
+driver needs one more, small program, see below.
 
 **It has not run on real hardware yet.** Everything below was checked against a
 thermal simulator. Start with `--dry-run`, which writes nothing.
@@ -20,7 +23,10 @@ software keeps it at your limit at full speed. So the order is:
 2. **Fans first.** They rise before the limit and reach full speed at it. Speed is not touched.
    A GPU's own fans go first; the case fans join once those are at full.
 3. **Then a little power,** only when the fans have nothing left, and only as much as needed.
-4. **Give it back** as soon as there is room.
+   Once zcool has learned what the cooler carries, the power goes straight there.
+4. **Give it back** as soon as there is room, and while the fans still have some.
+
+In quiet mode 2 and 3 swap places for the first 15% of power: see below.
 
 Below your limit it costs nothing. At your limit it costs what the cooler lacks. In
 the simulator that beat leaving it to the hardware throttle, which slams power down:
@@ -28,7 +34,7 @@ the simulator that beat leaving it to the hardware throttle, which slams power d
 | 320 W against a weak cooler | Peak | Speed | In PROCHOT |
 |---|---|---|---|
 | Hardware only | 100.3 C | 67% | 21 s of 40 s |
-| zcool, limit 92 C | 90.0 C | 82% | never |
+| zcool, limit 92 C | 91.7 C | 84% | never |
 
 The chip's own protection (PROCHOT, thermal shutdown) stays in hardware. zcool cannot
 turn it off, and it keeps working if zcool is gone.
@@ -38,7 +44,7 @@ turn it off, and it keeps working if zcool is gone.
 ```sh
 zcool list                # chips, limits, fans, GPUs and what keeps them awake
 doas zcool run --dry-run  # says what it would do, writes nothing
-doas vi /etc/zcool.conf   # your limits
+doas zcool menu           # every setting, with what it does; s saves and restarts the service
 doas ln -s /etc/sv/zcool /etc/runit/runsvdir/default/
 ```
 
@@ -52,10 +58,45 @@ nvme0.max = 65
 fan.exclude = nct6798/pwm3
 battery.max = 80      # stop charging at 80%: the battery lives longer
 mode.battery = eco    # an MSI EC's power profile on battery, see below
+turbo.battery = no    # what follows the power source, see below
 ```
 
 Each chip gets its own limit. One you set above the chip's critical point minus 5 C
 is lowered, with a message.
+
+## It learns the cooler
+
+While it holds a chip at its limit with the fans at full or close to it, zcool learns how
+much power the cooler carries there: the power it settles at, moved to the limit itself.
+That goes to `/var/lib/zcool/learned` and `zcool list` shows it. The next time the heat
+builds up and the fans have given all, the power limit goes straight there instead of
+feeling its way down from full power: in the simulator the first limit after learning was
+168 W against 275 W cold, for a cooler that carries 181 W. It keeps learning, so dust, a
+warm room or a new paste move it. A limit moved by the power source scales what it learned
+as the cooler would carry it. `learn = no` turns it off.
+
+## What follows the power source
+
+Each of these takes `.ac` or `.battery` after its name. Left out, the firmware's own stays,
+and zcool puts back what it changed when it stops, like everything else.
+
+| Setting | Values | What it does |
+|---|---|---|
+| `epp` | `performance`, `balance_performance`, `balance_power`, `power`, `default` | The CPU's energy preference (intel_pstate, amd-pstate): how readily it climbs to high clocks. On battery `balance_power` or `power` saves a lot for a little speed. |
+| `turbo` | `yes`, `no` | Clocks above the base clock. Off on battery: a cool, quiet laptop that lasts much longer, and a slower one. |
+| `noise` | `normal`, `quiet` | Quiet: a chip first gives up to 15% of its power before its fans go past the firmware's curve or Cooler Boost comes on. If that is not enough the fans join, and stay until the heat is gone for 30 s, so they do not come and go. |
+| `limits` | `0` to `-30` | Every chip's limit moves by this: `limits.battery = -10` keeps a laptop on battery 10 C cooler. |
+| `mode` | `eco`, `comfort`, `sport`, `turbo` | An MSI EC's own power profile, see below. |
+
+```ini
+epp.ac = balance_performance
+epp.battery = balance_power
+turbo.battery = no
+noise.battery = quiet
+limits.battery = -10
+```
+
+`zcool menu` has three presets for all of these at once: quiet, balanced and fast.
 
 ## What it controls
 
@@ -164,6 +205,11 @@ Off unless you set it. **The BIOS is the better place:** Curve Optimizer on AMD,
 voltage offset on Intel. That survives updates, does not conflict with kernel
 lockdown, and is the only way on AMD and on many recent Intel CPUs.
 
+Many laptops cannot undervolt at all: since the Plundervolt fix (2019-2020) firmware often
+locks the register, the MSI GF63 Thin 10SC among them. There the same thing, less heat for
+the same work, comes from the power source settings above: `epp` and `turbo` on battery,
+and a learned power limit under long loads.
+
 `undervolt.core` and `undervolt.cache` set Intel's MSR 0x150, and:
 
 - It refuses with kernel lockdown on. The install guide turns lockdown on, so choose one.
@@ -197,7 +243,11 @@ library that reads only an attached GPU, and one that reads nothing, read throug
 For an MSI EC: Cooler Boost before any power is taken and off after the heat, the
 firmware's bits left as they were, everything back after SIGTERM and `kill -9`, a boost
 turned on by hand left on, the charge limit (and the kernel's own where there is one), the
-profile following the power source, and an unknown or read-only EC never written. It proves
+profile following the power source, and an unknown or read-only EC never written. The
+energy preference, turbo and limits following the power source and coming back after
+`kill -9`; quiet mode taking power before Cooler Boost, and no boost at all where a little
+power is enough; the cooler learned, kept on disk and used on the next run; and the menu,
+driven through a terminal, saving what it changed and restarting the service. It proves
 the logic. It proves nothing about any real driver or NVIDIA's real library, and a real
 chip's numbers will differ.
 

@@ -8,4 +8,5 @@ test {
     _ = @import("nvidia.zig");
     _ = @import("ec.zig");
     _ = @import("journal.zig");
+    _ = @import("menu.zig");
 }

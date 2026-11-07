@@ -18,6 +18,7 @@ const sandbox = @import("sandbox.zig");
 const gpus = @import("gpus.zig");
 const nvidia = @import("nvidia.zig");
 const ec = @import("ec.zig");
+const menu = @import("menu.zig");
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = false,
@@ -94,9 +95,17 @@ const Chip = struct {
     id_len: u8 = 0,
     kind: Kind,
     limit: f32 = 0,
+    /// the limit before the power source moves it
+    base_limit: f32 = 0,
     crit: f32 = 0,
     thermal: control.Thermal = .{},
     throttle: control.Throttle = .{},
+    quiet: control.Quiet = .{},
+    learned: control.Learned = .{},
+    learned_logged: bool = false,
+    /// what was last written to disk
+    learned_saved: f32 = 0,
+    quiet_logged: bool = false,
     has_primary: bool = false,
     failures: u8 = 0,
     period_ms: i64 = 0,
@@ -178,7 +187,16 @@ const Fan = struct {
     }
 };
 
-const Policy = struct { index: u16, original: i64, min: i64, max: i64 };
+const Policy = struct {
+    index: u16,
+    original: i64,
+    min: i64,
+    max: i64,
+    /// its energy preference, as it was before zcool, when it has one
+    epp: [24]u8 = undefined,
+    epp_len: u8 = 0,
+    epp_saved: bool = false,
+};
 
 const CpuPower = struct {
     rapl_count: u8 = 0,
@@ -410,18 +428,26 @@ fn finishChip(c: *Chip) void {
         .nvme, .other => 80,
     };
     if (cfg.limitFor(c.name())) |wanted| {
-        c.limit = control.clampLimit(wanted, crit, fallback);
-        if (c.limit != wanted) {
-            sys.printf("{s}: limit {d:.0} is outside the safe range, using {d:.0}\n", .{ c.name(), wanted, c.limit });
+        setLimit(c, control.clampLimit(wanted, crit, fallback));
+        if (c.base_limit != wanted) {
+            sys.printf("{s}: limit {d:.0} is outside the safe range, using {d:.0}\n", .{ c.name(), wanted, c.base_limit });
         }
         return;
     }
-    c.limit = switch (c.kind) {
+    setLimit(c, switch (c.kind) {
         .cpu => if (crit > 0) @min(90, crit - 10) else 90,
         .gpu => if (crit > 0) crit - 15 else 85,
         .nvme => if (crit > 0) crit - 10 else 70,
         .other => 0, // watched only: board sensors are often not worth a fan spike
-    };
+    });
+}
+
+/// The power source moves every limit by this, 0 or lower.
+var shift_now: f32 = 0;
+
+fn setLimit(c: *Chip, limit: f32) void {
+    c.base_limit = limit;
+    c.limit = if (limit > 0) @max(30, limit + shift_now) else 0;
 }
 
 fn discoverCpuPower() void {
@@ -455,9 +481,53 @@ fn discoverCpuPower() void {
         const original = sys.readInt(policyPath(&path_buf, digits, "scaling_max_freq")) orelse continue;
         const most = sys.readInt(policyPath(&path_buf, digits, "cpuinfo_max_freq")) orelse original;
         const least = sys.readInt(policyPath(&path_buf, digits, "cpuinfo_min_freq")) orelse 0;
-        cpu_power.policies[cpu_power.npolicies] = .{ .index = index, .original = original, .min = least, .max = most };
+        var policy = Policy{ .index = index, .original = original, .min = least, .max = most };
+        var epp_buf: [32]u8 = undefined;
+        if (sys.readFile(policyPath(&path_buf, digits, "energy_performance_preference"), &epp_buf)) |text| {
+            const name = std.mem.trim(u8, text, " \t\r\n");
+            if (name.len > 0 and name.len <= policy.epp.len) {
+                @memcpy(policy.epp[0..name.len], name);
+                policy.epp_len = @intCast(name.len);
+            }
+        }
+        cpu_power.policies[cpu_power.npolicies] = policy;
         cpu_power.npolicies += 1;
     }
+    discoverTurbo();
+}
+
+/// Turbo is one switch for the whole CPU: intel_pstate's no_turbo, or cpufreq's boost.
+const Turbo = struct {
+    path: [256]u8 = undefined,
+    len: u8 = 0,
+    /// intel_pstate's switch says the opposite: 1 is off
+    inverted: bool = false,
+    original: i64 = -1,
+    saved: bool = false,
+};
+var turbo = Turbo{};
+
+fn discoverTurbo() void {
+    for ([_]struct { file: []const u8, inverted: bool }{
+        .{ .file = "/sys/devices/system/cpu/intel_pstate/no_turbo", .inverted = true },
+        .{ .file = "/sys/devices/system/cpu/cpufreq/boost", .inverted = false },
+    }) |candidate| {
+        var path_buf: [256]u8 = undefined;
+        const path = sys.join(&path_buf, &.{ sys.root, candidate.file });
+        const value = sys.readInt(path) orelse continue;
+        @memcpy(turbo.path[0..path.len], path);
+        turbo.len = @intCast(path.len);
+        turbo.inverted = candidate.inverted;
+        turbo.original = value;
+        return;
+    }
+}
+
+fn turboOn() ?bool {
+    if (turbo.len == 0) return null;
+    var path_buf: [260]u8 = undefined;
+    const value = sys.readInt(sys.join(&path_buf, &.{turbo.path[0..turbo.len]})) orelse return null;
+    return (value == 1) != turbo.inverted;
 }
 
 fn policyPath(buf: []u8, digits: []const u8, file: []const u8) [:0]const u8 {
@@ -568,12 +638,12 @@ fn readNvidia(c: *Chip, index: usize) ?f32 {
         const slowdown = r.slowdown orelse 0;
         c.crit = if (slowdown >= 50 and slowdown <= 130) slowdown else 0;
         if (cfg.limitFor(c.name())) |wanted| {
-            c.limit = control.clampLimit(wanted, c.crit, 100);
-            if (c.limit != wanted) sys.printf("{s}: limit {d:.0} is outside the safe range, using {d:.0}\n", .{ c.name(), wanted, c.limit });
+            setLimit(c, control.clampLimit(wanted, c.crit, 100));
+            if (c.base_limit != wanted) sys.printf("{s}: limit {d:.0} is outside the safe range, using {d:.0}\n", .{ c.name(), wanted, c.base_limit });
         } else {
             // the driver's own target, when it gives one with room below the slowdown point
             const own = r.gpu_max orelse 0;
-            c.limit = if (c.crit > 0 and own >= 50 and own <= c.crit - 5) own else if (c.crit > 0) c.crit - 15 else 85;
+            setLimit(c, if (c.crit > 0 and own >= 50 and own <= c.crit - 5) own else if (c.crit > 0) c.crit - 15 else 85);
         }
         c.nv.limit = r.limit orelse 0;
         c.nv.limit_min = r.limit_min orelse 0;
@@ -606,7 +676,7 @@ fn fromEc(c: *Chip) ?f32 {
     if (!c.ec_temp) {
         c.ec_temp = true;
         c.no_actuator = true;
-        if (c.limit == 0) c.limit = control.clampLimit(cfg.limitFor(c.name()) orelse 85, 0, 95);
+        if (c.limit == 0) setLimit(c, control.clampLimit(cfg.limitFor(c.name()) orelse 85, 0, 95));
         if (!listing) sys.printf("{s}: read through the EC instead, limit {d:.0}C, fans only\n", .{ c.name(), c.limit });
     }
     return t;
@@ -1055,13 +1125,76 @@ fn noMoreCooling(index: usize) bool {
     return true;
 }
 
+/// Quiet mode is on for the power source zcool is on now.
+var quiet_now: bool = false;
+
+/// Power is a lever for this chip, so quiet mode has something to give before the fans.
+fn hasPowerLever(c: *const Chip) bool {
+    return switch (c.kind) {
+        .cpu => cpu_power.rapl_count > 0 or cpu_power.npolicies > 0,
+        .gpu => !c.no_actuator and (c.backend != .nvidia or c.nv.lever != .none),
+        else => false,
+    };
+}
+
+/// What the chip draws, in watts, where a power limit is what holds it: what the cooler
+/// carries is learned from that.
+fn chipWatts(c: *const Chip) ?f32 {
+    switch (c.kind) {
+        .cpu => {
+            if (cpu_power.rapl_count == 0 or cpu_power.escalated) return null;
+            var milliwatts: f32 = 0;
+            for (cpu_power.rapl_watts[0..cpu_power.rapl_count]) |w| milliwatts += w;
+            return milliwatts / 1000;
+        },
+        .gpu => {
+            if (c.backend == .nvidia) return if (c.nv.lever == .limit) @as(f32, @floatFromInt(c.nv.power_mw)) / 1000 else null;
+            if (c.cap_len == 0 or c.power_fd < 0) return null;
+            const microwatts = sys.readIntFd(c.power_fd) orelse return null;
+            return @as(f32, @floatFromInt(microwatts)) / 1_000_000;
+        },
+        else => return null,
+    }
+}
+
+/// The power a limit starts from, in watts, as the actuators work it out when they start.
+fn referenceWatts(c: *const Chip) f32 {
+    switch (c.kind) {
+        .cpu => {
+            var total: f32 = 0;
+            for (0..cpu_power.rapl_count) |i| {
+                const base: f32 = @floatFromInt(cpu_power.rapl_base[i]);
+                const milliwatts = cpu_power.rapl_watts[i];
+                total += (if (milliwatts > 5000) @min(milliwatts * 1000, base) else base) / 1_000_000;
+            }
+            return total;
+        },
+        .gpu => {
+            if (c.backend == .nvidia) {
+                const mw = if (c.nv.power_mw > 5000) @min(c.nv.power_mw, c.nv.limit) else c.nv.limit;
+                return @as(f32, @floatFromInt(mw)) / 1000;
+            }
+            const microwatts = if (c.power_fd >= 0) sys.readIntFd(c.power_fd) orelse 0 else 0;
+            const reference = if (microwatts > 5_000_000) @min(microwatts, c.cap_base) else c.cap_base;
+            return @as(f32, @floatFromInt(reference)) / 1_000_000;
+        },
+        else => return 0,
+    }
+}
+
 fn step(dt: f32) void {
+    // quiet mode: whether each chip lets its fans past the firmware's curve yet
+    var loud: [max_chips]bool = undefined;
+    for (chips[0..nchips], 0..) |*c, index| {
+        const quiet = quiet_now and c.controlled() and hasPowerLever(c);
+        loud[index] = c.quiet.update(quiet, &c.thermal, c.limit, c.throttle.level, c.emergency, dt);
+    }
     for (fans[0..nfans]) |*f| {
         var demand: f32 = 0;
         for (chips[0..nchips], 0..) |*c, index| {
             if (!c.controlled() or !c.thermal.ready or c.asleep or !fanServes(f, index)) continue;
             // a chip going through its critical point gets everything at once
-            const d = if (c.emergency) 1 else control.fanDemand(c.thermal.forecast(), c.limit);
+            const d = if (c.emergency) 1 else if (loud[index]) control.fanDemand(c.thermal.forecast(), c.limit) else 0;
             demand = @max(demand, d);
         }
         updateFan(f, demand, dt);
@@ -1072,8 +1205,12 @@ fn step(dt: f32) void {
     for (chips[0..nchips], 0..) |*c, index| {
         if (!c.controlled() or !c.thermal.ready or c.asleep) continue;
         const crit = if (c.emergency) c.thermal.temp + 1 else c.crit;
-        c.throttle.update(&c.thermal, c.limit, crit, noMoreCooling(index), dt);
-        report(c);
+        const exhausted = noMoreCooling(index);
+        // power starts at what the cooler is known to carry, once the fans have given all
+        c.throttle.start = if (cfg.learn and exhausted and c.throttle.level >= 1) c.learned.startLevel(c.limit, referenceWatts(c)) else 1;
+        c.throttle.update(&c.thermal, c.limit, crit, exhausted or !loud[index], dt);
+        if (cfg.learn and !dry_run) learn(c, nearlyNoMoreCooling(index), dt);
+        report(c, loud[index]);
         switch (c.kind) {
             .cpu => {
                 cpu_level = @min(cpu_level, c.throttle.level);
@@ -1087,13 +1224,44 @@ fn step(dt: f32) void {
     watchEscalation(cpu_over, dt);
 }
 
-fn report(c: *Chip) void {
+/// Every fan that serves the chip is at full or close to it: the controller settles just short
+/// of full, and what the chip draws there is close to all the cooler carries.
+fn nearlyNoMoreCooling(index: usize) bool {
+    for (fans[0..nfans]) |*f| {
+        if (f.unusable or !fanServes(f, index)) continue;
+        if (!f.managed) return false;
+        if (f.ec_boost) {
+            if (f.written != 1) return false;
+        } else if (f.ctl.duty < 230) return false;
+    }
+    return true;
+}
+
+fn learn(c: *Chip, near_full: bool, dt: f32) void {
+    const watts = chipWatts(c) orelse return;
+    c.learned.observe(watts, &c.thermal, c.limit, near_full and c.throttle.level < 1 and !c.no_actuator, dt);
+    if (c.learned.known() and !c.learned_logged) {
+        c.learned_logged = true;
+        sys.printf("{s}: learned that the cooler carries {d:.0} W at {d:.0}C with every fan at full\n", .{ c.name(), c.learned.watts, c.learned.at });
+    }
+}
+
+fn report(c: *Chip, loud: bool) void {
     const throttled = c.throttle.level < 0.995 and !c.no_actuator;
+    if (throttled and !loud and !c.quiet_logged) {
+        c.quiet_logged = true;
+        c.throttle_logged = true;
+        sys.printf("{s}: {d:.1}C, quiet: a little power before louder fans, for the {d:.0}C limit\n", .{ c.name(), c.thermal.temp, c.limit });
+    } else if (throttled and loud and c.quiet_logged) {
+        c.quiet_logged = false;
+        sys.printf("{s}: {d:.1}C, quiet has given what it may, the fans join in\n", .{ c.name(), c.thermal.temp });
+    }
     if (throttled != c.throttle_logged) {
         c.throttle_logged = throttled;
         if (throttled) {
             sys.printf("{s}: {d:.1}C, fans have nothing left, trimming power for the {d:.0}C limit\n", .{ c.name(), c.thermal.temp, c.limit });
         } else {
+            c.quiet_logged = false;
             sys.printf("{s}: {d:.1}C, full power again\n", .{ c.name(), c.thermal.temp });
         }
     }
@@ -1162,39 +1330,134 @@ var on_mains: ?bool = null;
 /// The EC's profile before zcool changed it: back to it on a source with no profile set.
 var profile_original: ?u8 = null;
 
-fn findMains() void {
-    if (cfg.mode_ac == null and cfg.mode_battery == null) return;
-    if (ec.layout == null) {
-        sys.print("mode.ac and mode.battery need an MSI EC that zcool knows: left as they are\n");
-        return;
-    }
+/// A known EC whose profile follows the power source, where the config names one for it.
+var ec_modes: bool = false;
+
+/// The online file of the mains supply, which says whether the laptop is plugged in.
+fn openMains() ?i32 {
     var dir_buf: [256]u8 = undefined;
-    var dir = sys.Dir.open(sys.join(&dir_buf, &.{ sys.root, "/sys/class/power_supply" })) orelse return;
+    var dir = sys.Dir.open(sys.join(&dir_buf, &.{ sys.root, "/sys/class/power_supply" })) orelse return null;
     defer dir.close();
     while (dir.next()) |entry| {
         var path_buf: [256]u8 = undefined;
         var type_buf: [16]u8 = undefined;
         const kind = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/sys/class/power_supply/", entry, "/type" }), &type_buf) orelse continue;
         if (!std.mem.startsWith(u8, kind, "Mains")) continue;
-        mains_fd = sys.openRead(sys.join(&path_buf, &.{ sys.root, "/sys/class/power_supply/", entry, "/online" })) orelse continue;
-        return;
+        return sys.openRead(sys.join(&path_buf, &.{ sys.root, "/sys/class/power_supply/", entry, "/online" })) orelse continue;
     }
+    return null;
 }
 
-/// The EC's own power profile follows the power source, where the config names one for it.
+fn findMains() void {
+    if (!cfg.ac.any() and !cfg.battery.any()) return;
+    if (cfg.ac.mode != null or cfg.battery.mode != null) {
+        if (ec.layout == null) {
+            sys.print("mode.ac and mode.battery need an MSI EC that zcool knows: left as they are\n");
+        } else {
+            ec_modes = true;
+        }
+    }
+    mains_fd = openMains() orelse {
+        // no mains supply to follow: a desktop, always on mains
+        on_mains = true;
+        applySource(true);
+        return;
+    };
+}
+
+/// What the config sets follows the power source: checked every two seconds.
 fn followPowerSource(now: i64) void {
     if (mains_fd < 0 or now < mains_due_ms) return;
     mains_due_ms = now + 2000;
     const mains = (sys.readIntFd(mains_fd) orelse return) == 1;
     if (on_mains != null and on_mains.? == mains) return;
     on_mains = mains;
+    applySource(mains);
+}
+
+fn applySource(mains: bool) void {
+    const src = cfg.source(mains);
+    const source: []const u8 = if (mains) "on mains" else "on battery";
+    shift_now = @floatFromInt(src.shift);
+    for (chips[0..nchips]) |*c| {
+        if (c.base_limit > 0) c.limit = @max(30, c.base_limit + shift_now);
+    }
+    quiet_now = src.quiet;
+    var buf: [200]u8 = undefined;
+    var n: usize = 0;
+    if (src.shift != 0) n = appendf(&buf, n, ", limits {d}C lower", .{-src.shift});
+    if (src.epp != null and hasEpp()) n = appendf(&buf, n, ", energy preference {s}", .{@tagName(src.epp.?)});
+    if (src.turbo != null and turbo.len > 0) n = appendf(&buf, n, ", turbo {s}", .{if (src.turbo.?) "on" else "off"});
+    if (src.quiet) n = appendf(&buf, n, ", quiet fans", .{});
+    const what = if (n > 2) buf[2..n] else "the firmware's own settings";
+    // a config with only the EC's profiles says so in the EC's own line
+    if (generalSettings(&cfg.ac) or generalSettings(&cfg.battery)) {
+        sys.printf("power: {s}{s} {s}\n", .{ source, if (dry_run) ", would set:" else ":", what });
+    }
+    applyEpp(src.epp);
+    applyTurbo(src.turbo);
+    if (ec_modes) applyEcMode(src.mode, source);
+}
+
+fn generalSettings(src: *const config.Source) bool {
+    return src.shift != 0 or src.epp != null or src.turbo != null or src.quiet;
+}
+
+/// Adds to a line being built; what does not fit is left out.
+fn appendf(buf: []u8, n: usize, comptime fmt: []const u8, args: anytype) usize {
+    const written = std.fmt.bufPrint(buf[n..], fmt, args) catch return n;
+    return n + written.len;
+}
+
+fn hasEpp() bool {
+    for (cpu_power.policies[0..cpu_power.npolicies]) |*p| if (p.epp_len > 0) return true;
+    return false;
+}
+
+var epp_refused = false;
+
+/// The CPU's energy preference: how readily it climbs to high clocks. With none set for this
+/// source, what it was before zcool.
+fn applyEpp(wanted: ?config.Epp) void {
+    if (dry_run) return;
+    var path_buf: [256]u8 = undefined;
+    for (cpu_power.policies[0..cpu_power.npolicies]) |*p| {
+        if (p.epp_len == 0) continue;
+        if (wanted == null and !p.epp_saved) continue;
+        const target: []const u8 = if (wanted) |e| @tagName(e) else p.epp[0..p.epp_len];
+        var num: [8]u8 = undefined;
+        const digits = std.fmt.bufPrint(&num, "{d}", .{p.index}) catch continue;
+        const path = policyPath(&path_buf, digits, "energy_performance_preference");
+        if (!p.epp_saved) {
+            if (!journal.rememberValue(path, p.epp[0..p.epp_len])) continue;
+            p.epp_saved = true;
+        }
+        if (!sys.writeFile(path, target) and !epp_refused) {
+            epp_refused = true;
+            sys.print("cpu: the energy preference was refused; under the performance governor only `performance` is taken\n");
+        }
+    }
+}
+
+fn applyTurbo(wanted: ?bool) void {
+    if (turbo.len == 0 or dry_run) return;
+    const on = wanted orelse (if (turbo.saved) (turbo.original == 1) != turbo.inverted else return);
+    var path_buf: [260]u8 = undefined;
+    const path = sys.join(&path_buf, &.{turbo.path[0..turbo.len]});
+    if (!turbo.saved) {
+        if (!journal.rememberInt(path, turbo.original)) return;
+        turbo.saved = true;
+    }
+    if (!sys.writeInt(path, if (on != turbo.inverted) 1 else 0)) sys.print("cpu: the turbo switch was refused\n");
+}
+
+/// The EC's own power profile, or the one it had before zcool on a source with none set.
+fn applyEcMode(mode: ?ec.Profile, source: []const u8) void {
     const l = ec.layout.?;
-    const mode = if (mains) cfg.mode_ac else cfg.mode_battery;
     const byte = (if (mode) |m| l.profiles[@backingInt(m)] else profile_original) orelse return;
     const current = ec.read(l.profile) orelse return;
     if (current == byte) return;
     const name = ec.profileName(l, byte);
-    const source = if (mains) "on mains" else "on battery";
     if (dry_run) {
         sys.printf("ec: would set the profile to {s} {s}\n", .{ name, source });
         return;
@@ -1206,6 +1469,71 @@ fn followPowerSource(now: i64) void {
         profile_original = current;
     }
     if (ec.write(l.profile, byte)) sys.printf("ec: profile {s} {s}\n", .{ name, source });
+}
+
+// ---------------------------------------------------------------- what was learned
+
+fn learnedPath(buf: []u8) [:0]const u8 {
+    return sys.join(buf, &.{ sys.root, "/var/lib/zcool/learned" });
+}
+
+/// `cpu0 31.5 90 600` per line: watts, the limit they were learned at, seconds of learning.
+fn loadLearned() void {
+    var path_buf: [256]u8 = undefined;
+    var text_buf: [2048]u8 = undefined;
+    const text = sys.readFile(learnedPath(&path_buf), &text_buf) orelse return;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const id = fields.next() orelse continue;
+        const watts = tenths(fields.next() orelse continue) orelse continue;
+        const at = tenths(fields.next() orelse continue) orelse continue;
+        const seconds = tenths(fields.next() orelse continue) orelse continue;
+        if (!(watts >= 1 and watts <= 2000 and at >= 35 and at <= 130 and seconds >= 10)) continue;
+        for (chips[0..nchips]) |*c| {
+            if (!std.mem.eql(u8, c.name(), id)) continue;
+            c.learned = .{ .watts = watts, .at = at, .seconds = @min(seconds, 600) };
+            c.learned_logged = true;
+            c.learned_saved = watts;
+        }
+    }
+}
+
+/// "31.5" or "90": a number with at most one decimal, as saveLearned writes it. Far smaller
+/// than the standard float parser, which would double the binary.
+fn tenths(text: []const u8) ?f32 {
+    const dot = std.mem.indexOfScalar(u8, text, '.');
+    const whole = std.fmt.parseInt(u32, text[0 .. dot orelse text.len], 10) catch return null;
+    var tenth: u32 = 0;
+    if (dot) |d| {
+        if (d + 2 != text.len or text[d + 1] < '0' or text[d + 1] > '9') return null;
+        tenth = text[d + 1] - '0';
+    }
+    return @as(f32, @floatFromInt(whole)) + @as(f32, @floatFromInt(tenth)) / 10;
+}
+
+var learned_due_ms: i64 = 0;
+
+/// Once a minute at most, and only when something moved.
+fn saveLearned(now: i64, force: bool) void {
+    if (dry_run or !cfg.learn) return;
+    if (!force and now < learned_due_ms) return;
+    learned_due_ms = now + 60_000;
+    var changed = false;
+    for (chips[0..nchips]) |*c| {
+        if (c.learned.known() and @abs(c.learned.watts - c.learned_saved) >= 0.5) changed = true;
+    }
+    if (!changed) return;
+    var buf: [2048]u8 = undefined;
+    var n: usize = 0;
+    for (chips[0..nchips]) |*c| {
+        if (!c.learned.known()) continue;
+        const line = std.fmt.bufPrint(buf[n..], "{s} {d:.1} {d:.0} {d:.0}\n", .{ c.name(), c.learned.watts, c.learned.at, @min(c.learned.seconds, 600) }) catch break;
+        n += line.len;
+        c.learned_saved = c.learned.watts;
+    }
+    var path_buf: [256]u8 = undefined;
+    _ = sys.replaceFile(learnedPath(&path_buf), buf[0..n]);
 }
 
 fn tickMs() i64 {
@@ -1265,6 +1593,7 @@ fn runDaemon(selftest: bool) u8 {
     gpus.scan();
     if (cfg.gpu_sleep) gpus.allowSleep(dry_run);
     discover();
+    if (cfg.learn) loadLearned();
     if (ec.layout != null) {
         sys.printf("ec: {s}, {s}\n", .{ ec.version(), if (ec.writable) "Cooler Boost joins the fans" else "read only: load ec_sys with write_support=1" });
     } else if (cfg.use_ec and !ec.present and isMsi()) {
@@ -1294,6 +1623,10 @@ fn runDaemon(selftest: bool) u8 {
         }
     }
 
+    if (!dry_run and cfg.learn) {
+        var lib_buf: [256]u8 = undefined;
+        sys.mkdir(sys.join(&lib_buf, &.{ sys.root, "/var/lib/zcool" }));
+    }
     const sandboxed = applySandbox();
     sys.printf("sandbox: {s}\n", .{@tagName(sandboxed)});
     if (selftest) {
@@ -1314,6 +1647,7 @@ fn runDaemon(selftest: bool) u8 {
         const dt = @as(f32, @floatFromInt(now - last)) / 1000;
         last = now;
         if (!readChips(now)) {
+            saveLearned(now, true);
             nvidia.stop();
             emergencyRestore();
             return 1;
@@ -1321,6 +1655,7 @@ fn runDaemon(selftest: bool) u8 {
         sampleCpuPower(now);
         step(dt);
         followPowerSource(now);
+        saveLearned(now, false);
         if (undervolted and now - started > 600_000) {
             undervolt.markStable();
             undervolted = false;
@@ -1328,6 +1663,7 @@ fn runDaemon(selftest: bool) u8 {
         sys.sleepMs(tickMs());
     }
     if (undervolted) undervolt.markStable();
+    saveLearned(sys.nowMs(), true);
     nvidia.stop();
     emergencyRestore();
     return 0;
@@ -1385,7 +1721,34 @@ fn listChips() void {
     listEc();
     var path_buf: [256]u8 = undefined;
     if (batteryThreshold(&path_buf)) |path| sys.printf("\nbattery: charges up to {d}%\n", .{sys.readInt(path) orelse 100});
+    listPower();
     nvidia.stop();
+}
+
+/// The power source and what follows it, and what zcool has learned about the cooler.
+fn listPower() void {
+    var line: [200]u8 = undefined;
+    var n: usize = 0;
+    if (openMains()) |fd| {
+        defer sys.close(fd);
+        const mains = (sys.readIntFd(fd) orelse 1) == 1;
+        n = appendf(&line, n, "on {s}", .{if (mains) "mains" else "battery"});
+    }
+    for (cpu_power.policies[0..cpu_power.npolicies]) |*p| {
+        if (p.epp_len == 0) continue;
+        n = appendf(&line, n, "{s}energy preference {s}", .{ if (n > 0) ", " else "", p.epp[0..p.epp_len] });
+        break;
+    }
+    if (turboOn()) |on| n = appendf(&line, n, "{s}turbo {s}", .{ if (n > 0) ", " else "", if (on) "on" else "off" });
+    if (n > 0) sys.printf("\npower: {s}\n", .{line[0..n]});
+    loadLearned();
+    var first = true;
+    for (chips[0..nchips]) |*c| {
+        if (!c.learned.known()) continue;
+        if (first) sys.print("\nlearned: what the cooler carries with every fan at full\n");
+        first = false;
+        sys.printf("  {s:<12} {d:>5.0} W at {d:.0}C\n", .{ c.name(), c.learned.watts, c.learned.at });
+    }
 }
 
 /// An MSI laptop's EC: what it reads, and why zcool does or does not use it.
@@ -1459,10 +1822,82 @@ fn hasChipFor(g: *const gpus.Gpu) bool {
     return false;
 }
 
+// ---------------------------------------------------------------- the menu
+
+/// What the menu shows: every chip with its default limit, and every fan, also the ones the
+/// config leaves alone, so they can be taken back.
+fn runMenu(path: [:0]const u8) u8 {
+    listing = true;
+    const limits = cfg.nlimits;
+    const excludes = cfg.nexcludes;
+    cfg.nlimits = 0;
+    cfg.nexcludes = 0;
+    gpus.scan();
+    discover();
+    if (hasNvidia()) _ = nvidia.start();
+    _ = readChips(sys.nowMs());
+    cfg.nlimits = limits;
+    cfg.nexcludes = excludes;
+    loadLearned();
+    const rc = menu.run(path, menuInfo);
+    nvidia.stop();
+    return rc;
+}
+
+fn menuInfo(info: *menu.Info) void {
+    _ = readChips(sys.nowMs());
+    info.nchips = 0;
+    for (chips[0..nchips]) |*c| {
+        if (info.nchips == menu.max_chips) break;
+        var m = menu.ChipInfo{
+            .temp = if (c.thermal.ready) c.thermal.temp else 0,
+            .default_limit = c.base_limit,
+            .max_limit = if (c.crit > 0) c.crit - 5 else switch (c.kind) {
+                .cpu => 95,
+                .gpu => 100,
+                else => 80,
+            },
+            .asleep = c.asleep,
+            .learned_watts = if (c.learned.known()) c.learned.watts else 0,
+            .learned_at = c.learned.at,
+        };
+        const n = @min(c.id_len, m.name.len);
+        @memcpy(m.name[0..n], c.id[0..n]);
+        m.name_len = @intCast(n);
+        // a NVIDIA GPU its library has not read yet has no default to show
+        if (c.kind == .other or (c.backend == .nvidia and c.base_limit == 0)) m.default_limit = 0;
+        info.chips[info.nchips] = m;
+        info.nchips += 1;
+    }
+    info.nfans = 0;
+    for (fans[0..nfans]) |*f| {
+        if (info.nfans == menu.max_fans) break;
+        @memcpy(info.fans[info.nfans][0..f.id_len], f.id[0..f.id_len]);
+        info.fan_lens[info.nfans] = f.id_len;
+        info.nfans += 1;
+    }
+    info.on_mains = null;
+    if (openMains()) |fd| {
+        defer sys.close(fd);
+        if (sys.readIntFd(fd)) |v| info.on_mains = v == 1;
+    }
+    info.ec = ec.layout != null;
+    if (ec.readings()) |r| {
+        info.ec_cpu = r.cpu_temp;
+        info.ec_gpu = r.gpu_temp;
+        info.ec_cpu_fan = r.cpu_fan;
+        info.ec_gpu_fan = r.gpu_fan;
+    }
+    info.has_epp = hasEpp();
+    info.has_turbo = turbo.len > 0;
+    info.undervolt_note = if (undervolt.lockdownActive()) "kernel lockdown is on: refused" else "";
+}
+
 const usage =
     \\zcool: keeps chips under the temperature you set, losing as little speed as it can
     \\
     \\  zcool list                what is here: chips, limits, fans
+    \\  zcool menu                every setting on one screen; saving restarts the service
     \\  zcool run [--dry-run]     the daemon; --dry-run only says what it would do
     \\  zcool restore             puts back everything an earlier run changed
     \\  zcool undervolt           shows the current offsets
@@ -1511,6 +1946,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         loadConfig(config_path);
         listChips();
         return 0;
+    }
+    if (std.mem.eql(u8, command, "menu")) {
+        loadConfig(config_path);
+        var path_buf: [256]u8 = undefined;
+        return runMenu(config_path orelse sys.join(&path_buf, &.{ sys.root, "/etc/zcool.conf" }));
     }
     if (std.mem.eql(u8, command, "run")) {
         loadConfig(config_path);

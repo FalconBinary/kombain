@@ -99,10 +99,11 @@ class Ec:
 
 class Machine:
     def __init__(self, cpu=None, gpu=None, rapl=True, rapl_enforced=True, rapl_writable=True, freq=True, cpu_fan=True, pump=False, config="",
-                 cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu", ec=None):
+                 cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu", ec=None,
+                 epp=None, turbo=None, mains=None):
         self.root = tempfile.mkdtemp(prefix="zcool-")
         self.cpu, self.gpu, self.nv, self.gpu_driver, self.ec = cpu, gpu, nvidia, gpu_driver, ec
-        self.first_case = self.first_own_full = self.first_boost = self.first_trim = None
+        self.first_case = self.first_own_full = self.first_boost = self.first_trim = self.first_cap = None
         self.env = dict(os.environ, LD_LIBRARY_PATH=FAKE_LIB, FAKE_NVML=f"{self.root}/dev/nvml", FAKE_NVML_SYS=self.root)
         self.rapl, self.rapl_enforced, self.cpu_fan, self.pump = rapl, rapl_enforced, cpu_fan, pump
         self.energy = 0.0
@@ -164,6 +165,13 @@ class Machine:
             put(f"{base}/scaling_max_freq", 5000000)
             put(f"{base}/cpuinfo_max_freq", 5000000)
             put(f"{base}/cpuinfo_min_freq", 800000)
+            if epp is not None:
+                put(f"{base}/energy_performance_preference", epp)
+        if turbo is not None:
+            put(f"{r}/sys/devices/system/cpu/intel_pstate/no_turbo", 0 if turbo else 1)
+        if mains is not None and not ec:
+            put(f"{r}/sys/class/power_supply/ADP1/type", "Mains")
+            put(f"{r}/sys/class/power_supply/ADP1/online", int(mains))
         if ec:
             self.ec_path = f"{r}/sys/kernel/debug/ec/ec0/io"
             data = bytearray(256)
@@ -350,6 +358,7 @@ class Machine:
                         pass
                     if cap < 300 and self.first_trim is None:
                         self.first_trim = now
+                        self.first_cap = cap
                 if self.freq:
                     try:
                         speed = min(int(self.read(f"{self.root}/sys/devices/system/cpu/cpufreq/policy{i}/scaling_max_freq")) for i in range(self.cores)) / 5000000
@@ -1308,6 +1317,199 @@ def nvidia_that_reads_only_attached_is_attached(r):
     m.advance(20, limit_cpu=85, limit_gpu=80)
     r.check("NVIDIA at 0000:01:00.0" in m.text(), m.text()[-400:])
     m.stop()
+    m.close()
+
+
+def epp_of(m):
+    return {get(f"{m.root}/sys/devices/system/cpu/cpufreq/policy{i}/energy_performance_preference") for i in range(m.cores)}
+
+
+@scenario
+def the_power_source_sets_the_cpus_preference_turbo_and_limits(r):
+    config = "cpu0.max = 85\nepp.ac = balance_performance\nepp.battery = power\nturbo.battery = no\nlimits.battery = -10\n"
+    online = None
+    no_turbo = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        m = Machine(cpu=Chip(load=10), epp="balance_power", turbo=True, mains=True, config=config)
+        online = f"{m.root}/sys/class/power_supply/ADP1/online"
+        no_turbo = f"{m.root}/sys/devices/system/cpu/intel_pstate/no_turbo"
+        m.start()
+        m.advance(3)
+        r.check(epp_of(m) == {"balance_performance"}, f"on mains: {epp_of(m)}")
+        r.check(get(no_turbo) == "0", "turbo should stay on, on mains")
+        put(online, 0)
+        m.advance(4)
+        r.check(epp_of(m) == {"power"}, f"on battery: {epp_of(m)}")
+        r.check(get(no_turbo) == "1", "turbo should be off on battery")
+        r.check("power: on battery: limits 10C lower, energy preference power, turbo off" in m.text(), m.text()[-400:])
+        if sig == signal.SIGTERM:
+            put(online, 1)
+            m.advance(4)
+            r.check(epp_of(m) == {"balance_performance"}, f"back on mains: {epp_of(m)}")
+            r.check(get(no_turbo) == "0", "turbo.ac is not set: the original comes back on mains")
+        m.stop(sig)
+        if sig == signal.SIGKILL:
+            m.cmd("restore")
+        r.check(epp_of(m) == {"balance_power"}, f"originals after {sig.name}: {epp_of(m)}")
+        r.check(get(no_turbo) == "0", f"turbo after {sig.name}: {get(no_turbo)}")
+        m.close()
+
+
+@scenario
+def on_battery_every_limit_is_lower(r):
+    m = Machine(cpu=Chip(load=280, g_max=3.4), mains=False, config="cpu0.max = 85\nlimits.battery = -10\n")
+    m.start()
+    m.advance(30, limit_cpu=75)
+    temps = []
+    for _ in range(16):
+        m.advance(0.5, limit_cpu=75)
+        temps.append(m.cpu.temp)
+    r.check(m.cpu.peak <= 79, f"peak {m.cpu.peak:.1f} on battery, limit 75")
+    r.check(max(temps) <= 76.5, f"settled at {min(temps):.1f}..{max(temps):.1f}, limit 75")
+    battery = m.cpu.perf
+    put(f"{m.root}/sys/class/power_supply/ADP1/online", 1)
+    m.advance(25, limit_cpu=85)
+    r.check(m.cpu.temp > 80, f"on mains it may go to 85 again: {m.cpu.temp:.1f}")
+    r.note(f"on battery: settled {min(temps):.1f}..{max(temps):.1f} C at speed {battery * 100:.0f}%; on mains {m.cpu.temp:.1f} C")
+    m.stop()
+    m.close()
+
+
+@scenario
+def quiet_gives_a_little_power_before_cooler_boost(r):
+    # the firmware's curve carries about 100 W at 85 C, Cooler Boost 165 W
+    m = Machine(cpu=Chip(load=110, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config="cpu0.max = 85\nnoise.ac = quiet\n")
+    m.start()
+    m.advance(40, limit_cpu=85)
+    log = m.text()
+    r.check(m.first_boost is None, "a little power was enough here, Cooler Boost should stay off")
+    r.check("quiet: a little power before louder fans" in log, log[-400:])
+    r.check(m.cpu.peak <= 87, f"peak {m.cpu.peak:.1f}")
+    r.check(m.cpu.perf > 0.9, f"speed {m.cpu.perf:.3f}")
+    r.note(f"110 W: no boost, peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
+    m.stop()
+    m.close()
+    # more than a little power can cover: then Cooler Boost comes, after the power
+    m = Machine(cpu=Chip(load=160, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config="cpu0.max = 85\nnoise.ac = quiet\n")
+    m.start()
+    m.advance(50, limit_cpu=85)
+    log = m.text()
+    r.check(m.first_trim is not None and m.first_boost is not None and m.first_trim < m.first_boost,
+            f"power trimmed at {m.first_trim}, boost at {m.first_boost}")
+    r.check("the fans join in" in log, log[-400:])
+    r.check(m.cpu.peak <= 87, f"peak {m.cpu.peak:.1f}")
+    # with the boost on it gets its power back, and the boost stays while the load does
+    r.check(m.boost(), "the boost should stay on while the load lasts")
+    r.check(float(m.read(m.rapl_path)) >= 290e6 or "full power again" in log, f"cap {m.read(m.rapl_path)}")
+    r.note(f"160 W: power first, then the boost; peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
+    m.stop()
+    m.close()
+
+
+@scenario
+def the_cooler_is_learned_and_power_starts_there_next_time(r):
+    m = Machine(cpu=Chip(load=280, g_max=3.4), config=CONFIG)
+    m.start()
+    deadline = time.time() + 70
+    while "learned that the cooler carries" not in m.text() and time.time() < deadline:
+        m.advance(1, limit_cpu=85)
+    r.check("learned that the cooler carries" in m.text(), m.text()[-400:])
+    first = m.first_cap
+    m.stop()
+    path = f"{m.root}/var/lib/zcool/learned"
+    learned = get(path) if os.path.exists(path) else ""
+    r.check(learned.startswith("cpu0 "), f"learned file: {learned!r}")
+    if not learned.startswith("cpu0 "):
+        m.close()
+        return
+    watts = float(learned.split()[1])
+    # 55 K over ambient at 3.4 W/K, with the fan at full
+    r.check(165 < watts < 205, f"learned {watts} W")
+    listed = m.cmd("list").stdout
+    r.check("learned:" in listed and "cpu0" in listed.split("learned:")[1], listed[-300:])
+    # cool again, then the same load: the first power limit is near what the cooler carries
+    m.cpu.temp, m.cpu.peak = 45.0, 45.0
+    m.first_trim = m.first_cap = None
+    m.start()
+    m.advance(25, limit_cpu=85)
+    r.check(m.first_cap is not None and m.first_cap < watts * 1.05 and m.first_cap > watts * 0.8,
+            f"first limit {m.first_cap} W, learned {watts} W (cold start began at {first} W)")
+    r.note(f"learned {watts:.0f} W; first limit {first:.0f} W cold, {m.first_cap or 0:.0f} W after learning")
+    m.stop()
+    m.close()
+
+
+@scenario
+def the_menu_changes_settings_and_saves_them(r):
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
+    m = Machine(cpu=Chip(load=10), ec=Ec(), config="# The most each chip may reach.\n# cpu0.max = 85\nfan.exclude = nct6798/pwm1\n")
+    # a running service, as runit shows one: its supervisor reads what goes into control
+    sv = f"{m.root}/etc/sv/zcool/supervise"
+    os.makedirs(sv)
+    put(f"{sv}/stat", "run")
+    os.mkfifo(f"{sv}/control")
+    control = os.open(f"{sv}/control", os.O_RDONLY | os.O_NONBLOCK)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execve(ZCOOL, [ZCOOL, "menu", "--root", m.root], m.env)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
+
+    def screen(wait=0.8):
+        out, end = b"", time.time() + wait
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if ready:
+                try:
+                    out += os.read(fd, 65536)
+                except OSError:
+                    break
+        return out.decode(errors="replace")
+
+    def keys(data, wait=0.5):
+        os.write(fd, data)
+        return screen(wait)
+
+    out = screen(1.5)
+    r.check("Limits" in out and "cpu0" in out and "90 C, the default" in out, out[-600:])
+    r.check("nct6798/pwm1" in out and "no, left alone" in out, "the excluded fan should be listed")
+    keys(b"\x1b[C")
+    out = keys(b"s", 1.0)
+    conf = get(f"{m.root}/etc/zcool.conf")
+    r.check("cpu0.max = 91" in conf.splitlines(), conf)
+    r.check(conf.startswith("# The most each chip may reach.\ncpu0.max = 91\n"), f"the commented line should be taken back: {conf!r}")
+    try:
+        said = os.read(control, 16)
+    except BlockingIOError:
+        said = b""
+    r.check(said == b"t", f"the service should be told to restart: {said!r}")
+    r.check("zcool restarted" in out, out[-300:])
+    # the balanced preset, and the excluded fan taken back
+    keys(b"2")
+    keys(b"\x1b[B" * 12)
+    keys(b"\x1b[C")
+    keys(b"s", 1.0)
+    conf = get(f"{m.root}/etc/zcool.conf")
+    c = conf.splitlines()
+    r.check("epp.battery = balance_power" in c and "turbo.battery = no" in c and "noise.battery = quiet" in c, conf)
+    r.check("mode.ac = comfort" in c and "mode.battery = eco" in c, conf)
+    r.check("fan.exclude = nct6798/pwm1" not in c and "# fan.exclude = nct6798/pwm1" in c, conf)
+    listed = m.cmd("list").stdout
+    r.check("skipped" not in listed, "the daemon should read every line the menu wrote")
+    # a change, then q: it asks first; q again leaves without saving
+    keys(b"\x1b[C")
+    out = keys(b"q")
+    r.check("not saved" in out, out[-300:])
+    out = keys(b"q", 1.0)
+    _, code = os.waitpid(pid, 0)
+    r.check(os.WIFEXITED(code) and os.WEXITSTATUS(code) == 0, f"exit {code}")
+    r.check("\x1b[?1049l" in out, "the terminal should be given back")
+    r.check(get(f"{m.root}/etc/zcool.conf") == conf, "q twice should leave the file as saved")
+    os.close(fd)
+    os.close(control)
     m.close()
 
 

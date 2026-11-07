@@ -17,11 +17,26 @@
 # Stop charging the battery at this percent: it lives longer. Stays set when zcool stops.
 # battery.max = 80
 
+# What follows the power source: `.ac` on mains, `.battery` on battery. Left out, the
+# firmware's own stays. `zcool menu` sets them all at once with its presets.
+# The CPU's energy preference: performance, balance_performance, balance_power, power.
+# epp.ac = balance_performance
+# epp.battery = balance_power
+# Clocks above the base clock: off on battery for a cool laptop that lasts longer.
+# turbo.battery = no
+# quiet: up to 15% of power goes before the fans go past the firmware's curve.
+# noise.battery = quiet
+# Every limit lower by this many degrees.
+# limits.battery = -10
+
 # MSI laptops: the EC's own power profile (eco, comfort, sport, turbo) per power source,
 # and `ec = no` to keep zcool away from the EC altogether. See the README.
 # mode.ac = comfort
 # mode.battery = eco
 # ec = no
+
+# zcool learns how much power the cooler carries at the limit and starts there next time.
+# learn = no
 
 # Undervolting, Intel only, and only with kernel lockdown off: read the README first.
 # In the BIOS is the better place for it, on Intel and on AMD.
