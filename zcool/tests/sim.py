@@ -551,6 +551,26 @@ def sudden_load_is_caught_in_time(r):
 
 
 @scenario
+def a_short_burst_takes_no_power(r):
+    # a laptop CPU's die: little mass, so 45 to 70 C within a second or two when work starts,
+    # and back as soon as it ends. Seen on a GF63 with no fan to turn: power was trimmed at 65 C.
+    m = Machine(cpu=Chip(load=0, g_min=0.8, mass=2, temp=45), cpu_fan=False, config=CONFIG)
+    m.start()
+    m.advance(3, limit_cpu=85)
+    for _ in range(3):
+        m.cpu.load = 55
+        m.advance(1.6, limit_cpu=85)
+        m.cpu.load = 0
+        m.advance(3, limit_cpu=85)
+    log = m.text()
+    r.check("trimming power" not in log, log[-400:])
+    r.check(m.read(m.rapl_path) == "300000000", f"power limit touched: {m.read(m.rapl_path)}")
+    r.note(f"bursts to {m.cpu.peak:.1f} C with limit 85: no power taken")
+    m.stop()
+    m.close()
+
+
+@scenario
 def everything_returns_when_the_load_ends(r):
     m = Machine(cpu=Chip(load=280, g_max=3.4), config=CONFIG)
     m.start()
@@ -1203,7 +1223,7 @@ def the_ec_profile_follows_the_power_source(r):
     put(f"{m.root}/sys/class/power_supply/ADP1/online", 0)
     m.advance(4)
     r.check(m.ec_byte(Ec.PROFILE) == 0xc2, f"on battery: {m.ec_byte(Ec.PROFILE):#x}")
-    r.check("eco profile on battery" in m.text(), m.text()[-300:])
+    r.check("ec: profile eco on battery" in m.text(), m.text()[-300:])
     m.stop()
     r.check(m.ec_byte(Ec.PROFILE) == 0xc1, f"the original profile should come back: {m.ec_byte(Ec.PROFILE):#x}")
     m.close()
@@ -1238,13 +1258,24 @@ def an_ec_zcool_does_not_know_or_cannot_write_is_left_alone(r):
 
 @scenario
 def list_shows_the_ec(r):
-    m = Machine(cpu=Chip(load=10, temp=55), cpu_fan=False, ec=Ec(charge=0x80 | 80))
+    # 0x80: no program has set a profile, as on a GF63 that never ran MSI's own tools
+    m = Machine(cpu=Chip(load=10, temp=55), cpu_fan=False, ec=Ec(charge=0x80 | 80, profile=0x80))
     m.ec_set(0x71, 45)
     out = m.cmd("list").stdout
     r.check("ec: 16R5EMS1.102, GF63/GF65 Thin" in out, out)
-    r.check("cooler boost off, profile comfort, charge limit 80%" in out, out)
+    r.check("cooler boost off, profile the firmware's own, charge limit 80%" in out, out)
     r.check("ec/cooler_boost" in out and "auto" in out, out)
     r.check("cpu 55C, fan 45%" in out, out)
+    m.close()
+
+
+@scenario
+def list_says_what_keeps_zcool_from_the_ec(r):
+    m = Machine(cpu=Chip(load=10))
+    put(f"{m.root}/sys/class/dmi/id/sys_vendor", "Micro-Star International Co., Ltd.")
+    out = m.cmd("list").stdout
+    # the simulator never runs as root, and only root can see debugfs
+    r.check("only root reaches it: doas zcool list" in out, out)
     m.close()
 
 

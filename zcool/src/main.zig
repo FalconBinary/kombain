@@ -1193,10 +1193,10 @@ fn followPowerSource(now: i64) void {
     const byte = (if (mode) |m| l.profiles[@backingInt(m)] else profile_original) orelse return;
     const current = ec.read(l.profile) orelse return;
     if (current == byte) return;
-    const name = if (ec.profileOf(l, byte)) |m| @tagName(m) else "its own";
+    const name = ec.profileName(l, byte);
     const source = if (mains) "on mains" else "on battery";
     if (dry_run) {
-        sys.printf("ec: would switch to the {s} profile {s}\n", .{ name, source });
+        sys.printf("ec: would set the profile to {s} {s}\n", .{ name, source });
         return;
     }
     if (!ec.writable) return;
@@ -1205,7 +1205,7 @@ fn followPowerSource(now: i64) void {
         if (!journal.rememberByte(ec.path(&path_buf), l.profile, null, current)) return;
         profile_original = current;
     }
-    if (ec.write(l.profile, byte)) sys.printf("ec: {s} profile {s}\n", .{ name, source });
+    if (ec.write(l.profile, byte)) sys.printf("ec: profile {s} {s}\n", .{ name, source });
 }
 
 fn tickMs() i64 {
@@ -1265,7 +1265,11 @@ fn runDaemon(selftest: bool) u8 {
     gpus.scan();
     if (cfg.gpu_sleep) gpus.allowSleep(dry_run);
     discover();
-    if (ec.layout != null) sys.printf("ec: {s}, {s}\n", .{ ec.version(), if (ec.writable) "Cooler Boost joins the fans" else "read only: load ec_sys with write_support=1" });
+    if (ec.layout != null) {
+        sys.printf("ec: {s}, {s}\n", .{ ec.version(), if (ec.writable) "Cooler Boost joins the fans" else "read only: load ec_sys with write_support=1" });
+    } else if (cfg.use_ec and !ec.present and isMsi()) {
+        sys.printf("ec: not reached, {s}\n", .{noEcReason()});
+    }
     applyChargeLimit();
     findMains();
     installSignals();
@@ -1389,7 +1393,7 @@ fn listEc() void {
     if (!cfg.use_ec) return;
     ec.open();
     if (!ec.present) {
-        if (isMsi()) sys.print("\nMSI laptop: zcool can use its EC (Cooler Boost, charge limit) with debugfs on and ec_sys loaded with write_support=1, see the README\n");
+        if (isMsi()) sys.printf("\nMSI laptop: zcool can use its EC (Cooler Boost, charge limit), but {s}\n", .{noEcReason()});
         return;
     }
     const l = ec.layout orelse {
@@ -1400,12 +1404,26 @@ fn listEc() void {
     if (ec.readings()) |r| sys.printf("  cpu {d}C, fan {d}%   gpu {d}C, fan {d}%\n", .{ r.cpu_temp, r.cpu_fan, r.gpu_temp, r.gpu_fan });
     var charge_buf: [16]u8 = undefined;
     const boost: []const u8 = if (ec.boost()) |b| (if (b) "on" else "off") else "?";
-    const profile: []const u8 = if (ec.profile()) |m| @tagName(m) else "?";
+    const profile: []const u8 = if (ec.read(l.profile)) |byte| ec.profileName(l, byte) else "?";
     const charge: []const u8 = if (ec.chargeLimit()) |c|
         (if (c == 0) "none" else std.fmt.bufPrint(&charge_buf, "{d}%", .{c}) catch "?")
     else
         "not supported";
     sys.printf("  cooler boost {s}, profile {s}, charge limit {s}\n", .{ boost, profile, charge });
+}
+
+/// What keeps zcool from an MSI laptop's EC, the first thing to fix first.
+fn noEcReason() []const u8 {
+    // debugfs is root's alone
+    if (std.os.linux.getuid() != 0) return "only root reaches it: doas zcool list";
+    var buf: [4096]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    const cmdline = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/proc/cmdline" }), &buf) orelse "";
+    if (std.mem.indexOf(u8, cmdline, "debugfs=off") != null) return "the kernel runs with debugfs=off: drop it, see the README";
+    const mounts = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/proc/mounts" }), &buf) orelse "";
+    if (std.mem.indexOf(u8, mounts, " /sys/kernel/debug debugfs ") == null) return "debugfs is not mounted: doas mount -t debugfs debugfs /sys/kernel/debug";
+    if (!sys.exists(sys.join(&path_buf, &.{ sys.root, "/sys/module/ec_sys" }))) return "ec_sys is not loaded: doas modprobe ec_sys write_support=1";
+    return "ec_sys shows no EC";
 }
 
 fn isMsi() bool {
