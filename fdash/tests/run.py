@@ -1430,6 +1430,68 @@ def builtins_in_command_substitution_need_no_fork(h):
         expect(took * 3 < stock, f"{took:.2f} s against dash's {stock:.2f} s")
 
 
+DATA_EXPECTED = """1
+name\ttype\tsize
+big\tfile\t3000000
+lnk\tlink\t5
+small\tfile\t4
+sub\tdir\t4096
+файл\tfile\t0
+2
+name
+big
+name
+sub
+3
+1
+4
+name
+sub
+5
+[
+  {"name": "Ann", "age": 7},
+  {"name": "Smith, J", "age": 42}
+]
+6
+a,b,c
+1,x,
+2,,"[1,2]"
+7
+key\tvalue
+k\tv
+n\t3
+8
+CMD
+sh
+9
+name
+fdash
+10
+2
+11
+name\ttype\tsize
+файл\tfile\t0
+12
+13 2
+"""
+
+
+@test
+def tables_in_pipelines_as_in_nushell(h):
+    r = no_tty([os.path.join(HERE, "data.sh")], env={"LANG": "C.UTF-8"})
+    # a directory's size depends on the file system
+    got = re.sub(r"sub\tdir\t\d+", "sub\tdir\tN", r.stdout)
+    expect(got == DATA_EXPECTED.replace("sub\tdir\t4096", "sub\tdir\tN"), f"got:\n{r.stdout}{r.stderr}")
+    expect("no column nosuch" in r.stderr, r.stderr)
+    # on a terminal the last command draws the table
+    sh = Shell(h, env={"LANG": "C.UTF-8"})
+    sh.run("printf 'name\\tsize\\nbig\\t3000000\\nsmall\\t4\\n' | sort-by size")
+    expect("2.9 MiB" in sh.text() and "4 B" in sh.text(), "a drawn table with sizes", sh)
+    sh.run("last -h >/dev/null 2>&1 </dev/tty; echo last=$?")
+    expect("last=" in sh.text(), "last with nothing piped runs util-linux's", sh)
+    sh.close()
+
+
 def main():
     if not os.access(FDASH, os.X_OK):
         sys.exit(f"{FDASH}: not executable")

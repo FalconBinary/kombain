@@ -72,6 +72,18 @@ historycmd	-u history
 nextdcmd	-u nextd
 prevdcmd	-u prevd
 universalcmd	-u universal
+countcmd	-u count
+firstcmd	-u first
+fromcmd		-u from
+lastcmd		-u last
+lsxcmd		-u lsx
+pickcmd		-u pick
+psxcmd		-u psx
+rejectcmd	-u reject
+sortbycmd	-u sort-by
+tablecmd	-u table
+tocmd		-u to
+wherecmd	-u where
 #endif
 
 breakcmd	-s break -s continue
