@@ -17,7 +17,7 @@ mango, dependencies included, from the Void x86_64 index in November 2026.
 | Layer | Pick | Adds | Instead of |
 |---|---|---|---|
 | Scripts | dash (`/bin/sh`) | already there | bash |
-| Interactive shell | [fdash](fdash/) | 0.3 MiB | fish (19.3 MiB) |
+| Interactive shell | [fdash](fdash/) | 0.4 MiB | fish (19.3 MiB) |
 | Prompt, history | built into fdash | 0 | starship (12 MiB), atuin (28 MiB) |
 | Compositor | mangowc | 53.5 MiB, libraries included | |
 | Panel, launcher, sound, brightness, battery, Wi-Fi, Bluetooth, wallpaper, power, calendar | [netline](https://github.com/FalconBinary/netline) | 1.7 MiB | waybar, rofi, swaybg, nmcli, pavucontrol |
@@ -161,7 +161,7 @@ the firmware keeps one.
 
 CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
 
-- fdash: 51 tests through a real pty, also under ASan and UBSan, with scripts
+- fdash: 69 tests through a real pty, also under ASan and UBSan, with scripts
   compared against unmodified dash of the same version.
 - `install.sh`: from a clean image, twice.
 - Firewall: `tests/firewall.sh` sends real traffic between network namespaces,
