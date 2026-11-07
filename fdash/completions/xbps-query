@@ -6,3 +6,7 @@
 --list-manual-pkgs	List manually installed packages
 --ownedby	Find the package owning a file
 --revdeps	Show reverse dependencies
+-R|--repository ... @xbps-available	Package
+!-R|--repository ... @xbps-installed	Installed package
+--regex	Patterns are regular expressions
+--property	Show one property

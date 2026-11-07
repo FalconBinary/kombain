@@ -4,3 +4,7 @@
 --dry-run	Show what would happen
 --force	Force reinstall
 --repository	Add a repository
+... @xbps-available	Package
+--unpack-only	Unpack without configuring
+--automatic	Mark as automatically installed
+--download-only	Download only

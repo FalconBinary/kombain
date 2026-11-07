@@ -1,0 +1,5 @@
+... @processes	Process
+-x	Match the whole name
+-f	Match the whole command line
+-u	Only this user's processes
+--signal	Send this signal
