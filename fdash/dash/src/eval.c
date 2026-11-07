@@ -50,6 +50,9 @@
 #include "parser.h"
 #include "jobs.h"
 #include "eval.h"
+#ifdef FDASH
+#include "fdash.h"
+#endif
 #include "builtins.h"
 #include "options.h"
 #include "exec.h"
@@ -904,6 +907,11 @@ bail:
 		status = 127;
 #ifdef FLUSHERR
 		flushout(&errout);
+#endif
+#ifdef FDASH
+		/* fdash: which package has it, in interactive shells */
+		if (fdash_active())
+			status = fdash_not_found(argc, argv);
 #endif
 		goto bail;
 

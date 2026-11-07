@@ -11,6 +11,20 @@ int fdash_setvar(const char *name, const char *val, int export);
 
 /* commands.c */
 void fdash_startup(void);
+int fdash_autoload(const char *name);
+int fdash_autoload_exists(const char *name);
+void fdash_listautoload(void (*fn)(const char *, void *), void *arg);
+int fdash_not_found(int argc, char **argv);
+void fdash_defun(const void *node, const char *name, int linno);
+
+/* The parser records a function definition as it reads it (input.c, parser.c). */
+extern void *fdash_rec_file;
+void fdash_rec_start(void *file);
+void fdash_rec_stop(const void *node, const char *name, int linno, int pushback);
+void fdash_rec_char(int c);
+void fdash_rec_unget(int n);
+void fdash_rec_mark(void);
+void fdash_rec_reset(void);
 void fdash_dirh_update(void);
 void fdash_uvars_check(void);
 
