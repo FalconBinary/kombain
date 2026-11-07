@@ -1,0 +1,13 @@
+!-s|-l ... @pids
+-s * ... @pids
+-s @signals	Signal
+-l	List signal names
+-s	Send this signal
+-TERM	Terminate
+-KILL	Kill, cannot be caught
+-HUP	Hang up
+-INT	Interrupt
+-STOP	Stop
+-CONT	Continue
+-USR1	User signal 1
+-USR2	User signal 2

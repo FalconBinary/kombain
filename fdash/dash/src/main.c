@@ -60,6 +60,9 @@
 #include "mystring.h"
 #include "exec.h"
 #include "cd.h"
+#ifdef FDASH
+#include "fdash.h"
+#endif
 
 #define PROFILE 0
 
@@ -170,6 +173,7 @@ state2:
 			read_profile(shinit);
 		}
 #ifdef FDASH
+		fdash_startup();
 		read_profile("${XDG_CONFIG_HOME:-$HOME/.config}/fdash/config.sh");
 #endif
 	}

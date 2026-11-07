@@ -1,0 +1,7 @@
+... @users	User
+-a	Append to the groups (with -G)
+-G	Supplementary groups
+-g	Primary group
+-s	Login shell
+-L	Lock the account
+-U	Unlock the account

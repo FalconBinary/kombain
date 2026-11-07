@@ -681,4 +681,16 @@ fdash_setstatus(int status)
 	if (!vp || !(vp->flags & VREADONLY))
 		setvarint("status", status, 0);
 }
+
+/* Sets (or with a NULL val unsets) a variable unless it is read-only, which would raise an error. */
+int
+fdash_setvar(const char *name, const char *val, int export)
+{
+	struct var *vp = *findvar(name);
+
+	if (vp && (vp->flags & VREADONLY))
+		return 0;
+	setvar(name, val, export ? VEXPORT : 0);
+	return 1;
+}
 #endif

@@ -15,6 +15,7 @@ import time
 
 import pyte
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 FDASH = os.path.abspath(sys.argv[1])
 STOCK = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
 ONLY = sys.argv[3] if len(sys.argv) > 3 else None
@@ -358,6 +359,188 @@ def completion_specs(h):
     expect("tool deploy" in s.row(), "subcommand", s)
     s.send(" --n" + TAB)
     expect("tool deploy --now" in s.row(), "nested option", s)
+    s.close()
+
+
+def shipped(h):
+    """The completion specs and generators fdash installs, in the test user's config."""
+    cfg = os.path.join(h, ".config/fdash")
+    shutil.copytree(os.path.join(HERE, "../completions"), cfg + "/completions", dirs_exist_ok=True)
+    shutil.copytree(os.path.join(HERE, "../generators"), cfg + "/generators", dirs_exist_ok=True)
+
+
+@test
+def generators_are_cached_until_their_source_changes(h):
+    cfg = os.path.join(h, ".config/fdash")
+    os.makedirs(cfg + "/completions")
+    os.makedirs(cfg + "/generators")
+    source = os.path.join(h, "fruit-source")
+    open(source, "w").close()
+    open(cfg + "/completions/tool", "w").write(
+        "!-R|--remote ... @fruits\tFruit\n-R|--remote ... @remote-fruits\n-R\tFrom the remote\n")
+    gen = cfg + "/generators/fruits"
+    open(gen, "w").write(f"#!/bin/sh\necho run >> {h}/runs\necho '#cache {source}'\n"
+                         "printf 'apple\\tRed\\nbanana\\tYellow\\ncherry\\tDark\\n'\n")
+    open(cfg + "/generators/remote-fruits", "w").write("#!/bin/sh\nprintf 'kiwi\\tGreen\\n'\n")
+    os.chmod(gen, 0o755)
+    os.chmod(cfg + "/generators/remote-fruits", 0o755)
+    s = Shell(h)
+    s.send("tool ap" + TAB)
+    expect("tool apple" in s.row(), "candidate from a generator", s)
+    s.send(CTRL_C + "tool ba" + TAB)
+    expect("tool banana" in s.row(), "second candidate", s)
+    runs = lambda: open(f"{h}/runs").read().count("run")
+    expect(runs() == 1, f"ran once, then the cache: {runs()} runs", s)
+    expect(os.path.exists(os.path.join(h, ".cache/fdash/fruits")), "cache on disk")
+    s.send(CTRL_C + "tool ch")
+    expect("tool cherry" in s.row(), "a suggestion from the cache", s)
+    time.sleep(0.05)
+    os.utime(source)
+    s.send(CTRL_C + "tool ch")
+    expect(runs() == 1, "a suggestion never runs the generator", s)
+    s.send(TAB)
+    expect(runs() == 2 and "tool cherry" in s.row(), "a changed source runs it again", s)
+    s.send(CTRL_C + "tool ki" + TAB)
+    expect("kiwi" not in s.row(), "the condition keeps the remote list out", s)
+    s.send(CTRL_C + "tool -R ki" + TAB)
+    expect("tool -R kiwi" in s.row(), "an option selects the other list", s)
+    s.close()
+
+
+@test
+def xbps_packages_complete_from_local_repository_data(h):
+    if not shutil.which("xbps-query") or not os.listdir("/var/db/xbps"):
+        print("      (skipped: no xbps here)")
+        return
+    shipped(h)
+    s = Shell(h)
+    s.send("xbps-install 2048-q" + TAB, 1.0)
+    expect("xbps-install 2048-qt" in s.row(), "an available package", s)
+    expect(os.path.exists(os.path.join(h, ".cache/fdash/xbps-available")), "kept in the cache")
+    s.send(CTRL_C + "xbps-remove base-fil" + TAB, 1.0)
+    expect("xbps-remove base-files" in s.row(), "an installed package", s)
+    s.send(CTRL_C + "xbps-remove 2048-q" + TAB, 1.0)
+    expect("2048-qt" not in s.row(), "only installed ones for xbps-remove", s)
+    s.send(CTRL_C + "xbps-query -Rs 2048-q" + TAB, 1.0)
+    expect("2048-qt" in s.row(), "-R queries the repository", s)
+    s.send(CTRL_C + "xbps-query 2048-q" + TAB, 1.0)
+    expect("2048-qt" not in s.row(), "without -R only installed packages", s)
+    s.close()
+
+
+@test
+def services_users_hosts_and_processes(h):
+    shipped(h)
+    sv = os.path.join(h, "service")
+    for name in ("netline-x", "sshd-y"):
+        os.makedirs(os.path.join(sv, name, "supervise"))
+    open(os.path.join(sv, "netline-x/supervise/stat"), "w").write("run\n")
+    os.makedirs(os.path.join(h, ".ssh"))
+    open(os.path.join(h, ".ssh/config"), "w").write("Host myserver *.wild\n  HostName 10.1.1.1\nHost=other-box\n")
+    open(os.path.join(h, ".ssh/known_hosts"), "w").write(
+        "[gitbox]:2222,10.0.0.5 ssh-ed25519 AAAA\n|1|abc=|def= ssh-ed25519 AAAA\n")
+    s = Shell(h, env={"SVDIR": sv})
+    s.send("sv up net" + TAB)
+    expect("sv up netline-x" in s.row(), "runit service", s)
+    s.send(CTRL_C + "ssh mys" + TAB)
+    expect("ssh myserver" in s.row(), "host from ~/.ssh/config", s)
+    s.send(CTRL_C + "ssh gitb" + TAB)
+    expect("ssh gitbox" in s.row(), "host from known_hosts", s)
+    s.send(CTRL_C + "ssh oth" + TAB)
+    expect("ssh other-box" in s.row(), "Host=name form", s)
+    s.send(CTRL_C + "ssh *" + TAB)
+    expect(".wild" not in s.text(), "patterns are not hosts", s)
+    s.send(CTRL_C + "su roo" + TAB)
+    expect("su root" in s.row(), "user", s)
+    s.send(CTRL_C)
+    s.run("sleep 100 &")
+    s.send("pkill slee" + TAB)
+    expect("pkill sleep" in s.row(), "process name", s)
+    s.send(CTRL_C + "kill -s KI" + TAB)
+    expect("kill -s KILL" in s.row(), "signal name", s)
+    s.send(CTRL_C + "kill " + TAB)
+    expect("sleep" in s.text().split("kill", 1)[-1], "pids with their names", s)
+    s.close()
+
+
+@test
+def git_refs_complete_without_running_git(h):
+    shipped(h)
+    g = os.path.join(h, "repo/.git")
+    os.makedirs(g + "/refs/heads/feature")
+    os.makedirs(g + "/refs/remotes/origin")
+    os.makedirs(g + "/refs/tags")
+    open(g + "/HEAD", "w").write("ref: refs/heads/main\n")
+    for ref in ("heads/main", "heads/feature/login", "remotes/origin/main", "tags/v1.0"):
+        open(f"{g}/refs/{ref}", "w").write("0" * 40 + "\n")
+    open(g + "/packed-refs", "w").write("# pack-refs\n" + "1" * 40 + " refs/heads/packed-one\n")
+    open(g + "/config", "w").write('[core]\n\tbare = false\n[remote "upstream"]\n\turl = x\n')
+    os.makedirs(g + "/refs/heads/evil")
+    open(g + "/refs/heads/evil/x\x1b]0;PWNED\x07", "w").write("0" * 40 + "\n")
+    s = Shell(h, cwd=os.path.join(h, "repo"), env={"PATH": "/nonexistent"})
+    s.send("git checkout feat" + TAB)
+    expect("git checkout feature/login" in s.row(), "loose branch", s)
+    s.send(CTRL_C + "git switch pack" + TAB)
+    expect("git switch packed-one" in s.row(), "packed branch", s)
+    s.send(CTRL_C + "git push up" + TAB)
+    expect("git push upstream" in s.row(), "remote from the config", s)
+    s.send(CTRL_C + "git push upstream fea" + TAB)
+    expect("git push upstream feature/login" in s.row(), "then a branch", s)
+    s.send(CTRL_C + "git merge origin/m" + TAB)
+    expect("git merge origin/main" in s.row(), "remote branch", s)
+    s.send(CTRL_C + "git checkout evil/" + TAB)
+    expect(b"\x1b]0;PWNED" not in s.raw, "a hostile ref name stays out of the terminal", s)
+    s.close()
+
+
+@test
+def pager_shows_descriptions_in_columns(h):
+    d = os.path.join(h, ".config/fdash/completions")
+    os.makedirs(d)
+    open(os.path.join(d, "tool"), "w").write("".join(f"cmd{i}\tDoes thing {i}\n" for i in range(1, 13)))
+    s = Shell(h, cols=100, rows=30)
+    s.send("tool cmd" + TAB)
+    screen = s.text()
+    expect("cmd1  (Does thing 1)" in screen, "candidate with its description", s)
+    row = next(l for l in screen.splitlines() if "cmd1 " in l)
+    expect(row.count("(Does thing") >= 2, "more than one column", s)
+    expect(row.index("cmd7 ") < row.index("cmd10 "), "numbers in order, filled by columns", s)
+    s.close()
+
+
+@test
+def pager_is_navigable_and_narrows_as_you_type(h):
+    for i in range(1, 31):
+        open(os.path.join(h, f"item{i}"), "w").close()
+    s = Shell(h, cols=80, rows=30)
+    s.send("ls ite" + TAB)
+    expect("ls item" in s.row() and "item30" in s.text(), "common part inserted, pager open", s)
+    s.send("2")
+    lines = [l for l in s.text().splitlines()[1:] if l.strip()]
+    expect(any("item2" in l for l in lines) and not any("item13" in l for l in lines), "narrowed to item2*", s)
+    s.send(TAB)
+    expect(s.row().rstrip().endswith("ls item2"), "tab selects the first", s)
+    s.send(DOWN)
+    expect(s.row().rstrip().endswith("ls item20"), "down moves on", s)
+    s.send(CR)
+    expect(s.row().rstrip().endswith("ls item20") and "item21" not in s.text(), "enter takes it, pager closed", s)
+    s.send(CR, 0.15)
+    expect("\nitem20\n" in s.text(), "then runs", s)
+    s.send("ls ite" + TAB + "\x1b", 0.3)
+    expect("item30" not in s.text().split("ls ite")[-1] and s.row().rstrip().endswith("ls item"), "escape closes", s)
+    s.close()
+
+
+@test
+def pager_folds_long_lists(h):
+    for i in range(200):
+        open(os.path.join(h, f"f{i:03}"), "w").close()
+    s = Shell(h, cols=40, rows=30)
+    s.send("ls f" + TAB)
+    expect("more rows" in s.text(), "long lists are folded", s)
+    s.send(TAB)
+    s.send("\x1b[6~")
+    expect("rows " in s.text() and " of " in s.text(), "page down scrolls with a position", s)
     s.close()
 
 

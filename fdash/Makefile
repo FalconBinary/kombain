@@ -14,8 +14,7 @@ TARGET   ?= fdash
 DASH     := dash
 BUILD    ?= build
 STAMP    := $(BUILD)/.configured
-OBJS     := $(BUILD)/fdash.o $(BUILD)/isocline.o
-SRCS     := src/fdash.c src/fdash.h $(wildcard isocline/src/*.c isocline/src/*.h isocline/include/*.h)
+OBJS     := $(patsubst src/%.c,$(BUILD)/%.o,$(wildcard src/*.c)) $(BUILD)/isocline.o
 DASHSRC  := $(wildcard $(DASH)/src/*.c $(DASH)/src/*.h $(DASH)/src/builtins.def.in)
 COMMON   := -DFDASH -I$(CURDIR)/src -I$(CURDIR)/isocline/include
 
@@ -33,7 +32,7 @@ $(BUILD)/generated: $(STAMP) $(DASH)/src/builtins.def.in
 	$(MAKE) -C $(BUILD)/src builtins.h nodes.h syntax.h token.h token_vars.h
 	touch $@
 
-$(BUILD)/fdash.o: src/fdash.c src/fdash.h $(BUILD)/generated
+$(BUILD)/%.o: src/%.c src/fdash.h src/util.h isocline/include/isocline.h $(BUILD)/generated
 	$(CC) $(OPT) -Wall -Wextra -Wno-unused-parameter -std=gnu11 $(COMMON) -DSHELL -DBSD=1 \
 		-DFDASH_DATADIR='"$(DATADIR)"' -include $(BUILD)/config.h \
 		-I$(DASH)/src -I$(BUILD)/src -c $< -o $@
@@ -44,13 +43,15 @@ $(BUILD)/isocline.o: $(wildcard isocline/src/*.c isocline/src/*.h isocline/inclu
 
 $(TARGET): $(OBJS) $(DASHSRC)
 	rm -f $(BUILD)/src/dash
-	$(MAKE) -C $(BUILD)/src dash LIBS="$(CURDIR)/$(BUILD)/fdash.o $(CURDIR)/$(BUILD)/isocline.o" LDFLAGS="$(LINKOPT)"
+	$(MAKE) -C $(BUILD)/src dash LIBS="$(addprefix $(CURDIR)/,$(OBJS))" LDFLAGS="$(LINKOPT)"
 	cp $(BUILD)/src/dash $@
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(BINDIR)/fdash
 	install -d $(DESTDIR)$(DATADIR)/completions
 	install -m644 completions/* $(DESTDIR)$(DATADIR)/completions/
+	install -d $(DESTDIR)$(DATADIR)/generators
+	install -m755 generators/* $(DESTDIR)$(DATADIR)/generators/
 	install -m644 config.sh.example $(DESTDIR)$(DATADIR)/config.sh.example
 
 test: $(TARGET)

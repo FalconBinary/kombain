@@ -1,0 +1,4 @@
+@users	User
+-l	Login shell
+-c	Run a command
+-s	Shell to run

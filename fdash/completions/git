@@ -49,3 +49,25 @@ reset --soft	Keep changes staged
 stash pop	Apply and drop the last stash
 stash list	List stashes
 stash push	Save changes
+checkout @git-branches
+switch @git-branches
+merge @git-branches
+rebase @git-branches
+log @git-branches
+diff @git-branches
+cherry-pick @git-branches
+reset @git-branches
+branch -d|-D|--delete|-m|-M ... @git-branches
+push @git-remotes
+push * @git-branches
+pull @git-remotes
+pull * @git-branches
+fetch @git-remotes
+remote remove|rm|rename|set-url|get-url|show|prune @git-remotes
+remote add	Add a remote
+remote remove	Remove a remote
+remote rename	Rename a remote
+remote set-url	Change a remote's URL
+remote show	Show a remote
+tag -d|--delete ... @git-tags
+show @git-tags
