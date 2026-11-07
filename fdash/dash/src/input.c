@@ -218,6 +218,15 @@ static void freestrings(struct strpush *sp)
 }
 
 
+#ifdef FDASH
+/* fdash: what the parser reads of a function definition, see parser.c; never an alias's text */
+#define FDASH_REC(c) \
+	do { \
+		if (unlikely(fdash_rec_file == parsefile) && !parsefile->strpush) \
+			fdash_rec_char(c); \
+	} while (0)
+#endif
+
 static int __pgetc(void)
 {
 	int c;
@@ -225,12 +234,21 @@ static int __pgetc(void)
 	if (parsefile->unget) {
 		long unget = -(long)(unsigned)parsefile->unget--;
 
+#ifdef FDASH
+		c = parsefile->nextc[unget];
+		FDASH_REC(c);
+		return c;
+#else
 		return parsefile->nextc[unget];
+#endif
 	}
 
 	if (parsefile->nleft > 0) {
 		parsefile->nleft--;
 		c = (signed char)*parsefile->nextc++;
+#ifdef FDASH
+		FDASH_REC(c);
+#endif
 	} else
 		c = preadbuffer();
 
@@ -467,12 +485,19 @@ save:
 	if (!IS_DEFINED_SMALL)
 		*q = savec;
 
+#ifdef FDASH
+	FDASH_REC((signed char)*parsefile->nextc);
+#endif
 	return (signed char)*parsefile->nextc++;
 }
 
 void pungetn(int n)
 {
 	parsefile->unget += n;
+#ifdef FDASH
+	if (unlikely(fdash_rec_file == parsefile) && !parsefile->strpush)
+		fdash_rec_unget(n);
+#endif
 }
 
 /*

@@ -163,6 +163,9 @@ parsecmd(int interact)
 	tokpushback = 0;
 	checkkwd = 0;
 	heredoclist = 0;
+#ifdef FDASH
+	fdash_rec_reset();
+#endif
 	doprompt = interact;
 	if (doprompt)
 		setprompt(doprompt);
@@ -581,7 +584,14 @@ simplecmd(void) {
 				checkkwd = CHKNL | CHKKWD | CHKALIAS;
 				n->ndefun.text = n->narg.text;
 				n->ndefun.linno = plinno;
+#ifdef FDASH
+				/* fdash keeps the source for funced and funcsave */
+				fdash_rec_start(parsefile);
+#endif
 				n->ndefun.body = command();
+#ifdef FDASH
+				fdash_rec_stop(n, n->ndefun.text, n->ndefun.linno, tokpushback);
+#endif
 				return n;
 			}
 			/* fall through */
@@ -804,6 +814,10 @@ xxreadtoken(void)
 		tokpushback = 0;
 		return lasttoken;
 	}
+#ifdef FDASH
+	if (unlikely(fdash_rec_file != NULL))
+		fdash_rec_mark();
+#endif
 	if (needprompt) {
 		setprompt(2);
 	}

@@ -200,7 +200,7 @@ static int is_runnable(const char *name)
 
 		return stat(name, &st) == 0 && !S_ISDIR(st.st_mode) && access(name, X_OK) == 0;
 	}
-	if (lookupalias(name, 0) || fdash_isfunction(name) || find_builtin(name))
+	if (lookupalias(name, 0) || fdash_isfunction(name) || find_builtin(name) || fdash_autoload_exists(name))
 		return 1;
 	cmds_load();
 	i = cmds_lower(name);
@@ -616,6 +616,7 @@ static void complete_commands(ic_completion_env_t *cenv, const char *word, size_
 		fdash_listaliases(cand_add, &c);
 		c.help = "function";
 		fdash_listfunctions(cand_add, &c);
+		fdash_listautoload(cand_add, &c);
 		c.help = "keyword";
 		for (i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++)
 			cand_add(keywords[i], &c);
