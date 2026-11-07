@@ -1372,6 +1372,64 @@ def scripts_behave_like_stock_dash_of_the_same_version(h):
         expect(norm(a.stderr) == norm(b.stderr), f"stderr {args[0]}:\n{a.stderr}\nvs\n{b.stderr}")
 
 
+KSH_EXPECTED = """1 cdef|bcd|ef|de|bcde||
+2 abXYef
+3 a:b:c X/X/c Z/b/c a/b/Z
+4 X/bin
+5 ABCDEF Hello abc aBC
+6 ПРИВЕТ рив ПрIVет
+7 abcdef ...... a-f
+8 1 a_b__c
+9 [][][]
+10 file abCdef abhellodef <abcdef abcdef>
+11 ne Two
+12 ace
+13 a+b a-b
+"""
+
+
+@test
+def ksh_substrings_replacement_and_case(h):
+    r = no_tty([os.path.join(HERE, "ksh.sh")], env={"LANG": "C.UTF-8"})
+    expect(r.stdout == KSH_EXPECTED, f"got:\n{r.stdout}{r.stderr}")
+    r = no_tty(["-c", "set -u; unset q; echo ${q:1}"])
+    expect(r.returncode == 2 and "parameter not set" in r.stderr, "set -u still holds: " + r.stderr)
+    r = no_tty(["-c", "v=ab; echo ${v:1:-5}"])
+    expect(r.returncode == 2 and "substring expression < 0" in r.stderr, r.stderr)
+
+
+@test
+def double_brackets_and_here_strings(h):
+    r = no_tty([os.path.join(HERE, "dbracket.sh")])
+    lines = r.stdout.splitlines()
+    for n in range(1, 21):
+        expect(any(l.split()[0] == str(n) for l in lines if l.split()) or n == 19, f"line {n} missing:\n{r.stdout}{r.stderr}")
+    expect("NINETEEN $A" in lines, r.stdout)
+    expect("20 status 2" in lines, r.stdout)
+    r = no_tty(["-c", "f() { [[ $1 == a* ]] && echo yes; }; f abc; f xbc; echo done"])
+    expect(r.stdout == "yes\ndone\n", r.stdout + r.stderr)
+
+
+@test
+def builtins_in_command_substitution_need_no_fork(h):
+    script = os.path.join(HERE, "nofork.sh")
+    a = no_tty([script])
+    expect(a.returncode == 0 and "1 hi 1" in a.stdout and "7 i=0" in a.stdout and "6 mine" in a.stdout, a.stdout + a.stderr)
+    if STOCK:
+        b = subprocess.run([STOCK, script], capture_output=True, text=True, env={"HOME": h, "PATH": "/usr/bin:/bin"})
+        expect(a.stdout == b.stdout, f"differs from dash:\n{a.stdout}\nvs\n{b.stdout}")
+    loop = "i=0; while [ $i -lt 2000 ]; do x=$(printf %s $i); i=$((i+1)); done; echo $x"
+    start = time.time()
+    r = no_tty(["-c", loop])
+    took = time.time() - start
+    expect(r.stdout == "1999\n", r.stdout)
+    if STOCK:
+        start = time.time()
+        subprocess.run([STOCK, "-c", loop], capture_output=True)
+        stock = time.time() - start
+        expect(took * 3 < stock, f"{took:.2f} s against dash's {stock:.2f} s")
+
+
 def main():
     if not os.access(FDASH, os.X_OK):
         sys.exit(f"{FDASH}: not executable")

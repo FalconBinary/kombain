@@ -78,6 +78,9 @@
 #include "syntax.h"
 #include "system.h"
 #include "var.h"
+#ifdef FDASH
+#include <alloca.h>
+#endif
 
 /*
  * _rmescape() flags
@@ -133,6 +136,9 @@ STATIC void expbackq(union node *, int);
 STATIC char *evalvar(char *, int);
 static size_t strtodest(const char *p, int flags);
 static size_t memtodest(const char *p, size_t len, int flags);
+#ifdef FDASH
+static ssize_t varvalue(char *name, int varflags, unsigned flags);
+#endif
 STATIC ssize_t varvalue(char *, int, unsigned);
 STATIC void expandmeta(struct strlist *);
 static void addglob(const glob64_t *);
@@ -547,8 +553,28 @@ expbackq(union node *cmd, int flag)
 	INTOFF;
 	startloc = expdest - (char *)stackblock();
 	pushstackmark(&smark, startloc);
+#ifdef FDASH
+	{
+	/* the substitution may run in this shell (see evalbackcmd), and its
+	 * own expansions must not take this word's state with them */
+	struct nodelist *saveargbackq = argbackq;
+	struct ifsregion saveifsfirst = ifsfirst;
+	struct ifsregion *saveifslastp = ifslastp;
+
+	ifsfirst.next = NULL;
+	ifslastp = NULL;
 	evalbackcmd(cmd, (struct backcmd *) &in);
+	argbackq = saveargbackq;
+	ifsfirst = saveifsfirst;
+	ifslastp = saveifslastp;
+	}
+#else
+	evalbackcmd(cmd, (struct backcmd *) &in);
+#endif
 	popstackmark(&smark);
+#ifdef FDASH
+	expdest = (char *)stackblock() + startloc;
+#endif
 
 	p = in.buf;
 	i = in.nleft;
@@ -771,6 +797,438 @@ out:
 }
 
 
+
+#ifdef FDASH
+/*
+ * ksh93's and bash's ${var:offset:length}, ${var/pattern/string} and
+ * ${var^^}. Each works on the plain value and plain operands, and puts the
+ * result back as the context wants it: quoted, split or matched.
+ */
+
+
+/* The CTLENDVAR that ends the word at p, past nested expansions. With sep,
+ * also the first sepc at its top level: unquoted, unescaped, not inside
+ * another expansion, so a / that a variable holds is never a separator.
+ * A colon is the exception: inside double quotes the parser escapes every
+ * one, and the offset and length are arithmetic anyway. */
+static char *fdash_wordend(char *p, int sepc, char **sep)
+{
+	int depth = 0;
+	int inquotes = 0;
+
+	for (;; p++) {
+		switch ((signed char)*p) {
+		case 0:
+			return p;
+		case CTLESC:
+			p++;
+			if (sep && !*sep && !depth && sepc == ':' && *p == ':')
+				*sep = p;
+			break;
+		case CTLMBCHAR: {
+			int j = 1;
+
+			if ((signed char)p[j] == CTLESC)
+				j++;
+			p += j + (unsigned char)p[j] + 2;
+			break;
+		}
+		case CTLVAR:
+			/* $name and ${name} have no CTLENDVAR of their own */
+			if ((*++p & VSTYPE) != VSNORMAL)
+				depth++;
+			break;
+		case CTLARI:
+			depth++;
+			break;
+		case CTLENDARI:
+			depth--;
+			break;
+		case CTLENDVAR:
+			if (!depth)
+				return p;
+			depth--;
+			break;
+		case CTLQUOTEMARK:
+			inquotes ^= 1;
+			break;
+		default:
+			if (sep && !*sep && !depth && !inquotes && *p == sepc)
+				*sep = p;
+		}
+	}
+}
+
+/* A piece of the word, ended as argstr expects, expanded with flag into a
+ * string of its own. */
+static char *fdash_expandpart(const char *from, const char *to, int flag,
+			      int startloc)
+{
+	size_t n = to - from;
+	char *part = alloca(n + 2);
+	char *s;
+
+	memcpy(part, from, n);
+	part[n] = CTLENDVAR;
+	part[n + 1] = 0;
+	argstr(part, flag);
+	n = expdest - ((char *)stackblock() + startloc);
+	s = ckmalloc(n + 1);
+	memcpy(s, (char *)stackblock() + startloc, n);
+	s[n] = 0;
+	expdest = (char *)stackblock() + startloc;
+	return s;
+}
+
+/* A pattern as argstr leaves it with EXP_CASE, quoted characters behind
+ * CTLESC, as fnmatch reads it. Sets *glob when anything in it is special. */
+char *fdash_pattern(const char *s, int *glob)
+{
+	char *out = ckmalloc(strlen(s) * 2 + 1);
+	char *q = out;
+
+	*glob = 0;
+	for (; *s; s++) {
+		int c = (signed char)*s;
+
+		if (c == CTLQUOTEMARK)
+			continue;
+		if (c == CTLMBCHAR) {
+			int j = 1;
+			unsigned ml;
+
+			if ((signed char)s[j] == CTLESC)
+				j++;
+			ml = (unsigned char)s[j++];
+			memcpy(q, s + j, ml);
+			q += ml;
+			s += j + ml + 1;
+			continue;
+		}
+		if (c == CTLESC) {
+			if (!*++s)
+				break;
+			if (strchr("*?[]\\", *s))
+				*q++ = '\\';
+			*q++ = *s;
+			continue;
+		}
+		if (strchr("*?[", *s))
+			*glob = 1;
+		if (*s == '\\' && s[1]) {
+			*q++ = *s++;
+			*glob = 1;
+		}
+		*q++ = *s;
+	}
+	*q = 0;
+	return out;
+}
+
+/* Bytes of the character at s, at least one: the locale decides, as for ${#var}. */
+static size_t fdash_charlen(const char *s, size_t n)
+{
+	mbstate_t mbs = {};
+	size_t ml = mbrlen(s, n, &mbs);
+
+	return ml == (size_t)-1 || ml == (size_t)-2 || ml < 1 ? 1 : ml;
+}
+
+static size_t fdash_nchars(const char *s, size_t n)
+{
+	size_t count = 0;
+
+	for (size_t i = 0; i < n; i += fdash_charlen(s + i, n - i))
+		count++;
+	return count;
+}
+
+/* The byte where character k starts, or n. */
+static size_t fdash_charat(const char *s, size_t n, intmax_t k)
+{
+	size_t i = 0;
+
+	while (k-- > 0 && i < n)
+		i += fdash_charlen(s + i, n - i);
+	return i;
+}
+
+static int fdash_match(const char *pat, const char *s, size_t from, size_t to)
+{
+	char *sub = ckmalloc(to - from + 1);
+	int matched;
+
+	memcpy(sub, s + from, to - from);
+	sub[to - from] = 0;
+	matched = !fnmatch(pat, sub, 0);
+	ckfree(sub);
+	return matched;
+}
+
+/* The longest match that starts at from, or -1. */
+static ssize_t fdash_longest(const char *pat, const char *s, size_t n,
+			     size_t from, int to_end)
+{
+	size_t to = n;
+
+	for (;;) {
+		if (fdash_match(pat, s, from, to))
+			return to;
+		if (to_end || to == from)
+			return -1;
+		/* back one character */
+		do
+			to--;
+		while (to > from && (s[to] & 0xc0) == 0x80);
+	}
+}
+
+struct fdash_buf {
+	char *p;
+	size_t len;
+	size_t size;
+};
+
+static void fdash_put(struct fdash_buf *b, const char *s, size_t n)
+{
+	if (b->len + n + 1 > b->size) {
+		b->size = (b->len + n + 1) * 2;
+		b->p = ckrealloc(b->p, b->size);
+	}
+	memcpy(b->p + b->len, s, n);
+	b->len += n;
+	b->p[b->len] = 0;
+}
+
+static void fdash_replace(struct fdash_buf *out, const char *val, size_t n,
+			  char *word, int startloc)
+{
+	char *sep = NULL;
+	char *end;
+	char *pat;
+	char *rep;
+	char *raw;
+	int all = 0, start = 0, finish = 0, glob;
+	size_t replen;
+	size_t i;
+
+	if (*word == '/')
+		all = 1;
+	else if (*word == '#')
+		start = 1;
+	else if (*word == '%')
+		finish = 1;
+	word += all | start | finish;
+	end = fdash_wordend(word, '/', &sep);
+	raw = fdash_expandpart(word, sep ?: end, EXP_CASE, startloc);
+	rep = sep ? fdash_expandpart(sep + 1, end, 0, startloc) : savestr("");
+	pat = fdash_pattern(raw, &glob);
+	ckfree(raw);
+	replen = strlen(rep);
+
+	if (!*pat) {
+		/* an empty pattern only has a place at either end */
+		if (finish)
+			fdash_put(out, val, n);
+		if (start || finish)
+			fdash_put(out, rep, replen);
+		if (!finish)
+			fdash_put(out, val, n);
+		goto done;
+	}
+	if (!glob) {
+		/* a plain string, the common case: no matching at every place */
+		char *lit = ckmalloc(strlen(pat) + 1);
+		size_t litlen;
+		char *q = lit;
+
+		for (const char *s = pat; *s; s++) {
+			if (*s == '\\' && s[1])
+				s++;
+			*q++ = *s;
+		}
+		*q = 0;
+		litlen = strlen(lit);
+		i = 0;
+		for (;;) {
+			const char *hit = memmem(val + i, n - i, lit, litlen);
+
+			if (start && hit != val)
+				hit = NULL;
+			if (finish) {
+				hit = n >= litlen && !memcmp(val + n - litlen, lit, litlen) ?
+				      val + n - litlen : NULL;
+			}
+			if (!hit) {
+				fdash_put(out, val + i, n - i);
+				break;
+			}
+			fdash_put(out, val + i, hit - (val + i));
+			fdash_put(out, rep, replen);
+			i = hit - val + litlen;
+			if (!all) {
+				fdash_put(out, val + i, n - i);
+				break;
+			}
+		}
+		ckfree(lit);
+		goto done;
+	}
+	i = 0;
+	while (i <= n) {
+		ssize_t to = -1;
+
+		if (finish) {
+			/* the longest tail that matches */
+			for (size_t from = 0; from <= n; from += from < n ? fdash_charlen(val + from, n - from) : 1) {
+				if (fdash_match(pat, val, from, n)) {
+					fdash_put(out, val, from);
+					fdash_put(out, rep, replen);
+					goto done;
+				}
+			}
+			fdash_put(out, val, n);
+			goto done;
+		}
+		to = fdash_longest(pat, val, n, i, 0);
+		if (to >= 0) {
+			fdash_put(out, rep, replen);
+			if (!all) {
+				fdash_put(out, val + to, n - to);
+				goto done;
+			}
+			if ((size_t)to > i) {
+				i = to;
+				continue;
+			}
+		}
+		if (start) {
+			fdash_put(out, val + i, n - i);
+			goto done;
+		}
+		if (i == n)
+			break;
+		{
+			size_t ml = fdash_charlen(val + i, n - i);
+
+			fdash_put(out, val + i, ml);
+			i += ml;
+		}
+	}
+done:
+	ckfree(pat);
+	ckfree(rep);
+}
+
+static void fdash_case(struct fdash_buf *out, const char *val, size_t n,
+		       const char *word)
+{
+	/* inside double quotes the parser escapes each ^ */
+	const char *op = word + ((signed char)*word == CTLESC);
+	const char *next = op + 1 + ((signed char)op[1] == CTLESC);
+	int upper = *op == '^';
+	int every = *next == *op;
+	size_t i = 0;
+
+	while (i < n) {
+		mbstate_t mbs = {};
+		wchar_t wc;
+		size_t ml = mbrtowc(&wc, val + i, n - i, &mbs);
+		char buf[MB_LEN_MAX];
+		size_t bl;
+
+		if (ml == (size_t)-1 || ml == (size_t)-2 || ml < 1) {
+			fdash_put(out, val + i, 1);
+			i++;
+		} else {
+			mbs = (mbstate_t){};
+			bl = wcrtomb(buf, upper ? towupper(wc) : towlower(wc), &mbs);
+			if (bl == (size_t)-1)
+				fdash_put(out, val + i, ml);
+			else
+				fdash_put(out, buf, bl);
+			i += ml;
+		}
+		if (!every) {
+			fdash_put(out, val + i, n - i);
+			break;
+		}
+	}
+}
+
+static void fdash_substr(struct fdash_buf *out, const char *val, size_t n,
+			 char *word, int startloc)
+{
+	char *sep = NULL;
+	char *end = fdash_wordend(word, ':', &sep);
+	/* an escaped colon ends the offset at its CTLESC */
+	char *first = !sep ? end : sep > word && (signed char)sep[-1] == CTLESC ? sep - 1 : sep;
+	char *text = fdash_expandpart(word, first, 0, startloc);
+	intmax_t chars = fdash_nchars(val, n);
+	intmax_t offset = *text ? arith(text) : 0;
+	intmax_t length = chars;
+	size_t from, to;
+
+	ckfree(text);
+	if (sep) {
+		text = fdash_expandpart(sep + 1, end, 0, startloc);
+		length = *text ? arith(text) : 0;
+		ckfree(text);
+	}
+	if (offset < 0)
+		offset += chars;
+	if (offset < 0 || offset > chars)
+		return;
+	if (length < 0) {
+		length += chars - offset;
+		if (length < 0)
+			sh_error("%jd: substring expression < 0", length - chars + offset);
+	}
+	from = fdash_charat(val, n, offset);
+	to = from + fdash_charat(val + from, n - from, length);
+	fdash_put(out, val + from, to - from);
+}
+
+static char *fdash_subevalvar(char *p, char *var, int startloc, int varflags,
+			      int flag)
+{
+	int subtype = varflags & VSTYPE;
+	struct fdash_buf val = { 0 }, out = { 0 };
+	char *end;
+
+	if (flag & EXP_DISCARD)
+		return argstr(p, EXP_DISCARD);
+	if ((*var == '@' || *var == '*') && subtype == VSSUBSTR)
+		sh_error("${%c:...}: a slice of the parameters is not supported", *var);
+	end = fdash_wordend(p, 0, NULL);
+
+	/* the value with nothing escaped, whatever the context wants */
+	expdest = (char *)stackblock() + startloc;
+	varvalue(var, varflags, 0);
+	fdash_put(&val, (char *)stackblock() + startloc,
+		  expdest - ((char *)stackblock() + startloc));
+	expdest = (char *)stackblock() + startloc;
+	fdash_put(&out, "", 0);
+
+	switch (subtype) {
+	case VSSUBSTR:
+		fdash_substr(&out, val.p, val.len, p, startloc);
+		break;
+	case VSREPLACE:
+		fdash_replace(&out, val.p, val.len, p, startloc);
+		break;
+	case VSCASE:
+		fdash_case(&out, val.p, val.len, p);
+		break;
+	}
+	memtodest(out.p, out.len, flag);
+	ckfree(val.p);
+	ckfree(out.p);
+	removerecordregions(startloc);
+	return end + 1;
+}
+#endif
+
 /*
  * Expand a variable, and return a pointer to the next character in the
  * input string.
@@ -851,6 +1309,13 @@ again:
 
 	if (subtype == VSNORMAL)
 		goto record;
+
+#ifdef FDASH
+	if (subtype > VSLENGTH) {
+		p = fdash_subevalvar(p, var, startloc, varflags, flag | discard);
+		goto record;
+	}
+#endif
 
 #ifdef DEBUG
 	switch (subtype) {

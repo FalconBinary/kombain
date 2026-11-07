@@ -79,6 +79,9 @@ void changeifs(const char *);
 
 /* From arith.y */
 intmax_t arith(const char *);
+#ifdef FDASH
+char *fdash_pattern(const char *, int *);
+#endif
 int expcmd(int , char **);
 #ifdef USE_LEX
 void arith_lex_reset(void);

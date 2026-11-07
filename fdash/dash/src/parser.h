@@ -66,7 +66,12 @@ union node;
 #define VSTRIMLEFT	0x8		/* ${var#pattern} */
 #define VSTRIMLEFTMAX	0x9		/* ${var##pattern} */
 #define VSLENGTH	0xa		/* ${#var} */
-/* VSLENGTH must come last. */
+/* VSLENGTH must come last of POSIX's: fdash's own come after it. */
+#ifdef FDASH
+#define VSSUBSTR	0xb		/* ${var:offset:length} */
+#define VSREPLACE	0xc		/* ${var/pattern/string}, the word keeps / # % */
+#define VSCASE		0xd		/* ${var^^} ${var^} ${var,,} ${var,}, the word is the operator */
+#endif
 
 /* values of checkkwd variable */
 #define CHKALIAS	0x1

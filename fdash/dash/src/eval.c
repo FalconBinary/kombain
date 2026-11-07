@@ -36,6 +36,10 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/types.h>
+#ifdef FDASH
+#include <fcntl.h>
+#include <sys/mman.h>
+#endif
 
 /*
  * Evaluate a command.
@@ -50,6 +54,9 @@
 #include "parser.h"
 #include "jobs.h"
 #include "eval.h"
+#ifdef FDASH
+int fdash_evaldbracket(union node *, int);
+#endif
 #ifdef FDASH
 #include "fdash.h"
 #endif
@@ -102,6 +109,9 @@ STATIC int evalcommand(union node *, int, struct backcmd *);
 STATIC int evalcommand(union node *, int);
 #endif
 STATIC int evalbltin(const struct builtincmd *, int, char **, int);
+#ifdef FDASH
+static int fdash_inprocess(union node *, struct backcmd *);
+#endif
 STATIC int evalfun(struct funcnode *, int, char **, int);
 STATIC void prehash(union node *);
 STATIC int eprintlist(struct output *, struct strlist *, int);
@@ -265,6 +275,11 @@ evaltree(union node *n, int flags)
 		if (n->nredir.redirect)
 			popredir(0);
 		break;
+#ifdef FDASH
+	case NDBRACKET:
+		evalfn = fdash_evaldbracket;
+		goto checkexit;
+#endif
 	case NCMD:
 		evalfn = evalcommand;
 checkexit:
@@ -647,6 +662,11 @@ evalbackcmd(union node *n, struct backcmd *result)
 		goto out;
 	}
 
+#ifdef FDASH
+	if (fdash_inprocess(n, result))
+		goto out;
+#endif
+
 	sh_pipe(pip, 0);
 	tpip[0] = pip[0];
 	tpip[1] = pip[1];
@@ -672,6 +692,111 @@ out:
 	TRACE(("evalbackcmd done: fd=%d buf=0x%x nleft=%d jp=0x%x\n",
 		result->fd, result->buf, result->nleft, result->jp));
 }
+
+#ifdef FDASH
+/*
+ * $(echo ...), $(printf ...), $(pwd), $(test ...), $(command -v name) and
+ * $(type name) run in the shell itself, their output caught in memory, as
+ * ksh93 does: no fork. Only where nothing can tell the difference: those
+ * builtins and no function of the same name, no assignment or redirection,
+ * and no expansion in the words that could change the shell, $((...)),
+ * ${x=...} or ${x?...}. An error ends just the substitution, with status 2,
+ * as it would end the subshell.
+ */
+static int fdash_nofork(union node *n)
+{
+	static const char *const pure[] = {
+		"echo", "printf", "pwd", "test", "[", "type", "command", NULL,
+	};
+	const char *name;
+	union node *arg;
+	const char *const *p;
+
+	if (n->type != NCMD || n->ncmd.assign || n->ncmd.redirect ||
+	    !n->ncmd.args)
+		return 0;
+	name = n->ncmd.args->narg.text;
+	for (p = pure; *p && strcmp(*p, name); p++)
+		;
+	if (!*p || fdash_isfunction(name))
+		return 0;
+	if (!strcmp(name, "command")) {
+		arg = n->ncmd.args->narg.next;
+		if (!arg || (strcmp(arg->narg.text, "-v") && strcmp(arg->narg.text, "-V")))
+			return 0;
+	}
+	for (arg = n->ncmd.args; arg; arg = arg->narg.next) {
+		const char *t;
+
+		for (t = arg->narg.text; *t; t++) {
+			switch ((signed char)*t) {
+			case CTLESC:
+				t++;
+				break;
+			case CTLARI:
+				return 0;
+			case CTLVAR:
+				t++;
+				if ((*t & VSTYPE) == VSASSIGN || (*t & VSTYPE) == VSQUESTION)
+					return 0;
+				break;
+			}
+		}
+	}
+	return 1;
+}
+
+static int fdash_inprocess(union node *n, struct backcmd *result)
+{
+	struct jmploc *volatile savehandler = handler;
+	struct jmploc jmploc;
+	volatile int saveint;
+	volatile int savestatus;
+	int fd, saved, err;
+	off_t size;
+
+	if (!fdash_nofork(n))
+		return 0;
+	fd = memfd_create("fdash-subst", MFD_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	saved = fcntl(1, F_DUPFD_CLOEXEC, 10);
+	if (saved < 0) {
+		close(fd);
+		return 0;
+	}
+	flushall();
+	dup2(fd, 1);
+	SAVEINT(saveint);
+	/* $? after the substitution is still the shell's, as after a fork */
+	savestatus = exitstatus;
+	err = setjmp(jmploc.loc);
+	if (!err) {
+		handler = &jmploc;
+		evalcommand(n, EV_TESTED);
+	}
+	handler = savehandler;
+	flushall();
+	dup2(saved, 1);
+	close(saved);
+	if (err && exception != EXERROR) {
+		close(fd);
+		longjmp(handler->loc, 1);
+	}
+	RESTOREINT(saveint);
+	back_exitstatus = err ? 2 : exitstatus;
+	exitstatus = savestatus;
+	size = lseek(fd, 0, SEEK_END);
+	if (size > 0) {
+		result->buf = ckmalloc(size);
+		result->nleft = pread(fd, result->buf, size, 0);
+		if (result->nleft < 0)
+			result->nleft = 0;
+	}
+	close(fd);
+	return 1;
+}
+#endif
 
 static struct strlist *fill_arglist(struct arglist *arglist,
 				    union node **argpp)
@@ -1175,3 +1300,11 @@ eprintlist(struct output *out, struct strlist *sp, int sep)
 
 	return sep;
 }
+
+#ifdef FDASH
+/* [[ ]] in fdash's ksh.c takes redirections as a simple command does */
+void fdash_expredir(union node *n)
+{
+	expredir(n);
+}
+#endif
