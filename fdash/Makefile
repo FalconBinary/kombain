@@ -48,6 +48,8 @@ $(TARGET): $(OBJS) $(DASHSRC)
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(BINDIR)/fdash
+	sed 's|/usr/local/share/fdash|$(DATADIR)|' update-completions.sh >$(DESTDIR)$(BINDIR)/fdash-update-completions
+	chmod 755 $(DESTDIR)$(BINDIR)/fdash-update-completions
 	install -d $(DESTDIR)$(DATADIR)/completions
 	install -m644 completions/* $(DESTDIR)$(DATADIR)/completions/
 	install -d $(DESTDIR)$(DATADIR)/generators
