@@ -29,6 +29,7 @@
 #include "var.h"
 
 #include "fdash.h"
+#include "isocline.h"
 #include "util.h"
 
 /* Before config.sh runs, in interactive shells on a terminal. */
@@ -1014,4 +1015,212 @@ out:
 	free(db.s);
 	free(pkgs.s);
 	return 127;
+}
+
+/* --------------------------------------------------------------------- fc */
+
+/* History numbers count from 1, the oldest; the line running fc is not one of them. */
+static long fc_count(void)
+{
+	long n = ic_history_count() - (fdash_line_saved() ? 1 : 0);
+
+	return n > 0 ? n : 0;
+}
+
+static const char *fc_entry(long num)
+{
+	return ic_history_get(fc_count() - num + (fdash_line_saved() ? 1 : 0));
+}
+
+/* A number (negative: back from the newest) or the newest command starting with the text. */
+static long fc_find(const char *spec)
+{
+	long n = fc_count(), v, i;
+	const char *p = spec + (*spec == '-' || *spec == '+');
+
+	if (*p && strspn(p, "0123456789") == strlen(p)) {
+		v = atol(spec);
+		if (v < 0)
+			v = n + 1 + v;
+		return v < 1 ? 1 : v > n ? n : v;
+	}
+	for (i = n; i >= 1; i--) {
+		const char *e = fc_entry(i);
+
+		if (e && !strncmp(e, spec, strlen(spec)))
+			return i;
+	}
+	sh_error("fc: no command starts with %s", spec);
+	return 0;
+}
+
+/* What fc runs replaces it in the history, as POSIX asks. */
+static int fc_run(const char *cmd, int show)
+{
+	if (show)
+		out1fmt("%s\n", cmd);
+	flushall();
+	if (fdash_line_saved())
+		ic_history_remove_last();
+	ic_history_add(cmd);
+	return evalstring((char *)cmd, 0);
+}
+
+/*
+ * fc -l [-nr] [first [last]]     lists
+ * fc -s [old=new] [first]        runs one again, changed
+ * fc [-r] [-e editor] [first [last]]  edits some and runs them
+ */
+int fccmd(int argc, char **argv)
+{
+	const char *editor = NULL, *ops[2] = { NULL, NULL };
+	int list = 0, nonum = 0, rev = 0, again = 0, nops = 0, i;
+	long first, last, n;
+
+	if (!fdash_active() || !ic_history_count())
+		sh_error("fc: no history");
+	for (i = 1; i < argc; i++) {
+		const char *a = argv[i];
+
+		if (!strcmp(a, "--")) {
+			i++;
+			break;
+		}
+		if (a[0] != '-' || !a[1] || strspn(a + 1, "0123456789") == strlen(a + 1))
+			break;
+		for (a++; *a; a++) {
+			switch (*a) {
+			case 'l': list = 1; break;
+			case 'n': nonum = 1; break;
+			case 'r': rev = 1; break;
+			case 's': again = 1; break;
+			case 'e':
+				editor = a[1] ? a + 1 : argv[++i];
+				if (!editor)
+					sh_error("fc: -e needs an editor");
+				a = " ";	/* the rest was the editor */
+				break;
+			default:
+				sh_error("usage: fc -l [-nr] [first [last]] | fc -s [old=new] [first] | fc [-r] [-e editor] [first [last]]");
+			}
+			if (*a == ' ')
+				break;
+		}
+	}
+	if (editor && !strcmp(editor, "-"))
+		again = 1;
+	n = fc_count();
+	if (!n)
+		sh_error("fc: no history");
+	if (again) {
+		struct sb cmd = {0};
+		const char *e, *old = NULL, *eq = NULL;
+		int status;
+
+		if (i < argc && (eq = strchr(argv[i], '='))) {
+			old = argv[i++];
+		}
+		e = fc_entry(i < argc ? fc_find(argv[i]) : n);
+		if (old && eq > old) {
+			const char *eqp = strchr(old, '=');
+			size_t olen = (size_t)(eqp - old);
+			const char *at = NULL;
+
+			{
+				struct sb pat = {0};
+
+				sb_add(&pat, old, olen);
+				at = strstr(e, pat.s);
+				free(pat.s);
+			}
+			if (at) {
+				sb_add(&cmd, e, (size_t)(at - e));
+				sb_str(&cmd, eqp + 1);
+				sb_str(&cmd, at + olen);
+			} else {
+				sb_str(&cmd, e);
+			}
+		} else {
+			sb_str(&cmd, e);
+		}
+		status = fc_run(cmd.s, 1);
+		free(cmd.s);
+		return status;
+	}
+	while (i < argc && nops < 2)
+		ops[nops++] = argv[i++];
+	if (list) {
+		first = ops[0] ? fc_find(ops[0]) : (n > 16 ? n - 15 : 1);
+		last = ops[1] ? fc_find(ops[1]) : (ops[0] ? n : n);
+	} else {
+		first = ops[0] ? fc_find(ops[0]) : n;
+		last = ops[1] ? fc_find(ops[1]) : first;
+	}
+	if (first > last) {
+		long t = first;
+
+		first = last;
+		last = t;
+		rev = !rev;
+	}
+	if (list) {
+		long k;
+
+		for (k = 0; k <= last - first; k++) {
+			long num = rev ? last - k : first + k;
+			const char *e = fc_entry(num);
+
+			if (nonum)
+				out1fmt("\t%s\n", e ? e : "");
+			else
+				out1fmt("%ld\t%s\n", num, e ? e : "");
+		}
+		return 0;
+	}
+	{
+		struct sb text = {0}, tmp = {0}, line = {0};
+		const char *dir = lookupvar("TMPDIR");
+		char *edited;
+		long k;
+		int fd, status;
+
+		for (k = 0; k <= last - first; k++) {
+			const char *e = fc_entry(rev ? last - k : first + k);
+
+			sb_str(&text, e ? e : "");
+			sb_chr(&text, '\n');
+		}
+		sb_str(&tmp, dir && *dir == '/' ? dir : "/tmp");
+		sb_str(&tmp, "/fdash-fc.XXXXXX.sh");
+		if ((fd = mkstemps(tmp.s, 3)) < 0)
+			sh_error("fc: cannot make a temporary file");
+		status = write(fd, text.s, text.len) == (ssize_t)text.len ? 0 : 1;
+		close(fd);
+		free(text.s);
+		if (!status) {
+			if (editor) {
+				sb_str(&line, editor);
+			} else {
+				sb_str(&line, "${FCEDIT:-${VISUAL:-${EDITOR:-vi}}}");
+			}
+			sb_chr(&line, ' ');
+			sb_quote(&line, tmp.s);
+			status = evalstring(line.s, 0);
+		}
+		edited = status ? NULL : read_text(tmp.s, 1 << 20);
+		unlink(tmp.s);
+		free(tmp.s);
+		free(line.s);
+		if (!edited)
+			return status ? status : 1;
+		{
+			size_t len = strlen(edited);
+
+			while (len && edited[len - 1] == '\n')
+				edited[--len] = 0;
+		}
+		status = *edited ? fc_run(edited, 1) : 0;
+		free(edited);
+		return status;
+	}
 }

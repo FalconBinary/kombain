@@ -648,9 +648,20 @@ static void signals_restore(void) {
 
 #endif
 
+static void tty_make_raw(tty_t* tty);
+
 ic_private bool tty_start_raw(tty_t* tty) {
   if (tty == NULL) return false;
   if (tty->raw_enabled) return true;
+  // fdash: what stty changed stays, but a program that died raw is repaired
+  struct termios now;
+  if (tcgetattr(tty->fd_in, &now) == 0) {
+    now.c_iflag |= ICRNL;
+    now.c_oflag |= OPOST | ONLCR;
+    now.c_lflag |= ICANON | ECHO | ISIG | IEXTEN;
+    tty->orig_ios = now;
+    tty_make_raw(tty);
+  }
   if (tcsetattr(tty->fd_in,TCSADRAIN,&tty->raw_ios) < 0) return false;
   tty->raw_enabled = true;
   return true;
@@ -664,10 +675,8 @@ ic_private void tty_end_raw(tty_t* tty) {
   tty->raw_enabled = false;
 }
 
-static bool tty_init_raw(tty_t* tty)
+static void tty_make_raw(tty_t* tty)
 {
-  // Set input to raw mode. See <https://man7.org/linux/man-pages/man3/termios.3.html>.
-  if (tcgetattr(tty->fd_in,&tty->orig_ios) == -1) return false;
   tty->raw_ios = tty->orig_ios;
   // input: no break signal, no \r to \n, no parity check, no 8-bit to 7-bit, no flow control
   tty->raw_ios.c_iflag &= ~(unsigned long)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
@@ -678,6 +687,13 @@ static bool tty_init_raw(tty_t* tty)
   // 1 byte at a time, no delay
   tty->raw_ios.c_cc[VTIME] = 0;
   tty->raw_ios.c_cc[VMIN] = 1;
+}
+
+static bool tty_init_raw(tty_t* tty)
+{
+  // Set input to raw mode. See <https://man7.org/linux/man-pages/man3/termios.3.html>.
+  if (tcgetattr(tty->fd_in,&tty->orig_ios) == -1) return false;
+  tty_make_raw(tty);
 
   // store in global so our signal handlers can restore the terminal mode
   signals_install(tty);
