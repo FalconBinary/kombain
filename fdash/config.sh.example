@@ -19,3 +19,15 @@ abbr xq xbps-query -Rs
 # FDASH_PS1 replaces the built-in prompt and takes isocline markup, for example:
 # FDASH_PS1='[ansi-cyan]$PWD[/] > '
 # A plain PS1 also replaces it, as text without colors.
+
+# A right prompt, for example the time:
+# FDASH_RPROMPT='[ansi-darkgray]$(date +%H:%M)[/]'
+
+# vi editing instead of the emacs-like keys:
+# set -o vi
+
+# Keys of your own run commands; commandline reads and changes the line from them:
+# bind alt-g 'commandline -i "$(git branch --show-current)"'
+
+# Variables for every fdash, now and later (fish's set -U); run them once, not here:
+#   universal -x EDITOR=nvim
