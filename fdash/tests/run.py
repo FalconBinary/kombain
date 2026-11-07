@@ -849,6 +849,37 @@ def fc_lists_reruns_and_edits(h):
 
 
 @test
+def vi_mode(h):
+    s = Shell(h)
+    s.run("set -o vi")
+    s.send("echo hello world", 0.1)
+    s.send("\x1b", 0.3)
+    s.send("0wcw")
+    s.send("bye", 0.1)
+    s.send("\x1b", 0.3)
+    s.send("A!" + CR, 0.15)
+    expect("\nbye world!\n" in s.text(), "escape, then 0, w, cw and A", s)
+    s.send("echo abcdef\x1b", 0.3)
+    s.send("2hx")
+    expect(s.row().rstrip().endswith("echo abcef"), "a count, then x", s)
+    s.send("u")
+    expect(s.row().rstrip().endswith("echo abcdef"), "u undoes", s)
+    s.send("bdw")
+    expect(s.row().rstrip().endswith("echo"), "dw", s)
+    s.send("p")
+    expect(s.row().rstrip().endswith("echo abcdef"), "p puts it back", s)
+    s.send("ddk")
+    expect("echo hello world" in s.row() or "bye" in s.row(), "dd, then k goes back in the history", s)
+    s.send(CTRL_C)
+    s.send("echo fast\x1bbD" + CR, 0.2)
+    expect("\n\n" in s.text().split("echo")[-1] or s.text().rstrip().endswith(">"), "escape typed fast before a command", s)
+    s.run("set -o emacs")
+    s.send("echo gone\x1b", 0.3)
+    expect("gone" not in s.row(), "back to the usual keys: escape clears the line", s)
+    s.close()
+
+
+@test
 def cyrillic_text_and_files(h):
     os.mkdir(os.path.join(h, "документы"))
     s = Shell(h)

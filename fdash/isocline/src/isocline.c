@@ -281,6 +281,11 @@ ic_public void ic_set_initial_input( const char* input, long pos ) {
   env->initial_pos = pos;
 }
 
+ic_public void ic_set_vi_mode( bool enable ) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return;
+  env->vi_mode = enable;
+}
+
 ic_public void ic_set_right_prompt( const char* markup ) {
   ic_env_t* env = ic_get_env(); if (env==NULL) return;
   mem_free(env->mem, env->rprompt);
