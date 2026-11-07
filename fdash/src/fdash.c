@@ -46,7 +46,7 @@
 
 static const char *const keywords[] = {
 	"!", "case", "do", "done", "elif", "else", "esac", "fi", "for", "if",
-	"in", "then", "until", "while", "{", "}",
+	"in", "then", "until", "while", "{", "}", "[[", "]]",
 };
 
 /* Everything executable on PATH, sorted; reread when PATH or a directory changes. */

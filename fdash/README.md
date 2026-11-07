@@ -1,7 +1,9 @@
 # fdash
 
-The interactive side of fish on top of dash: a 387 KiB POSIX shell with
+The interactive side of fish on top of dash: a 390 KiB POSIX shell with
 autosuggestions, syntax highlighting, completion with a pager, and fish's keys.
+From ksh93 it has `[[ ]]`, `${var:1:3}`, `${var//a/b}`, here-strings and
+command substitution without a fork; from Nushell, tables in pipelines.
 
 `fdash` is dash 0.5.13 plus a line editor (a patched [isocline]). The editor
 only starts when the shell is interactive on a terminal. Scripts and `fdash -c`
@@ -37,6 +39,49 @@ run the dash code paths, so `/bin/sh` should stay plain dash anyway.
 POSIX kept fish's ideas where they have one: `set -o vi` edits in vi's way (motions,
 operators with counts, `v` for `$EDITOR`), `fc` lists, reruns and edits the history, and
 `stty` changes stay from one command to the next.
+
+## From ksh93
+
+| Feature | How |
+|---|---|
+| `${var:offset:length}` | Characters, not bytes, in a UTF-8 locale. A negative offset counts from the end (`${v: -2}`), a negative length stops that far from it. Arithmetic in both |
+| `${var/pattern/string}` | The first match; `//` every match, `/#` at the start, `/%` at the end. The longest match, as in ksh93. A `/` that a variable holds never splits it |
+| `${var^^}` `${var^}` `${var,,}` `${var,}` | Upper and lower case, all or the first character; Cyrillic too in a UTF-8 locale |
+| `[[ ... ]]` | `==` and `!=` match patterns, `=~` extended regular expressions, `<` and `>` compare strings, `-eq` and the rest arithmetic (`[[ $n+1 -gt 5 ]]`), `-f`, `-d` and the other file tests, `-v name`, `!`, `&&`, `\|\|`, `( )`. No word splitting or globbing inside; what is quoted on the right matches itself. Newlines between words, redirections after `]]` |
+| `cmd <<< word` | A here-string: the word and a newline on standard input |
+| `$(...)` without a fork | `$(echo ...)`, `$(printf ...)`, `$(pwd)`, `$(test ...)`, `$(command -v ...)` and `$(type ...)` run in the shell itself, their output caught in memory: 22 times as fast in a loop of `x=$(printf ...)`. Only where nothing can tell the difference, no function of that name, assignment, redirection, `$((...))`, `${x=...}` or `${x?...}`; an error ends just the substitution, as it would end the subshell |
+
+None of these was valid in dash, so no POSIX script changes meaning: the tests
+run a corpus through fdash and dash and compare every byte. Arrays,
+`typeset`, `select`, brace expansion and `${ cmd; }` are not here.
+
+## Tables, as in Nushell
+
+```sh
+lsx | where size -gt 1mb | sort-by -r modified | first 5
+psx | where mem -gt 100mib | pick pid name mem
+curl -s api.example.com/items | from json | where price -lt 10 | to csv
+```
+
+A table travels as text, tab-separated with the names of the columns on its first
+line, so every other program can read and write it. Whichever command writes to a
+terminal draws it, as Nushell does: aligned, numbered, numbers to the right, sizes
+in KiB and MiB, directories in blue.
+
+| Command | Does |
+|---|---|
+| `lsx [-a] [dir...]` | name, type, size, modified, mode |
+| `psx` | pid, ppid, name, state, threads, mem, user, command |
+| `where COLUMN OP VALUE` | keeps the rows that match. OP is `==` `!=` `-lt` `-le` `-gt` `-ge` (or `'<'` and the rest quoted, or the whole condition in one quoted word: `where 'size > 1mb'`), `=~` `!~` for regular expressions, `contains`. Sizes and times take units: `10kb`, `2MiB`, `300ms`, `5min`, `2d` |
+| `sort-by [-r] COLUMN...` | numbers as numbers, the rest in natural order |
+| `pick COLUMN...`, `reject COLUMN...` | the columns to keep, or to drop (Nushell's `select`, a keyword in ksh) |
+| `first [N]`, `last [N]`, `count` | rows from the start or the end, how many |
+| `from csv\|json\|ssv\|tsv` | a table from CSV, from JSON (a list of objects, or one object as key and value), or from columns separated by spaces, such as `ps` prints |
+| `to csv\|json\|tsv` | and back |
+| `table` | draws what comes in, tab-separated or columns of words |
+
+`last`, `reject` and `from` are also programs (util-linux's `last`, CUPS's
+`reject`): with nothing piped in, the program runs.
 
 ## What does not
 
@@ -209,10 +254,11 @@ leaves room for it.
 ## Changes to upstream
 
 `dash/` is dash 0.5.13 with its changes inside `#ifdef FDASH` (`input.c`,
-`parser.c`, `main.c`, `exec.c`, `eval.c`, `var.c`, `options.c`, `alias.c`,
-`builtins.def.in`): reading lines through the editor, recording a function's text
-as it is parsed, loading saved functions, the command-not-found hook, and
-`set -o vi` turning emacs off. `isocline/` is isocline at 8d6dc1e with changes
+`parser.c`, `main.c`, `exec.c`, `eval.c`, `expand.c`, `jobs.c`, `var.c`,
+`options.c`, `alias.c`, `builtins.def.in`, and a node type in `nodetypes`):
+reading lines through the editor, recording a function's text as it is parsed,
+loading saved functions, the command-not-found hook, `set -o vi` turning emacs
+off, and the ksh93 features above. `isocline/` is isocline at 8d6dc1e with changes
 marked `fdash:`:
 
 - history suggestions, prefix search, and an abbreviation hook
