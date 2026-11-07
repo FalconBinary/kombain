@@ -149,3 +149,5 @@ NXHERE nhere			# fd<<!
 NNOT nnot			# ! command  (actually pipeline)
 	type	int
 	com	nodeptr
+
+NDBRACKET ncmd			# fdash: [[ expression ]], its words in args

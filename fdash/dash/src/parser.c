@@ -121,6 +121,9 @@ STATIC union node *pipeline(void);
 STATIC union node *command(void);
 STATIC union node *simplecmd(void);
 STATIC union node *makename(void);
+#ifdef FDASH
+STATIC union node *dbracket(int);
+#endif
 STATIC void parsefname(void);
 STATIC void parseheredoc(void);
 STATIC int readtoken(void);
@@ -543,6 +546,11 @@ simplecmd(void) {
 		checkkwd = savecheckkwd;
 		switch (readtoken()) {
 		case TWORD:
+#ifdef FDASH
+			if (!args && !vars && !redir && !quoteflag &&
+			    !strcmp(wordtext, "[["))
+				return dbracket(savelinno);
+#endif
 			n = (union node *)stalloc(sizeof (struct narg));
 			n->type = NARG;
 			n->narg.text = wordtext;
@@ -676,9 +684,193 @@ parsefname(void)
 		fixredir(n, wordtext, 0);
 	} else {
 		n->nfile.fname = makename();
+#ifdef FDASH
+		/* a here-string: its document is the word and a newline */
+		if (n->type == NXHERE) {
+			char *text = n->nhere.doc->narg.text;
+			size_t len = strlen(text);
+			char *doc = stalloc(len + 2);
+
+			memcpy(doc, text, len);
+			doc[len] = '\n';
+			doc[len + 1] = 0;
+			n->nhere.doc->narg.text = doc;
+		}
+#endif
 	}
 }
 
+
+#ifdef FDASH
+static union node *dbword(const char *text)
+{
+	union node *n = (union node *)stalloc(sizeof (struct narg));
+
+	n->type = NARG;
+	n->narg.text = (char *)text;
+	n->narg.backquote = NULL;
+	return n;
+}
+
+/*
+ * The right side of =~: parentheses are part of a regular expression, and
+ * the pieces the lexer cuts it into are joined back while nothing separates
+ * them, so ^(a|b)+$ is one word.
+ */
+static union node *dbregex(void)
+{
+	struct nodelist *bq = NULL;
+	struct nodelist **bqp = &bq;
+	char *buf = NULL;
+	size_t len = 0;
+	int depth = 0;
+	union node *n;
+	char *text;
+
+	for (;;) {
+		const char *piece;
+		size_t plen;
+		int c;
+
+		checkkwd = 0;
+		switch (readtoken()) {
+		case TWORD:
+			if (!depth && !quoteflag && !strcmp(wordtext, "]]")) {
+				tokpushback++;
+				goto done;
+			}
+			piece = wordtext;
+			*bqp = backquotelist;
+			while (*bqp)
+				bqp = &(*bqp)->next;
+			break;
+		case TLP:
+			piece = "(";
+			depth++;
+			break;
+		case TRP:
+			if (!depth)
+				goto pushback;
+			piece = ")";
+			depth--;
+			break;
+		case TOR:
+			if (!depth)
+				goto pushback;
+			piece = "||";
+			break;
+		case TPIPE:
+			if (!depth)
+				goto pushback;
+			piece = "|";
+			break;
+		default:
+pushback:
+			tokpushback++;
+			goto done;
+		}
+		plen = strlen(piece);
+		buf = ckrealloc(buf, len + plen + 1);
+		memcpy(buf + len, piece, plen);
+		len += plen;
+		if (depth)
+			continue;
+		/* at the top level it goes on only with what touches it */
+		c = pgetc();
+		pungetc();
+		if (c == ' ' || c == '\t' || c == '\n' || c == PEOF)
+			break;
+	}
+done:
+	if (!len)
+		synerror("missing regular expression after =~");
+	text = stalloc(len + 1);
+	memcpy(text, buf, len);
+	text[len] = 0;
+	ckfree(buf);
+	n = dbword(text);
+	n->narg.backquote = bq;
+	return n;
+}
+
+/*
+ * [[ expression ]], as in ksh93: the words up to ]] become the arguments of
+ * an NDBRACKET node, with && || ( ) < > as words of their own, and newlines
+ * between them allowed. fdash_evaldbracket expands and evaluates them.
+ */
+STATIC union node *
+dbracket(int linno)
+{
+	union node *args = NULL;
+	union node **app = &args;
+	union node *n;
+
+	for (;;) {
+		checkkwd = 0;
+		switch (readtoken()) {
+		case TWORD:
+			if (!quoteflag && !strcmp(wordtext, "]]"))
+				goto done;
+			n = dbword(wordtext);
+			n->narg.backquote = backquotelist;
+			if (!quoteflag && !strcmp(wordtext, "=~")) {
+				*app = n;
+				app = &n->narg.next;
+				n = dbregex();
+			}
+			break;
+		case TAND:
+			n = dbword("&&");
+			break;
+		case TOR:
+			n = dbword("||");
+			break;
+		case TLP:
+			n = dbword("(");
+			break;
+		case TRP:
+			n = dbword(")");
+			break;
+		case TREDIR:
+			/* < and > compare strings here; parsefname is not called */
+			if (redirnode->type == NFROM && redirnode->nfile.fd == 0)
+				n = dbword("<");
+			else if (redirnode->type == NTO && redirnode->nfile.fd == 1)
+				n = dbword(">");
+			else
+				synerror("unexpected redirection in [[ ]]");
+			break;
+		case TNL:
+			continue;
+		default:
+			synerror("missing ]]");
+		}
+		*app = n;
+		app = &n->narg.next;
+	}
+done:
+	*app = NULL;
+	n = (union node *)stalloc(sizeof (struct ncmd));
+	n->type = NDBRACKET;
+	n->ncmd.linno = linno;
+	n->ncmd.assign = NULL;
+	n->ncmd.args = args;
+	/* redirections after ]], such as 2>/dev/null */
+	app = &n->ncmd.redirect;
+	for (;;) {
+		checkkwd = 0;
+		if (readtoken() != TREDIR) {
+			tokpushback++;
+			break;
+		}
+		*app = redirnode;
+		app = &redirnode->nfile.next;
+		parsefname();
+	}
+	*app = NULL;
+	return n;
+}
+#endif
 
 /*
  * Input any here documents.
@@ -1322,6 +1514,19 @@ parseredir: {
 		np->nfile.fd = 0;
 		switch (c = pgetc_eatbnl()) {
 		case '<':
+#ifdef FDASH
+			/* <<< word: ksh93's here-string. parsefname reads the
+			 * word as the document, nothing more to read later. */
+			if (pgetc_eatbnl() == '<') {
+				if (sizeof (struct nfile) != sizeof (struct nhere)) {
+					np = (union node *)stalloc(sizeof (struct nhere));
+					np->nfile.fd = 0;
+				}
+				np->type = NXHERE;
+				break;
+			}
+			pungetc();
+#endif
 			if (sizeof (struct nfile) != sizeof (struct nhere)) {
 				np = (union node *)stalloc(sizeof (struct nhere));
 				np->nfile.fd = 0;
@@ -1454,6 +1659,16 @@ varname:
 				c = pgetc_eatbnl();
 				if (chkeofmark)
 					STPUTC(c, out);
+#ifdef FDASH
+				/* ${var:offset:length}, as in ksh93 and bash */
+				if (c != '}' && !strchr(types, c)) {
+					subtype = VSSUBSTR;
+					if (chkeofmark)
+						STADJUST(-1, out);
+					pungetc();
+					break;
+				}
+#endif
 				/*FALLTHROUGH*/
 			default:
 				p = strchr(types, c);
@@ -1461,6 +1676,21 @@ varname:
 					break;
 				subtype |= p - types + VSNORMAL;
 				break;
+#ifdef FDASH
+			case '/':
+				/* ${var/pattern/string}: a second /, a # or a % stays in the word */
+				subtype = VSREPLACE;
+				newsyn = BASESYNTAX;
+				break;
+			case '^':
+			case ',':
+				/* ${var^^} and ${var,,}: the operator is the word */
+				subtype = VSCASE;
+				if (chkeofmark)
+					STADJUST(-1, out);
+				pungetc();
+				break;
+#endif
 			case '%':
 			case '#':
 				subtype = c == '#' ? VSTRIMLEFT :

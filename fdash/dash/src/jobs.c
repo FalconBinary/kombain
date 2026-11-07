@@ -1370,6 +1370,13 @@ dotail:
 		cmdlist(n->ncmd.args, 1);
 		cmdlist(n->ncmd.redirect, 0);
 		break;
+#ifdef FDASH
+	case NDBRACKET:
+		cmdputs("[[");
+		cmdlist(n->ncmd.args, 1);
+		cmdputs(" ]]");
+		break;
+#endif
 	case NARG:
 		p = n->narg.text;
 dotail2:
@@ -1451,7 +1458,7 @@ cmdputs(const char *s)
 	int quoted = 0;
 	static const char vstype[VSTYPE + 1][4] = {
 		"", "}", "-", "+", "?", "=",
-		"%", "%%", "#", "##",
+		"%", "%%", "#", "##", "", ":", "/", "",
 	};
 
 	nextc = makestrspace((strlen(s) + 1) * 8, cmdnextc);
