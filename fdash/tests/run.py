@@ -21,6 +21,7 @@ FDASH = os.path.abspath(sys.argv[1])
 STOCK = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
 ONLY = sys.argv[3] if len(sys.argv) > 3 else None
 UP, DOWN, RIGHT, LEFT = "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"
+ALT_LEFT, ALT = "\x1b[1;3D", "\x1b"
 ALT_RIGHT, CTRL_C, CTRL_D, CTRL_Z, TAB, CR = "\x1b[1;3C", "\x03", "\x04", "\x1a", "\t", "\r"
 
 
@@ -605,6 +606,77 @@ def completions_from_man_pages(h):
     expect("(Colorize the output)" in s.text(), "with descriptions", s)
     s.send(CTRL_C + "later --la" + TAB)
     expect("later --later" in s.row(), "a page without a spec is read on the first tab", s)
+    s.close()
+
+
+@test
+def directory_history(h):
+    for d in ("a", "b", "c"):
+        os.mkdir(os.path.join(h, d))
+    s = Shell(h)
+    s.run("cd a")
+    s.run("cd ../b")
+    s.run("cd ../c")
+    s.run("prevd")
+    s.run("pwd")
+    expect(f"\n{h}/b\n" in s.text(), "prevd", s)
+    s.run("prevd")
+    s.run("nextd 2")
+    s.run("pwd")
+    expect(s.text().rstrip().endswith(f"{h}/c\n" + s.row().rstrip()) or f"\n{h}/c\n" in s.text(), "nextd 2", s)
+    s.run("dirh")
+    expect(f"{h}/a" in s.text() and f"{h}/b" in s.text(), "dirh lists them", s)
+    s.run("false")
+    before = len([l for l in s.text().splitlines() if l.strip()])
+    s.send(ALT_LEFT, 0.2)
+    expect("/b" in s.row() and "[1]" in s.row(), "alt+left on an empty line is prevd, and $? stays", s)
+    s.send(ALT_RIGHT, 0.2)
+    expect("/c" in s.row(), "alt+right is nextd", s)
+    after = len([l for l in s.text().splitlines() if l.strip()])
+    expect(after == before, "the prompt is redrawn in place", s)
+    s.run("history")
+    expect("prevd 2>" not in s.text(), "the keys' commands stay out of the history", s)
+    s.send("cdh " + TAB)
+    expect(f"{h}/a" in s.text().split("cdh", 1)[-1], "cdh completes visited directories", s)
+    s.send(CTRL_C)
+    s.run("cdh")
+    expect("Directory number" in s.text(), "cdh asks", s)
+    s.run("1")
+    s.run("pwd")
+    expect(s.text().count(f"\n{h}/b\n") >= 1, "cdh went there", s)
+    s.close()
+
+
+@test
+def fish_keys(h):
+    bindir = os.path.join(h, "bin")
+    os.mkdir(bindir)
+    for name, body in (("man", 'echo "man-called: $*"'), ("whatis", 'echo "whatis-called: $*"'),
+                       ("ed.sh", "echo 'echo edited-line' > \"$1\"")):
+        open(os.path.join(bindir, name), "w").write("#!/bin/sh\n" + body + "\n")
+        os.chmod(os.path.join(bindir, name), 0o755)
+    os.mkdir(os.path.join(h, "listme"))
+    open(os.path.join(h, "listme", "inside-file"), "w").close()
+    s = Shell(h, env={"PATH": bindir + ":/usr/bin:/bin", "EDITOR": bindir + "/ed.sh"})
+    s.send("git commit -m x" + ALT + "h", 0.3)
+    expect("man-called: -- git-commit" in s.text(), "alt+h: the man page of the command", s)
+    expect(s.row().rstrip().endswith("git commit -m x"), "and the line comes back", s)
+    s.send(CTRL_C + "ls -la" + ALT + "w", 0.3)
+    expect("whatis-called: -- ls" in s.text(), "alt+w: whatis", s)
+    s.send(CTRL_C + "echo hi" + ALT + "s")
+    expect(s.row().rstrip().endswith("doas echo hi") or s.row().rstrip().endswith("sudo echo hi"), "alt+s", s)
+    s.send(ALT + "s")
+    expect(s.row().rstrip().endswith("> echo hi"), "alt+s again takes it off", s)
+    s.send(CTRL_C + "echo original" + ALT + "e", 0.4)
+    expect(s.row().rstrip().endswith("echo edited-line"), "alt+e: the line from the editor", s)
+    s.send(CR, 0.15)
+    expect("\nedited-line\n" in s.text(), "and it runs", s)
+    s.send("cat listme" + ALT + "l", 0.3)
+    expect("inside-file" in s.text() and s.row().rstrip().endswith("cat listme"), "alt+l lists the directory", s)
+    s.send(CTRL_C)
+    s.run("bind alt-g 'commandline -i inserted'")
+    s.send("echo " + ALT + "g", 0.3)
+    expect(s.row().rstrip().endswith("echo inserted"), "bind and commandline", s)
     s.close()
 
 
