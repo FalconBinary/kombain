@@ -681,6 +681,44 @@ def fish_keys(h):
 
 
 @test
+def universal_variables(h):
+    a, b = Shell(h), Shell(h)
+    a.run("universal UV_EDITOR=nano-like")
+    a.run("echo a:$UV_EDITOR")
+    expect("\na:nano-like\n" in a.text(), "set here", a)
+    b.run("true")
+    b.run("echo b:$UV_EDITOR")
+    expect("\nb:nano-like\n" in b.text(), "and in the other shell at its next prompt", b)
+    a.run("universal -x UV_SHARED=1")
+    a.run("universal UV_QUOTED=\"it's a \\\\ b\"")
+    b.run("true")
+    b.run("env | grep UV_SHARED")
+    expect("\nUV_SHARED=1\n" in b.text(), "exported", b)
+    b.run('echo "q:$UV_QUOTED"')
+    expect("\nq:it's a \\ b\n" in b.text(), "quotes and backslashes survive", b)
+    b.run("UV_EDITOR=local")
+    a.run("universal UV_OTHER=2")
+    b.run("true")
+    b.run("echo e:$UV_EDITOR")
+    expect("\ne:local\n" in b.text(), "a value set by hand stays until the universal one changes", b)
+    a.run("universal -e UV_SHARED")
+    b.run("true")
+    b.run('echo "[${UV_SHARED-gone}]"')
+    expect("\n[gone]\n" in b.text(), "erased everywhere", b)
+    a.run("universal")
+    expect("universal UV_EDITOR='nano-like'" in a.text() and "UV_SHARED" not in a.text().split("> universal\n")[-1],
+           "listed", a)
+    a.close(), b.close()
+    c = Shell(h)
+    c.run("echo c:$UV_EDITOR")
+    expect("\nc:nano-like\n" in c.text(), "a new shell starts with them", c)
+    c.close()
+    out = subprocess.run([FDASH, "-c", 'echo "[$UV_EDITOR]"'], env={"HOME": h, "PATH": "/usr/bin:/bin"},
+                         capture_output=True, text=True).stdout
+    expect(out == "[]\n", "scripts never see them")
+
+
+@test
 def cyrillic_text_and_files(h):
     os.mkdir(os.path.join(h, "документы"))
     s = Shell(h)
