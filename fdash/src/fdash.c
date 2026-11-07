@@ -795,6 +795,50 @@ static const char *spec_load(const char *cmd)
 	return spec_text;
 }
 
+/*
+ * A command without a spec gets one from its man page on the first tab after a
+ * dash, by fdash-update-completions (a few milliseconds); once per session.
+ */
+static int spec_from_man(const char *cmd)
+{
+	static struct sb tried;
+	struct sb out = {0}, prog = {0};
+	const char *path = pathval(), *p;
+	char *argv[3];
+	int ok = 0;
+
+	for (p = tried.s; p && p < tried.s + tried.len; p += strlen(p) + 1)
+		if (!strcmp(p, cmd))
+			return 0;
+	sb_add(&tried, cmd, strlen(cmd) + 1);
+	for (p = path; ; p++) {
+		const char *end = strchr(p, ':');
+		size_t n = end ? (size_t)(end - p) : strlen(p);
+
+		sb_clear(&prog);
+		sb_add(&prog, p, n);
+		sb_str(&prog, "/fdash-update-completions");
+		if (n && *prog.s == '/' && access(prog.s, X_OK) == 0) {
+			struct stackmark mark;
+
+			argv[0] = prog.s;
+			argv[1] = (char *)cmd;
+			argv[2] = NULL;
+			setstackmark(&mark);
+			ok = run_capture(argv, listvars(VEXPORT, VUNSET, NULL), 3000, &out, 4096) == 0;
+			popstackmark(&mark);
+			break;
+		}
+		if (!end)
+			break;
+		p = end;
+	}
+	free(out.s);
+	free(prog.s);
+	spec_name[0] = 0;	/* read the spec again */
+	return ok;
+}
+
 /* The words typed after the command, apart from options, and the options. */
 #define MAX_TYPED 64
 
@@ -1082,6 +1126,9 @@ static void completer(ic_completion_env_t *cenv, const char *input)
 	}
 	if (!st.cmdpos && cmd.len) {
 		const char *spec = spec_load(cmd.s);
+
+		if (!spec && word[0] == '-' && !ic_completion_is_hint() && spec_from_man(cmd.s))
+			spec = spec_load(cmd.s);
 
 		if (spec && word_text(input, wstart, lim, &cur)) {
 			struct spec_ctx c = { cenv, word, len, cur.s, cur.len, NULL, 0 };

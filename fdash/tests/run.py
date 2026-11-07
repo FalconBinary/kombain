@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Drives a real fdash through a pty and checks what a terminal would show."""
 import fcntl
+import gzip
 import os
 import pty
 import select
@@ -541,6 +542,69 @@ def pager_folds_long_lists(h):
     s.send(TAB)
     s.send("\x1b[6~")
     expect("rows " in s.text() and " of " in s.text(), "page down scrolls with a position", s)
+    s.close()
+
+
+MAN_PAGE = r""".TH DEMO 1
+.SH NAME
+demo \- a demo
+.SH OPTIONS
+.TP
+\fB\-a\fR, \fB\-\-all\fR
+show all entries, i.e. hidden ones too. Then more text.
+.TP
+.B \-\-color\fR[=\fIWHEN\fR]
+colorize the output
+.IP "\fB\-q\fR" 4
+be quiet
+.SH EXAMPLES
+.TP
+\fBdemo \-x\fR
+not an option of its own
+"""
+
+MDOC_PAGE = r""".Dd May 1, 2025
+.Dt MDEMO 1
+.Sh OPTIONS
+.Bl -tag -width x
+.It Fl v , Fl -verbose
+Print more about
+.Ar everything .
+.It Fl o Ar file
+Write to a file.
+.El
+"""
+
+
+@test
+def completions_from_man_pages(h):
+    man = os.path.join(h, "man/man1")
+    os.makedirs(man)
+    with gzip.open(os.path.join(man, "demo.1.gz"), "wt") as f:
+        f.write(MAN_PAGE)
+    open(os.path.join(man, "mdemo.1"), "w").write(MDOC_PAGE)
+    open(os.path.join(man, "later.1"), "w").write(MAN_PAGE.replace("\\-\\-all", "\\-\\-later"))
+    script = os.path.join(HERE, "../update-completions.sh")
+    env = {"HOME": h, "PATH": "/usr/bin:/bin", "MANPATH": os.path.join(h, "man"), "FDASH_DATADIR": h + "/none"}
+    r = subprocess.run(["sh", script, "demo", "mdemo"], env=env, capture_output=True, text=True)
+    expect(r.returncode == 0, f"generator: {r.stderr}")
+    gen = os.path.join(h, ".local/share/fdash/generated_completions")
+    demo = open(os.path.join(gen, "demo")).read()
+    expect("--all\tShow all entries, i.e. hidden ones too\n" in demo, f"first sentence:\n{demo}")
+    expect("-a\t" in demo and "--color\tColorize the output" in demo and "-q\tBe quiet" in demo, f"man(7):\n{demo}")
+    expect("-x" not in demo, f"examples are not options:\n{demo}")
+    mdemo = open(os.path.join(gen, "mdemo")).read()
+    expect("--verbose\tPrint more about everything" in mdemo and "-o\tWrite to a file" in mdemo, f"mdoc:\n{mdemo}")
+    bindir = os.path.join(h, "bin")
+    os.mkdir(bindir)
+    shutil.copy(script, os.path.join(bindir, "fdash-update-completions"))
+    s = Shell(h, env={"PATH": bindir + ":/usr/bin:/bin", "MANPATH": env["MANPATH"]})
+    s.send("demo --a" + TAB)
+    expect("demo --all" in s.row(), "a generated spec completes", s)
+    s.send(CTRL_C + "demo -" + TAB)
+    expect("(Colorize the output)" in s.text(), "with descriptions", s)
+    s.send(CTRL_C + "later --la" + TAB)
+    expect("later --later" in s.row(), "a page without a spec is read on the first tab", s)
     s.close()
 
 

@@ -76,6 +76,8 @@ chown -R nobody:"$(id -g nobody)" "$work/fdash"
 unprivileged make -C "$work/fdash"
 make -C "$work/fdash" install
 grep -qx /usr/local/bin/fdash /etc/shells 2>/dev/null || echo /usr/local/bin/fdash >>/etc/shells
+# options from the man pages, for every user; fdash makes the missing ones on demand
+/usr/local/bin/fdash-update-completions -o /usr/local/share/fdash/generated_completions
 
 echo "==> firewall"
 if [ -e /etc/nftables.conf ]; then
