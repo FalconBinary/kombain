@@ -262,6 +262,13 @@ minus_o(char *name, int val)
 		for (i = 0; i < NOPTS; i++)
 			if (equal(name, optnames[i])) {
 				optlist[i] = val;
+#ifdef FDASH
+				/* fdash edits with one of them, as setoption() has it for -V and -E */
+				if (val && &optlist[i] == &Vflag)
+					Eflag = 0;
+				else if (val && &optlist[i] == &Eflag)
+					Vflag = 0;
+#endif
 				return;
 			}
 		sh_error("Illegal option -o %s", name);

@@ -1954,6 +1954,7 @@ int fdash_read(char *buf, int n)
 			fdash_uvars_check();
 		}
 		prompt = make_prompt();
+		ic_set_vi_mode(Vflag);
 		if (whichprompt == 1 && (rprompt = lookupvar("FDASH_RPROMPT")) && *rprompt)
 			ic_set_right_prompt(expandstr(rprompt));
 		else

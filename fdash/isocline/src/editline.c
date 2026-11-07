@@ -36,6 +36,7 @@ typedef struct editor_s {
   bool          modified;     // has a modification happened? (used for history navigation for example)  
   const char*   hprefix;      // fdash: typed text that filters up/down through the history
   bool          burst;        // fdash: this key was queued behind the previous one, as in a paste
+  bool          vi_cmd;       // fdash: in vi's command mode
   bool          disable_undo; // temporarily disable auto undo (for history search)
   ssize_t       history_idx;  // current index in the history 
   editstate_t*  undo;         // undo buffer  
@@ -920,6 +921,12 @@ static void edit_insert_char(ic_env_t* env, editor_t* eb, char c) {
 
 #include "editline_completion.c"
 
+//-------------------------------------------------------------
+// fdash: vi editing
+//-------------------------------------------------------------
+
+#include "editline_vi.c"
+
 
 //-------------------------------------------------------------
 // Edit line: main edit loop
@@ -1011,12 +1018,17 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
     eb.burst = queued;
     queued = tty_has_input(env->tty);
 
+    // fdash: in vi mode Alt and a letter is a quick escape and that letter, and v in command mode is Alt+E
+    const bool vi_alt = (env->vi_mode && KEY_MODS(c) == KEY_MOD_ALT && code_is_ascii_char(KEY_NO_MODS(c), NULL));
+
     // fdash: Alt and function keys go to the shell first
     if (env->key_fun != NULL) {
       char name[32];
       const char* text = NULL;
       long npos = -1;
-      ic_key_action_t act = (key_name(c, name, sizeof(name))
+      bool named = (env->vi_mode && eb.vi_cmd && c == 'v' ? (strcpy(name, "alt-e"), true)
+                    : !vi_alt && key_name(c, name, sizeof(name)));
+      ic_key_action_t act = (named
         ? env->key_fun(name, sbuf_string(eb.input), (long)eb.pos, &text, &npos, env->key_arg) : IC_KEY_IGNORE);
       if (act == IC_KEY_EDITED && text != NULL) {
         editor_start_modify(&eb);
@@ -1030,6 +1042,23 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
       if (act == IC_KEY_RUN && text != NULL) {
         ran = mem_strdup(env->mem, text);
         break;
+      }
+    }
+
+    // fdash: vi editing
+    if (env->vi_mode) {
+      if (!eb.vi_cmd && (c == KEY_ESC || vi_alt)) {
+        sbuf_clear(eb.hint);
+        sbuf_clear(eb.hint_help);
+        vi_enter_command(env, &eb);
+        if (c == KEY_ESC) continue;
+        c = KEY_NO_MODS(c);
+      }
+      if (eb.vi_cmd) {
+        sbuf_clear(eb.hint);
+        sbuf_clear(eb.hint_help);
+        eb.burst = false;   // each command is its own undo step, however fast it came
+        if (edit_vi_command(env, &eb, c)) continue;
       }
     }
 
@@ -1238,6 +1267,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
   }
 
   char* res; 
+  if (env->vi_mode && eb.vi_cmd) vi_set_cursor(env, false);
   if (ran != NULL) {
     // fdash: the command takes the place of the prompt and input on the screen
     edit_clear(env, &eb);
