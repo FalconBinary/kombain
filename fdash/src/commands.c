@@ -1,11 +1,12 @@
 /*
- * fdash builtins beyond the line editor: directory history and universal
- * variables. They are POSIX-named commands, so scripts that never call them
- * see plain dash.
+ * fdash builtins beyond the line editor: directory history, universal
+ * variables and function sources. They are POSIX-named commands, so scripts
+ * that never call them see plain dash.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 #include "builtins.h"
 #include "error.h"
 #include "eval.h"
+#include "main.h"
 #include "memalloc.h"
 #include "mystring.h"
 #include "options.h"
@@ -534,4 +536,482 @@ int universalcmd(int argc, char **argv)
 		free(name.s);
 	}
 	return 0;
+}
+
+/* -------------------------------------------------------- function sources */
+
+/*
+ * dash keeps a function as a parse tree, so fdash keeps its text too: the
+ * parser records what it reads from the closing parenthesis to the end of the
+ * body, in interactive shells only (config.sh included). defun() then finds
+ * the text by the node it was recorded for.
+ */
+struct fsource {
+	const void *node;
+	char *name, *text;
+	int linno;
+	struct fsource *next;
+};
+
+#define PENDING_MAX 16
+
+void *fdash_rec_file;		/* the input being recorded, or NULL */
+static int rec_depth;
+static struct sb rec;
+static size_t rec_mark;		/* where the last token began */
+static struct fsource *pending, *sources;
+
+void fdash_rec_reset(void)
+{
+	rec_depth = 0;
+	fdash_rec_file = NULL;
+}
+
+void fdash_rec_start(void *file)
+{
+	if (!iflag || rec_depth++)
+		return;		/* a function inside a function goes with the outer one */
+	sb_clear(&rec);
+	rec_mark = 0;
+	fdash_rec_file = file;
+}
+
+void fdash_rec_char(int c)
+{
+	if (c >= -128)
+		sb_chr(&rec, (char)c);
+}
+
+void fdash_rec_unget(int n)
+{
+	while (n-- > 0 && rec.len)
+		rec.s[--rec.len] = 0;
+}
+
+void fdash_rec_mark(void)
+{
+	rec_mark = rec.len;
+}
+
+static void fsource_free(struct fsource *f)
+{
+	free(f->name);
+	free(f->text);
+	free(f);
+}
+
+/* The body is read; the token after it (pushed back for the next command) is not part of it. */
+void fdash_rec_stop(const void *node, const char *name, int linno, int pushback)
+{
+	struct fsource *f, **fp;
+	const char *body;
+	size_t n;
+	int count = 0;
+
+	if (!rec_depth || --rec_depth)
+		return;
+	fdash_rec_file = NULL;
+	if (pushback && rec_mark <= rec.len) {
+		rec.len = rec_mark;
+		rec.s[rec.len] = 0;
+	}
+	for (body = rec.s; *body == ' ' || *body == '\t' || *body == '\n'; body++)
+		;
+	n = strlen(body);
+	while (n && strchr(" \t\n;&", body[n - 1]))
+		n--;
+	if (!n || !(f = calloc(1, sizeof(*f))))
+		return;
+	{
+		struct sb text = {0};
+
+		sb_str(&text, name);
+		sb_str(&text, "() ");
+		sb_add(&text, body, n);
+		sb_chr(&text, '\n');
+		f->text = text.s;
+	}
+	f->node = node;
+	f->name = strdup(name);
+	f->linno = linno;
+	f->next = pending;
+	pending = f;
+	/* a definition that never ran is forgotten after a while */
+	for (fp = &pending; *fp; fp = &(*fp)->next) {
+		if (++count > PENDING_MAX) {
+			while ((f = *fp)) {
+				*fp = f->next;
+				fsource_free(f);
+			}
+			break;
+		}
+	}
+}
+
+static struct fsource **source_find(const char *name)
+{
+	struct fsource **fp;
+
+	for (fp = &sources; *fp && strcmp((*fp)->name, name); fp = &(*fp)->next)
+		;
+	return fp;
+}
+
+/* defun() and unset -f: the function now has the recorded text, or none. */
+void fdash_defun(const void *node, const char *name, int linno)
+{
+	struct fsource **fp = source_find(name), *p;
+
+	if (*fp) {
+		struct fsource *old = *fp;
+
+		*fp = old->next;
+		fsource_free(old);
+	}
+	if (!node)
+		return;
+	for (p = pending; p; p = p->next) {
+		if (p->node == node && p->linno == linno && !strcmp(p->name, name)) {
+			struct fsource *f = calloc(1, sizeof(*f));
+
+			if (f && (f->name = strdup(name)) && (f->text = strdup(p->text))) {
+				f->next = sources;
+				sources = f;
+			} else if (f) {
+				fsource_free(f);
+			}
+			return;
+		}
+	}
+}
+
+static int functions_path(struct sb *path, const char *name)
+{
+	if (!config_dir(path))
+		return 0;
+	sb_str(path, "/functions/");
+	sb_str(path, name);
+	sb_str(path, ".sh");
+	return 1;
+}
+
+/* ~/.config/fdash/functions/NAME.sh, if it is a regular file of the user's. */
+int fdash_autoload_exists(const char *name)
+{
+	struct sb path = {0};
+	struct stat st;
+	int ok;
+
+	ok = goodname(name) && functions_path(&path, name) && stat(path.s, &st) == 0
+	     && S_ISREG(st.st_mode) && st.st_uid == geteuid();
+	free(path.s);
+	return ok;
+}
+
+/* exec.c, when a command is not found: a saved function loads in interactive shells. */
+int fdash_autoload(const char *name)
+{
+	static int loading;
+	struct sb path = {0};
+	int ok = 0;
+
+	if (loading || !fdash_active() || !fdash_autoload_exists(name))
+		return 0;
+	loading = 1;
+	functions_path(&path, name);
+	readcmdfile(path.s);
+	loading = 0;
+	ok = fdash_isfunction(name);
+	free(path.s);
+	return ok;
+}
+
+void fdash_listautoload(void (*fn)(const char *, void *), void *arg)
+{
+	struct sb dir = {0};
+	struct dirent *e;
+	DIR *d;
+
+	if (!config_dir(&dir))
+		return;
+	sb_str(&dir, "/functions");
+	if ((d = opendir(dir.s))) {
+		while ((e = readdir(d))) {
+			size_t n = strlen(e->d_name);
+
+			if (n > 3 && !strcmp(e->d_name + n - 3, ".sh") && e->d_name[0] != '.') {
+				e->d_name[n - 3] = 0;
+				if (goodname(e->d_name))
+					fn(e->d_name, arg);
+			}
+		}
+		closedir(d);
+	}
+	free(dir.s);
+}
+
+static void print_name(const char *name, void *arg)
+{
+	(void)arg;
+	out1fmt("%s\n", name);
+}
+
+/* functions: their names; functions NAME...: their text. */
+int functionscmd(int argc, char **argv)
+{
+	int i, status = 0;
+
+	if (argc < 2) {
+		fdash_listfunctions(print_name, NULL);
+		return 0;
+	}
+	for (i = 1; i < argc; i++) {
+		struct fsource **fp = source_find(argv[i]);
+
+		if (!fdash_isfunction(argv[i]) && !fdash_autoload(argv[i])) {
+			outfmt(out2, "functions: %s: no such function\n", argv[i]);
+			status = 1;
+		} else if (*(fp = source_find(argv[i]))) {
+			out1str((*fp)->text);
+		} else {
+			outfmt(out2, "functions: %s: defined where fdash did not keep the text\n", argv[i]);
+			status = 1;
+		}
+	}
+	return status;
+}
+
+static int write_file(const char *path, const char *text)
+{
+	struct sb tmp = {0};
+	FILE *f;
+	int ok = 0;
+
+	sb_str(&tmp, path);
+	sb_str(&tmp, ".new");
+	if ((f = fopen(tmp.s, "w"))) {
+		ok = fputs(text, f) >= 0;
+		ok = fclose(f) == 0 && ok && rename(tmp.s, path) == 0;
+		if (!ok)
+			unlink(tmp.s);
+	}
+	free(tmp.s);
+	return ok;
+}
+
+/* funcsave NAME...: into ~/.config/fdash/functions, where they load on first use. */
+int funcsavecmd(int argc, char **argv)
+{
+	struct sb path = {0};
+	int i, status = 0;
+
+	if (argc < 2)
+		sh_error("usage: funcsave name...");
+	for (i = 1; i < argc; i++) {
+		struct fsource **fp = source_find(argv[i]);
+
+		if (!*fp || !functions_path(&path, argv[i])) {
+			outfmt(out2, "funcsave: %s: %s\n", argv[i],
+			       fdash_isfunction(argv[i]) ? "its text was not kept" : "no such function");
+			status = 1;
+			continue;
+		}
+		{
+			char *slash = strrchr(path.s, '/');
+
+			*slash = 0;
+			mkdirs(path.s);
+			*slash = '/';
+		}
+		if (write_file(path.s, (*fp)->text)) {
+			out1fmt("funcsave: wrote %s\n", path.s);
+		} else {
+			outfmt(out2, "funcsave: cannot write %s\n", path.s);
+			status = 1;
+		}
+	}
+	free(path.s);
+	return status;
+}
+
+/*
+ * funced NAME: the function in $VISUAL or $EDITOR, defined again from what is
+ * saved. A new name starts from an empty function.
+ */
+int funcedcmd(int argc, char **argv)
+{
+	struct sb text = {0}, tmp = {0}, line = {0};
+	struct jmploc jmploc, *volatile savehandler = handler;
+	const char *name, *dir = lookupvar("TMPDIR");
+	struct fsource **fp;
+	volatile int status = 1;
+	int fd, failed;
+
+	if (argc != 2 || !goodname(argv[1]))
+		sh_error("usage: funced name");
+	name = argv[1];
+	if (!fdash_isfunction(name))
+		fdash_autoload(name);
+	if (*(fp = source_find(name))) {
+		sb_str(&text, (*fp)->text);
+	} else if (fdash_isfunction(name)) {
+		sh_error("funced: %s was defined where fdash did not keep its text", name);
+	} else {
+		sb_str(&text, name);
+		sb_str(&text, "() {\n\t\n}\n");
+	}
+	sb_str(&tmp, dir && *dir == '/' ? dir : "/tmp");
+	sb_str(&tmp, "/fdash-");
+	sb_str(&tmp, name);
+	sb_str(&tmp, ".XXXXXX.sh");
+	if ((fd = mkstemps(tmp.s, 3)) < 0) {
+		free(text.s);
+		free(tmp.s);
+		sh_error("funced: cannot make a temporary file");
+	}
+	failed = write(fd, text.s, text.len) != (ssize_t)text.len;
+	close(fd);
+	free(text.s);
+	if (!setjmp(jmploc.loc)) {
+		handler = &jmploc;
+		if (!failed) {
+			sb_str(&line, "${VISUAL:-${EDITOR:-vi}} ");
+			sb_quote(&line, tmp.s);
+			if ((status = evalstring(line.s, 0)) == 0) {
+				sb_clear(&line);
+				sb_str(&line, ". ");
+				sb_quote(&line, tmp.s);
+				status = evalstring(line.s, 0);
+			}
+		}
+		failed = 0;
+	} else {
+		failed = 1;
+	}
+	handler = savehandler;
+	unlink(tmp.s);
+	free(tmp.s);
+	free(line.s);
+	if (failed)
+		longjmp(handler->loc, 1);
+	if (!status && !fdash_isfunction(name)) {
+		outfmt(out2, "funced: what was saved does not define %s\n", name);
+		status = 1;
+	}
+	return status;
+}
+
+/* ------------------------------------------------------ command not found */
+
+/* A program on PATH, as a path. */
+static int on_path(const char *prog, struct sb *out)
+{
+	const char *p = pathval();
+
+	for (;;) {
+		const char *end = strchr(p, ':');
+		size_t n = end ? (size_t)(end - p) : strlen(p);
+
+		sb_clear(out);
+		sb_add(out, p, n);
+		sb_chr(out, '/');
+		sb_str(out, prog);
+		if (n && *out->s == '/' && access(out->s, X_OK) == 0)
+			return 1;
+		if (!end)
+			return 0;
+		p = end + 1;
+	}
+}
+
+static int call_handler(int argc, char **argv)
+{
+	struct sb line = {0};
+	int i, status;
+
+	sb_str(&line, "fdash_command_not_found");
+	for (i = 0; i < argc; i++) {
+		sb_chr(&line, ' ');
+		sb_quote(&line, argv[i]);
+	}
+	status = evalstring(line.s, 0);
+	free(line.s);
+	return status;
+}
+
+/*
+ * After "not found" in an interactive shell: a function fdash_command_not_found
+ * takes over if there is one; otherwise xlocate (from xtools) names the Void
+ * packages that have the command.
+ */
+int fdash_not_found(int argc, char **argv)
+{
+	static int told;
+	struct sb prog = {0}, out = {0}, pattern = {0}, db = {0}, pkgs = {0};
+	const char *name = argv[0], *p;
+	char *xargv[4];
+	struct stackmark mark;
+	int found = 0;
+
+	if (fdash_isfunction("fdash_command_not_found"))
+		return call_handler(argc, argv);
+	if (!*name || strchr(name, '/') || !on_path("xlocate", &prog))
+		goto out;
+	p = lookupvar("XDG_CACHE_HOME");
+	if (p && *p == '/') {
+		sb_str(&db, p);
+	} else if ((p = lookupvar("HOME"))) {
+		sb_str(&db, p);
+		sb_str(&db, "/.cache");
+	}
+	sb_str(&db, "/xlocate.git");
+	if (!is_dir(db.s)) {
+		if (!told++)
+			outfmt(out2, "fdash: xlocate -S downloads the index that tells which package has %s\n", name);
+		goto out;
+	}
+	sb_str(&pattern, "^/usr/bin/");
+	for (p = name; *p; p++) {
+		if (strchr(".[]*^$\\", *p))
+			sb_chr(&pattern, '\\');
+		sb_chr(&pattern, *p);
+	}
+	sb_chr(&pattern, '$');
+	xargv[0] = prog.s;
+	xargv[1] = "-e";
+	xargv[2] = pattern.s;
+	xargv[3] = NULL;
+	setstackmark(&mark);
+	run_capture(xargv, listvars(VEXPORT, VUNSET, NULL), 5000, &out, 1 << 16);
+	popstackmark(&mark);
+	/* lines of "pkgname-version_revision  /usr/bin/name" */
+	for (p = out.s; p && *p; ) {
+		const char *eol = strchr(p, '\n'), *end = p + strcspn(p, " \t\n");
+		const char *dash = end;
+		size_t i;
+
+		while (dash > p && *dash != '-')
+			dash--;
+		if (dash > p) {
+			for (i = 0; p + i < dash && !control_len(p + i); i++)
+				;
+			if (p + i == dash && found < 5) {
+				if (found++)
+					sb_str(&pkgs, " ");
+				sb_add(&pkgs, p, (size_t)(dash - p));
+			}
+		}
+		p = eol ? eol + 1 : NULL;
+	}
+	if (found == 1)
+		outfmt(out2, "%s is in the package %s: doas xbps-install %s\n", name, pkgs.s, pkgs.s);
+	else if (found)
+		outfmt(out2, "%s is in these packages: %s\n", name, pkgs.s);
+out:
+	free(prog.s);
+	free(out.s);
+	free(pattern.s);
+	free(db.s);
+	free(pkgs.s);
+	return 127;
 }

@@ -64,6 +64,9 @@ bindcmd		-u bind
 cdhcmd		-u cdh
 commandlinecmd	-u commandline
 dirhcmd		-u dirh
+funcedcmd	-u funced
+funcsavecmd	-u funcsave
+functionscmd	-u functions
 historycmd	-u history
 nextdcmd	-u nextd
 prevdcmd	-u prevd

@@ -719,6 +719,66 @@ def universal_variables(h):
 
 
 @test
+def functions_funced_and_funcsave(h):
+    bindir = os.path.join(h, "bin")
+    os.mkdir(bindir)
+    editor = os.path.join(bindir, "ed.sh")
+    open(editor, "w").write("#!/bin/sh\nsed -i 's/hello/changed/; s/^\\t$/\\techo fresh/' \"$1\"\n")
+    os.chmod(editor, 0o755)
+    s = Shell(h, env={"EDITOR": editor})
+    s.run('greet() { echo "hello $1 $(echo there)"; }  # not part of it')
+    s.run("functions greet")
+    expect('\ngreet() { echo "hello $1 $(echo there)"; }\n' in s.text(), "the text as typed", s)
+    s.run("alias ll='ls -d'")
+    s.run("multi() {")
+    s.run("  ll /")
+    s.run("}")
+    s.run("functions multi")
+    expect("\nmulti() {\n  ll /\n}\n" in s.text(), "several lines, the alias name kept", s)
+    s.run("funced greet", 0.3)
+    s.run("greet x")
+    expect("\nchanged x there\n" in s.text(), "funced edits and defines it again", s)
+    s.run("funcsave greet")
+    saved = os.path.join(h, ".config/fdash/functions/greet.sh")
+    expect(os.path.exists(saved) and "changed" in open(saved).read(), "funcsave writes the file", s)
+    s.run("funced brandnew", 0.3)
+    s.run("brandnew")
+    expect("\nfresh\n" in s.text(), "funced on a new name starts a function", s)
+    s.close()
+    s = Shell(h)
+    s.send("greet")
+    expect("red" not in s.color_of("greet"), "a saved function is a command", s)
+    s.send(CR, 0.2)
+    expect("\nchanged  there\n" in s.text(), "and loads on first use", s)
+    s.close()
+    out = subprocess.run([FDASH, "-c", "greet z"], env={"HOME": h, "PATH": "/usr/bin:/bin"},
+                         capture_output=True, text=True)
+    expect(out.returncode == 127, "scripts do not load them")
+
+
+@test
+def command_not_found_names_the_package(h):
+    bindir = os.path.join(h, "bin")
+    os.mkdir(bindir)
+    open(os.path.join(bindir, "xlocate"), "w").write(
+        '#!/bin/sh\n[ "$1" = -e ] && [ "$2" = "^/usr/bin/topx\\$" ] && printf "procps-ng-4.0.4_1  /usr/bin/topx\\n"\n')
+    os.chmod(os.path.join(bindir, "xlocate"), 0o755)
+    os.makedirs(os.path.join(h, ".cache/xlocate.git"))
+    s = Shell(h, env={"PATH": bindir + ":/usr/bin:/bin"})
+    s.run("topx -a", 0.3)
+    expect("topx: not found" in s.text(), "the usual message", s)
+    expect("topx is in the package procps-ng: doas xbps-install procps-ng" in s.text(), "and the package", s)
+    expect("[127]" in s.row(), "status 127", s)
+    s.run('fdash_command_not_found() { echo "custom $1 $#"; return 3; }')
+    s.run("nothere a b", 0.3)
+    expect("\ncustom nothere 3\n" in s.text() and "[3]" in s.row(), "a function of one's own takes over", s)
+    s.close()
+    out = subprocess.run([FDASH, "-c", "topx"], env={"HOME": h, "PATH": bindir + ":/usr/bin:/bin"},
+                         capture_output=True, text=True)
+    expect("package" not in out.stderr, "scripts only get the usual message")
+
+
+@test
 def cyrillic_text_and_files(h):
     os.mkdir(os.path.join(h, "документы"))
     s = Shell(h)

@@ -58,6 +58,9 @@
 #include "redir.h"
 #include "eval.h"
 #include "exec.h"
+#ifdef FDASH
+#include "fdash.h"
+#endif
 #include "builtins.h"
 #include "var.h"
 #include "options.h"
@@ -499,6 +502,12 @@ loop:
 	/* We failed.  If there was an entry for this command, delete it */
 	if (cmdp && updatetbl)
 		delete_cmd_entry();
+#ifdef FDASH
+	/* fdash: a function saved by funcsave loads on first use */
+	if (!(act & DO_NOFUNC) && fdash_autoload(name) &&
+	    (cmdp = cmdlookup(name, 0)) != NULL && cmdp->cmdtype == CMDFUNCTION)
+		goto success;
+#endif
 	if (act & DO_ERR)
 		sh_warnx("%s: %s", name, errmsg(e, E_EXEC));
 fail:
@@ -745,6 +754,9 @@ defun(union node *func)
 	entry.cmdtype = CMDFUNCTION;
 	entry.u.func = copyfunc(func);
 	addcmdentry(func->ndefun.text, &entry);
+#ifdef FDASH
+	fdash_defun(func, func->ndefun.text, func->ndefun.linno);
+#endif
 	INTON;
 }
 
@@ -761,6 +773,9 @@ unsetfunc(const char *name)
 	if ((cmdp = cmdlookup(name, 0)) != NULL &&
 	    cmdp->cmdtype == CMDFUNCTION)
 		delete_cmd_entry();
+#ifdef FDASH
+	fdash_defun(NULL, name, 0);
+#endif
 }
 
 /*
