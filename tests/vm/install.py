@@ -907,8 +907,8 @@ class Run:
         self.expect("Dev: the initramfs holds this machine's drivers only", initramfs == "0", initramfs)
         # A build for any machine takes every GPU driver: NVIDIA's, with their firmware, must still stay out.
         every = self.sh("dracut -q --force --no-hostonly --no-compress /var/tmp/every.img $(uname -r); "
-                        "lsinitrd /var/tmp/every.img | grep -cE '/(nouveau|nova_core|nova_drm|nvidia[a-z_]*)[.]ko'; "
-                        "lsinitrd /var/tmp/every.img | grep -cE '/i915[.]ko'; rm -f /var/tmp/every.img",
+                        "lsinitrd /var/tmp/every.img | grep -cE '/(nouveau|nova_core|nova_drm|nvidia[a-z_]*)[.]ko' || true; "
+                        "lsinitrd /var/tmp/every.img | grep -cE '/i915[.]ko' || true; rm -f /var/tmp/every.img",
                         check=False, timeout=600).strip().splitlines()[-2:]
         self.expect("Dev: NVIDIA's drivers stay out of the initramfs, even built for any machine",
                     len(every) == 2 and every[0] == "0" and every[1].isdigit() and int(every[1]) > 0, every)
