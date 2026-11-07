@@ -4,6 +4,7 @@
 
 int fdash_active(void);
 int fdash_read(char *buf, int n);
+int fdash_line_saved(void);
 
 /* var.c owns the variable table. */
 void fdash_setstatus(int status);

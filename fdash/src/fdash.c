@@ -461,7 +461,19 @@ static int word_text(const char *s, long i, long end, struct sb *out)
 
 static void hl_range(ic_highlight_env_t *henv, const char *s, long i, long lim);
 
-/* The quotes and expansions inside a word. */
+/* Did a scan from start end on the quote or parenthesis before j, rather than run out? */
+static int closed_by(const char *s, long start, long j, char c)
+{
+	long k = j - 2;
+
+	if (j <= start || s[j - 1] != c)
+		return 0;
+	while (k >= start && s[k] == '\\')
+		k--;
+	return (j - 2 - k) % 2 == 0;
+}
+
+/* The quotes and expansions inside a word; one left open shows as an error. */
 static void hl_inner(ic_highlight_env_t *henv, const char *s, long i, long end)
 {
 	while (i < end) {
@@ -474,29 +486,33 @@ static void hl_inner(ic_highlight_env_t *henv, const char *s, long i, long end)
 		} else if (c == '\'') {
 			for (j = i + 1; j < end && s[j] != '\''; j++)
 				;
-			j = j < end ? j + 1 : end;
-			ic_highlight(henv, i, j - i, "fd-string");
-			i = j;
+			ic_highlight(henv, i, (j < end ? j + 1 : end) - i, "fd-string");
+			if (j >= end)
+				ic_highlight(henv, i, 1, "fd-error");
+			i = j < end ? j + 1 : end;
 		} else if (c == '"') {
 			j = dquote_end(s, i + 1, end, 0);
 			ic_highlight(henv, i, j - i, "fd-string");
 			hl_inner(henv, s, i + 1, j);
+			if (!closed_by(s, i + 1, j, '"'))
+				ic_highlight(henv, i, 1, "fd-error");
 			i = j;
 		} else if (c == '$' && i + 1 < end && s[i + 1] == '(') {
 			j = paren_end(s, i + 2, end, 0);
-			ic_highlight(henv, i, 2, "fd-op");
-			if (j <= end && j > i + 2 && s[j - 1] == ')') {
+			if (closed_by(s, i + 2, j, ')')) {
+				ic_highlight(henv, i, 2, "fd-op");
 				ic_highlight(henv, j - 1, 1, "fd-op");
 				hl_range(henv, s, i + 2, j - 1);
 			} else {
 				hl_range(henv, s, i + 2, j);
+				ic_highlight(henv, i, 2, "fd-error");
 			}
 			i = j;
 		} else if (c == '$' && i + 1 < end && s[i + 1] == '{') {
 			for (j = i + 2; j < end && s[j] != '}'; j++)
 				;
+			ic_highlight(henv, i, (j < end ? j + 1 : end) - i, j < end ? "fd-var" : "fd-error");
 			j = j < end ? j + 1 : end;
-			ic_highlight(henv, i, j - i, "fd-var");
 			i = j;
 		} else if (c == '$') {
 			j = i + 1;
@@ -547,25 +563,83 @@ static void hl_word(ic_highlight_env_t *henv, const char *s, const struct token 
 	hl_inner(henv, s, t->start, t->end);
 }
 
+/* What closes a construct a word opens, or 0. */
+static char opener(const char *w, size_t n)
+{
+	static const char *const open[] = { "if", "case", "do", "{" };
+	static const char close[] = { 'f', 'e', 'd', '}' };
+	size_t k;
+
+	for (k = 0; k < 4; k++)
+		if (strlen(open[k]) == n && !strncmp(open[k], w, n))
+			return close[k];
+	return 0;
+}
+
+static char closer(const char *w, size_t n)
+{
+	static const char *const shut[] = { "fi", "esac", "done", "}" };
+	static const char close[] = { 'f', 'e', 'd', '}' };
+	size_t k;
+
+	for (k = 0; k < 4; k++)
+		if (strlen(shut[k]) == n && !strncmp(shut[k], w, n))
+			return close[k];
+	return 0;
+}
+
+/*
+ * A closer with nothing open to close (fi, done, esac, } or a parenthesis)
+ * is an error. One left open is not: the line may go on.
+ */
 static void hl_range(ic_highlight_env_t *henv, const char *s, long i, long lim)
 {
 	static int depth;
 	struct state st = { 1, 0, 0 };
 	struct token t;
+	char open[MAX_NESTING];
+	int nopen = 0;
 
 	if (depth >= MAX_NESTING)
 		return;
 	depth++;
 	for (;;) {
+		struct state before = st;
+
 		i = next_token(s, i, lim, &t);
 		if (t.type == T_END)
 			break;
-		if (t.type == T_COMMENT)
+		if (t.type == T_COMMENT) {
 			ic_highlight(henv, t.start, t.end - t.start, "fd-comment");
-		else if (t.type == T_SEP || t.type == T_REDIR)
+		} else if (t.type == T_SEP && s[t.start] == '(') {
+			ic_highlight(henv, t.start, 1, "fd-op");
+			if (nopen < MAX_NESTING)
+				open[nopen++] = ')';
+		} else if (t.type == T_SEP && s[t.start] == ')') {
+			/* it closes a subshell, or in a case ends a pattern */
+			int ok = nopen && (open[nopen - 1] == ')' || open[nopen - 1] == 'e');
+
+			if (ok && open[nopen - 1] == ')')
+				nopen--;
+			ic_highlight(henv, t.start, 1, ok ? "fd-op" : "fd-error");
+		} else if (t.type == T_SEP || t.type == T_REDIR) {
 			ic_highlight(henv, t.start, t.end - t.start, "fd-op");
-		else
+		} else {
+			size_t n = (size_t)(t.end - t.start);
+			char c;
+
 			hl_word(henv, s, &t, &st);
+			if (before.cmdpos && !before.redir) {
+				if ((c = opener(s + t.start, n)) && nopen < MAX_NESTING) {
+					open[nopen++] = c;
+				} else if ((c = closer(s + t.start, n))) {
+					if (nopen && open[nopen - 1] == c)
+						nopen--;
+					else
+						ic_highlight(henv, t.start, (long)n, "fd-error");
+				}
+			}
+		}
 		state_step(&st, s, &t);
 	}
 	depth--;
@@ -1785,6 +1859,7 @@ static void setup(void)
 	ic_set_hint_delay(0);
 	ic_enable_inline_help(false);
 	ic_enable_brace_insertion(false);
+	ic_enable_brace_matching(false);	/* it would not know quotes; the highlighter marks strays */
 	ic_enable_beep(false);
 	ic_set_multiline_eol(0);	/* a trailing backslash must stay a POSIX continuation */
 
@@ -1805,6 +1880,14 @@ static void setup(void)
 	sb_str(&path, "/history");
 	ic_set_history(path.s, HISTORY_MAX);
 	free(path.s);
+}
+
+static int line_saved;
+
+/* Is the line being run the newest history entry? fc leaves it out. */
+int fdash_line_saved(void)
+{
+	return line_saved && setup_done;
 }
 
 int fdash_active(void)
@@ -1857,7 +1940,7 @@ int fdash_read(char *buf, int n)
 	if (off >= pending.len) {
 		static struct sb rewritten;
 		struct stackmark mark;
-		const char *prompt, *line;
+		const char *prompt, *line, *rprompt;
 		char *res;
 
 		if (!setup_done)
@@ -1871,6 +1954,10 @@ int fdash_read(char *buf, int n)
 			fdash_uvars_check();
 		}
 		prompt = make_prompt();
+		if (whichprompt == 1 && (rprompt = lookupvar("FDASH_RPROMPT")) && *rprompt)
+			ic_set_right_prompt(expandstr(rprompt));
+		else
+			ic_set_right_prompt(NULL);
 		flushall();
 		if (whichprompt == 1)
 			announce_prompt();
@@ -1882,6 +1969,8 @@ int fdash_read(char *buf, int n)
 			INTON;
 			return 0;
 		}
+		/* isocline keeps lines of two characters or more that do not start with a space */
+		line_saved = !key_pending && res[0] != ' ' && res[0] && res[1];
 		if (key_pending) {
 			/* a key's command: the prompt shows how the user's own command went */
 			key_status = exitstatus;

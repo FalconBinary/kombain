@@ -62,6 +62,7 @@ histcmd		-u fc
 abbrcmd		-u abbr
 bindcmd		-u bind
 cdhcmd		-u cdh
+fccmd		-u fc
 commandlinecmd	-u commandline
 dirhcmd		-u dirh
 funcedcmd	-u funced

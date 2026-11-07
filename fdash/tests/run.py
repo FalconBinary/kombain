@@ -4,6 +4,7 @@ import fcntl
 import gzip
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -776,6 +777,75 @@ def command_not_found_names_the_package(h):
     out = subprocess.run([FDASH, "-c", "topx"], env={"HOME": h, "PATH": bindir + ":/usr/bin:/bin"},
                          capture_output=True, text=True)
     expect("package" not in out.stderr, "scripts only get the usual message")
+
+
+@test
+def right_prompt(h):
+    s = Shell(h, cols=60, env={"FDASH_RPROMPT": "[ansi-yellow]rp-$((6*7))[/]"})
+    expect(s.row().rstrip().endswith("rp-42"), "at the right end of the prompt line", s)
+    expect(s.screen.display[s.screen.cursor.y].index("rp-42") == 60 - 1 - 5, "one column left free", s)
+    s.send("echo short")
+    expect("rp-42" in s.row(), "stays while there is room", s)
+    s.send(" " + "x" * 40)
+    expect("rp-42" not in s.row(), "gives way to a long line", s)
+    s.send(CTRL_C + "if true; then" + CR)
+    expect("rp-42" not in s.row(), "not on continuation lines", s)
+    s.close()
+
+
+@test
+def unmatched_quotes_and_brackets_are_errors(h):
+    s = Shell(h)
+    s.send("echo 'open")
+    expect("red" in s.color_of("'open"), "an unclosed quote", s)
+    s.send(CTRL_C + 'echo "ok" $(echo hi')
+    expect("red" not in s.color_of('"ok"') and "red" in s.color_of("$(echo"), "an unclosed $(", s)
+    s.send(CTRL_C + "echo hi )")
+    expect("red" in s.color_of(")"), "a stray parenthesis", s)
+    s.send(CTRL_C + "if true; then echo; fi; done")
+    expect("red" in s.color_of("done") and "red" not in s.color_of("fi;"), "a stray done", s)
+    s.send(CTRL_C + 'case x in a) echo ")" ;; esac')
+    expect("red" not in s.color_of(") echo") and "red" not in s.color_of("esac"), "case patterns are fine", s)
+    s.send(CTRL_C + "(echo sub) && { echo grp; }")
+    expect("red" not in s.color_of("sub)") and "red" not in s.color_of("}"), "balanced ones are fine", s)
+    s.close()
+
+
+@test
+def stty_changes_survive_a_prompt(h):
+    s = Shell(h)
+    s.run("stty intr ^X")
+    s.run("stty -a | tr ';' '\\n' | grep -w intr")
+    expect("intr = ^X" in s.text(), "the change stays for the next command", s)
+    s.run("stty intr ^C -echo -icanon")
+    s.run("stty -a | tr ' ' '\\n' | grep -E '^-?icanon$|^-?echo$' | tr '\\n' ','")
+    expect("icanon,echo," in s.text(), "a terminal left raw is repaired", s)
+    s.close()
+
+
+@test
+def fc_lists_reruns_and_edits(h):
+    editor = os.path.join(h, "fced.sh")
+    open(editor, "w").write("#!/bin/sh\nsed -i 's/one/edited/' \"$1\"\n")
+    os.chmod(editor, 0o755)
+    s = Shell(h, env={"FCEDIT": editor})
+    s.run("echo one")
+    s.run("echo two")
+    s.run("fc -l")
+    listing = s.text().split("> fc -l\n")[-1]
+    expect(re.search(r"^1 +echo one$", listing, re.M) and re.search(r"^2 +echo two$", listing, re.M)
+           and "fc -l" not in listing, "fc -l", s)
+    s.run("fc -ln -1")
+    expect(re.search(r"^ +fc -l$", s.text().split("> fc -ln -1")[-1], re.M), "fc -ln -1: the one before, no number", s)
+    s.run("fc -s two=three 'echo t'")
+    expect("\necho three\nthree\n" in s.text(), "fc -s old=new", s)
+    s.run("fc -s 'echo o'", 0.2)
+    expect(s.text().count("\none\n") >= 2, "fc -s by the start of a command", s)
+    s.run("fc 'echo o'", 0.3)
+    expect("\nedited\n" in s.text(), "fc edits, then runs", s)
+    s.send(UP)
+    expect("echo edited" in s.row(), "and what ran is in the history instead of fc", s)
+    s.close()
 
 
 @test

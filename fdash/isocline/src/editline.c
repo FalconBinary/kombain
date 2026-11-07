@@ -199,6 +199,7 @@ typedef struct refresh_info_s {
   bool        in_extra;
   ssize_t     first_row;
   ssize_t     last_row;
+  ssize_t     rprompt_col;  // fdash: where the right prompt starts on the first row, 0 for none
 } refresh_info_t;
 
 static bool edit_refresh_rows_iter(
@@ -223,6 +224,14 @@ static bool edit_refresh_rows_iter(
   }
   else {
     term_write_formatted_n( term, s + row_start, attrbuf_attrs(info->attrs, row_start + row_len) + row_start, row_len );
+  }
+
+  // fdash: the right prompt
+  if (row == 0 && !info->in_extra && info->rprompt_col > 0) {
+    term_clear_to_end_of_line(term);
+    term_start_of_line(term);
+    term_right(term, info->rprompt_col);
+    bbcode_print(info->env->bbcode, info->env->rprompt);
   }
 
   // write line ending
@@ -255,6 +264,14 @@ static void edit_refresh_rows(ic_env_t* env, editor_t* eb, stringbuf_t* input, a
   info.in_extra   = in_extra;
   info.first_row  = first_row;
   info.last_row   = last_row;
+  info.rprompt_col = 0;
+  if (!in_extra && env->rprompt != NULL) {
+    // fdash: only while the input stays on the first row and leaves room
+    rowcol_t rc;
+    ssize_t rows = sbuf_get_rc_at_pos(input, eb->termw, promptw, cpromptw, sbuf_len(input), &rc);
+    ssize_t rw = bbcode_column_width(env->bbcode, env->rprompt);
+    if (rows == 1 && promptw + rc.col + 1 + rw < eb->termw) info.rprompt_col = eb->termw - rw - 1;
+  }
   sbuf_for_each_row( input, eb->termw, promptw, cpromptw, &edit_refresh_rows_iter, &info, NULL);
 }
 
@@ -948,7 +965,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
 
   // show prompt
   edit_write_prompt(env, &eb, 0, false);   
-  if (sbuf_len(eb.input) > 0) edit_refresh(env, &eb);
+  if (sbuf_len(eb.input) > 0 || env->rprompt != NULL) edit_refresh(env, &eb);
 
   // always a history entry for the current input
   history_sync(env->history);
