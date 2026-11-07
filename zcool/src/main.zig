@@ -17,6 +17,7 @@ const undervolt = @import("undervolt.zig");
 const sandbox = @import("sandbox.zig");
 const gpus = @import("gpus.zig");
 const nvidia = @import("nvidia.zig");
+const ec = @import("ec.zig");
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = false,
@@ -124,6 +125,11 @@ const Chip = struct {
     /// it may sleep: read only as often as needed, so that it can
     sleepy: bool = false,
     nv: Nv = .{},
+    /// a NVIDIA GPU its library cannot read, read through an MSI laptop's EC instead
+    ec_temp: bool = false,
+    /// what NVIDIA's library last answered instead of a reading
+    nv_error: [48]u8 = undefined,
+    nv_error_len: u8 = 0,
 
     fn name(self: *const Chip) []const u8 {
         return self.id[0..self.id_len];
@@ -156,6 +162,8 @@ const Fan = struct {
     stall_logged: bool = false,
     /// a fan NVIDIA's driver runs: zcool-nvidia sets it, in percent
     nv_index: i8 = -1,
+    /// an MSI laptop's Cooler Boost: both fans at full, or the firmware's curve
+    ec_boost: bool = false,
 
     fn name(self: *const Fan) []const u8 {
         return self.id[0..self.id_len];
@@ -481,6 +489,21 @@ fn discover() void {
         c.no_actuator = c.kind != .cpu and c.cap_len == 0;
     }
     addNvidiaChips();
+    addEcFan();
+}
+
+/// An MSI laptop's EC: Cooler Boost joins as one of the board's fans, which cool every chip.
+fn addEcFan() void {
+    if (!cfg.use_ec) return;
+    ec.open();
+    if (ec.layout == null or !ec.writable or nfans == max_fans) return;
+    const id = "ec/cooler_boost";
+    if (cfg.isExcluded(id)) return;
+    var fan = Fan{ .owner = -1, .ec_boost = true };
+    @memcpy(fan.id[0..id.len], id);
+    fan.id_len = id.len;
+    fans[nfans] = fan;
+    nfans += 1;
 }
 
 /// A GPU on NVIDIA's own driver. Its limits and fans come with the first reading, which is
@@ -522,14 +545,26 @@ fn helperDid(comptime fmt: []const u8, args: anytype) bool {
 fn readNvidia(c: *Chip, index: usize) ?f32 {
     var buf: [48]u8 = undefined;
     const request = std.fmt.bufPrint(&buf, "read {s}", .{busOf(c)}) catch return null;
-    const line = nvidia.ask(request, 5000) orelse return null;
-    const r = nvidia.parse(line) orelse return null;
+    const line = nvidia.ask(request, 5000) orelse return fromEc(c);
+    const r = nvidia.parse(line) orelse {
+        const n = @min(line.len, c.nv_error.len);
+        if (!std.mem.eql(u8, c.nv_error[0..c.nv_error_len], line[0..n])) {
+            @memcpy(c.nv_error[0..n], line[0..n]);
+            c.nv_error_len = @intCast(n);
+            if (!listing) sys.printf("{s}: NVIDIA's library answers \"{s}\"\n", .{ c.name(), line[0..n] });
+        }
+        return fromEc(c);
+    };
+    c.nv_error_len = 0;
     c.nv.util = r.util orelse 0;
     c.nv.power_mw = r.power_mw orelse 0;
     c.nv.fan = r.fan;
     c.nv.rested = false;
     if (!c.nv.known) {
         c.nv.known = true;
+        // its own library reads it now: what the EC stood in for is over
+        c.ec_temp = false;
+        c.no_actuator = false;
         const slowdown = r.slowdown orelse 0;
         c.crit = if (slowdown >= 50 and slowdown <= 130) slowdown else 0;
         if (cfg.limitFor(c.name())) |wanted| {
@@ -557,6 +592,26 @@ fn readNvidia(c: *Chip, index: usize) ?f32 {
     return r.temp;
 }
 
+/// When NVIDIA's library cannot read its GPU, an MSI laptop's EC still can, and then the
+/// fans can help it: the EC has one GPU temperature, so only with a single NVIDIA GPU.
+fn fromEc(c: *Chip) ?f32 {
+    if (c.nv.known or !cfg.use_ec) return null;
+    var count: usize = 0;
+    for (chips[0..nchips]) |*other| {
+        if (other.backend == .nvidia) count += 1;
+    }
+    if (count != 1) return null;
+    ec.open();
+    const t = ec.gpuTemperature() orelse return null;
+    if (!c.ec_temp) {
+        c.ec_temp = true;
+        c.no_actuator = true;
+        if (c.limit == 0) c.limit = control.clampLimit(cfg.limitFor(c.name()) orelse 85, 0, 95);
+        if (!listing) sys.printf("{s}: read through the EC instead, limit {d:.0}C, fans only\n", .{ c.name(), c.limit });
+    }
+    return t;
+}
+
 fn addNvidiaFans(c: *Chip, index: usize, count: u8) void {
     var i: u8 = 0;
     while (i < count and nfans < max_fans) : (i += 1) {
@@ -576,6 +631,22 @@ fn addNvidiaFans(c: *Chip, index: usize, count: u8) void {
 
 /// Each value is read once: what the journal keeps is what `releaseFan` writes back.
 fn takeFan(fan: *Fan) bool {
+    if (fan.ec_boost) {
+        // on already, from the key on the keyboard say: it stays on
+        const on = ec.boost() orelse return false;
+        fan.floor = if (on) 255 else 0;
+        fan.ctl = .{ .duty = fan.floor };
+        fan.written = @intFromBool(on);
+        if (dry_run) return true;
+        if (!fan.journaled) {
+            const l = ec.layout.?;
+            var path_buf: [256]u8 = undefined;
+            if (!journal.rememberByte(ec.path(&path_buf), l.boost, l.boost_bit, @intFromBool(on))) return false;
+            fan.orig_pwm = @intFromBool(on);
+            fan.journaled = true;
+        }
+        return true;
+    }
     if (fan.nv_index >= 0) {
         // never below what the driver runs it at now, like any other fan
         fan.floor = @as(f32, @floatFromInt(chips[@intCast(fan.owner)].nv.fan[@intCast(fan.nv_index)])) * 255 / 100;
@@ -609,6 +680,10 @@ fn takeFan(fan: *Fan) bool {
 fn releaseFan(fan: *Fan) void {
     fan.managed = false;
     if (dry_run) return;
+    if (fan.ec_boost) {
+        _ = ec.setBoost(fan.orig_pwm != 0);
+        return;
+    }
     if (fan.nv_index >= 0) {
         const c = &chips[@intCast(fan.owner)];
         // asleep, the GPU has dropped it already, and asking would wake it
@@ -641,7 +716,11 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
         }
         fan.take_failures = 0;
         fan.managed = true;
-        sys.printf("{s}: taking over from {d:.0}/255\n", .{ fan.name(), fan.floor });
+        if (fan.ec_boost) {
+            sys.printf("{s}: taking over, it was {s}\n", .{ fan.name(), if (fan.written == 1) "on" else "off" });
+        } else {
+            sys.printf("{s}: taking over from {d:.0}/255\n", .{ fan.name(), fan.floor });
+        }
     }
     fan.ctl.update(fan.floor, demand, dt);
     if (fan.ctl.canRelease()) {
@@ -649,6 +728,7 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
         releaseFan(fan);
         return;
     }
+    if (fan.ec_boost) return updateBoost(fan);
     const duty: i64 = @intFromFloat(@round(fan.ctl.duty));
     if (fan.written < 0 or @abs(duty - fan.written) >= 2 or (duty == 255 and fan.written != 255)) {
         if (!dry_run) {
@@ -674,6 +754,24 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
             fan.stall_logged = true;
         }
     }
+}
+
+/// Cooler Boost has two speeds: on near the limit, and off only once the fans would have come
+/// well down, so that it does not switch back and forth around one temperature.
+const boost_on: f32 = 191;
+const boost_off: f32 = 64;
+
+fn updateBoost(fan: *Fan) void {
+    const on: i64 = if (fan.ctl.duty >= boost_on) 1 else if (fan.ctl.duty < boost_off) 0 else fan.written;
+    if (on == fan.written) return;
+    if (!dry_run and !ec.setBoost(on == 1)) {
+        sys.printf("{s}: write failed, leaving it to the firmware\n", .{fan.name()});
+        releaseFan(fan);
+        fan.unusable = true;
+        return;
+    }
+    sys.printf("{s}: {s}\n", .{ fan.name(), if (on == 1) "on, both fans at full" else "off, the firmware's curve again" });
+    fan.written = on;
 }
 
 /// Average power per package, from the energy counter.
@@ -1010,6 +1108,106 @@ fn report(c: *Chip) void {
     }
 }
 
+// ---------------------------------------------------------------- the battery and the EC's profiles
+
+/// The kernel's own charge limit, which ThinkPads, ASUS, Dell and others have.
+fn batteryThreshold(buf: []u8) ?[:0]const u8 {
+    var dir_buf: [256]u8 = undefined;
+    var dir = sys.Dir.open(sys.join(&dir_buf, &.{ sys.root, "/sys/class/power_supply" })) orelse return null;
+    defer dir.close();
+    while (dir.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry, "BAT")) continue;
+        const path = sys.join(buf, &.{ sys.root, "/sys/class/power_supply/", entry, "/charge_control_end_threshold" });
+        if (sys.exists(path)) return path;
+    }
+    return null;
+}
+
+/// Unlike everything else, a charge limit stays when zcool stops: it has to hold while the
+/// laptop is off and plugged in. `battery.max = 100` takes it away.
+fn applyChargeLimit() void {
+    const wanted = cfg.battery_max;
+    if (wanted == 0) return;
+    var path_buf: [256]u8 = undefined;
+    const path = batteryThreshold(&path_buf);
+    var current: i64 = 0;
+    if (path) |file| {
+        current = sys.readInt(file) orelse 0;
+    } else {
+        const ec_limit = if (cfg.use_ec) ec.chargeLimit() else null;
+        current = ec_limit orelse {
+            sys.print("battery: this machine takes no charge limit\n");
+            return;
+        };
+    }
+    if (current == wanted) {
+        sys.printf("battery: charges up to {d}%\n", .{wanted});
+        return;
+    }
+    if (dry_run) {
+        sys.printf("battery: would charge up to {d}%\n", .{wanted});
+        return;
+    }
+    const done = if (path) |file| sys.writeInt(file, wanted) else ec.setChargeLimit(wanted);
+    if (done) {
+        sys.printf("battery: charges up to {d}% from now on\n", .{wanted});
+    } else {
+        sys.printf("battery: a {d}% limit was refused{s}\n", .{ wanted, if (path == null and !ec.writable) ": the EC is read only, see the README" else "" });
+    }
+}
+
+var mains_fd: i32 = -1;
+var mains_due_ms: i64 = 0;
+var on_mains: ?bool = null;
+/// The EC's profile before zcool changed it: back to it on a source with no profile set.
+var profile_original: ?u8 = null;
+
+fn findMains() void {
+    if (cfg.mode_ac == null and cfg.mode_battery == null) return;
+    if (ec.layout == null) {
+        sys.print("mode.ac and mode.battery need an MSI EC that zcool knows: left as they are\n");
+        return;
+    }
+    var dir_buf: [256]u8 = undefined;
+    var dir = sys.Dir.open(sys.join(&dir_buf, &.{ sys.root, "/sys/class/power_supply" })) orelse return;
+    defer dir.close();
+    while (dir.next()) |entry| {
+        var path_buf: [256]u8 = undefined;
+        var type_buf: [16]u8 = undefined;
+        const kind = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/sys/class/power_supply/", entry, "/type" }), &type_buf) orelse continue;
+        if (!std.mem.startsWith(u8, kind, "Mains")) continue;
+        mains_fd = sys.openRead(sys.join(&path_buf, &.{ sys.root, "/sys/class/power_supply/", entry, "/online" })) orelse continue;
+        return;
+    }
+}
+
+/// The EC's own power profile follows the power source, where the config names one for it.
+fn followPowerSource(now: i64) void {
+    if (mains_fd < 0 or now < mains_due_ms) return;
+    mains_due_ms = now + 2000;
+    const mains = (sys.readIntFd(mains_fd) orelse return) == 1;
+    if (on_mains != null and on_mains.? == mains) return;
+    on_mains = mains;
+    const l = ec.layout.?;
+    const mode = if (mains) cfg.mode_ac else cfg.mode_battery;
+    const byte = (if (mode) |m| l.profiles[@backingInt(m)] else profile_original) orelse return;
+    const current = ec.read(l.profile) orelse return;
+    if (current == byte) return;
+    const name = if (ec.profileOf(l, byte)) |m| @tagName(m) else "its own";
+    const source = if (mains) "on mains" else "on battery";
+    if (dry_run) {
+        sys.printf("ec: would switch to the {s} profile {s}\n", .{ name, source });
+        return;
+    }
+    if (!ec.writable) return;
+    if (profile_original == null) {
+        var path_buf: [256]u8 = undefined;
+        if (!journal.rememberByte(ec.path(&path_buf), l.profile, null, current)) return;
+        profile_original = current;
+    }
+    if (ec.write(l.profile, byte)) sys.printf("ec: {s} profile {s}\n", .{ name, source });
+}
+
 fn tickMs() i64 {
     for (fans[0..nfans]) |*f| if (f.managed) return 250;
     for (chips[0..nchips]) |*c| {
@@ -1067,6 +1265,9 @@ fn runDaemon(selftest: bool) u8 {
     gpus.scan();
     if (cfg.gpu_sleep) gpus.allowSleep(dry_run);
     discover();
+    if (ec.layout != null) sys.printf("ec: {s}, {s}\n", .{ ec.version(), if (ec.writable) "Cooler Boost joins the fans" else "read only: load ec_sys with write_support=1" });
+    applyChargeLimit();
+    findMains();
     installSignals();
     // started before the sandbox, which allows no programs to run
     if (hasNvidia()) {
@@ -1115,6 +1316,7 @@ fn runDaemon(selftest: bool) u8 {
         }
         sampleCpuPower(now);
         step(dt);
+        followPowerSource(now);
         if (undervolted and now - started > 600_000) {
             undervolt.markStable();
             undervolted = false;
@@ -1139,7 +1341,7 @@ fn listChips() void {
         const power: []const u8 = switch (c.kind) {
             .cpu => if (cpu_power.rapl_count > 0) "rapl" else if (cpu_power.npolicies > 0) "freq" else "none",
             .gpu => if (c.backend == .nvidia)
-                (if (!c.nv.known) "?" else if (c.nv.limit_max > c.nv.limit_min) "limit" else if (c.nv.max_clock > 0) "clocks" else "none")
+                (if (c.ec_temp) "ec, fans" else if (!c.nv.known) "?" else if (c.nv.limit_max > c.nv.limit_min) "limit" else if (c.nv.max_clock > 0) "clocks" else "none")
             else if (c.cap_len > 0) "cap" else "none",
             else => "none",
         };
@@ -1154,9 +1356,16 @@ fn listChips() void {
     if (hasNvidia() and !nvidia.running()) {
         sys.print("\nzcool-nvidia or NVIDIA's library is missing: that GPU is left to its driver\n");
     }
+    for (chips[0..nchips]) |*c| {
+        if (c.nv_error_len > 0) sys.printf("{s}: NVIDIA's library answers \"{s}\"{s}\n", .{ c.name(), c.nv_error[0..c.nv_error_len], if (c.ec_temp) ", read through the EC" else "" });
+    }
     listGpus();
     if (nfans == 0) sys.print("\nno controllable fans found\n") else sys.print("\nfan                       duty    rpm\n");
     for (fans[0..nfans]) |*f| {
+        if (f.ec_boost) {
+            sys.printf("{s:<24} {s:>5}      -\n", .{ f.name(), if (ec.boost() orelse false) "full" else "auto" });
+            continue;
+        }
         if (f.nv_index >= 0) {
             const c = &chips[@intCast(f.owner)];
             sys.printf("{s:<24} {d:>4}%      -\n", .{ f.name(), c.nv.fan[@intCast(f.nv_index)] });
@@ -1169,7 +1378,41 @@ fn listChips() void {
         const rpm = if (f.input_fd >= 0) (if (sys.readIntFd(f.input_fd)) |v| std.fmt.bufPrint(&rpm_buf, "{d}", .{v}) catch "?" else "?") else "-";
         sys.printf("{s:<24} {s:>5}  {s:>5}\n", .{ f.name(), duty, rpm });
     }
+    listEc();
+    var path_buf: [256]u8 = undefined;
+    if (batteryThreshold(&path_buf)) |path| sys.printf("\nbattery: charges up to {d}%\n", .{sys.readInt(path) orelse 100});
     nvidia.stop();
+}
+
+/// An MSI laptop's EC: what it reads, and why zcool does or does not use it.
+fn listEc() void {
+    if (!cfg.use_ec) return;
+    ec.open();
+    if (!ec.present) {
+        if (isMsi()) sys.print("\nMSI laptop: zcool can use its EC (Cooler Boost, charge limit) with debugfs on and ec_sys loaded with write_support=1, see the README\n");
+        return;
+    }
+    const l = ec.layout orelse {
+        sys.printf("\nec: firmware {s} is not one zcool knows, so it is left alone\n", .{ec.version()});
+        return;
+    };
+    sys.printf("\nec: {s}, {s}{s}\n", .{ ec.version(), l.family, if (ec.writable) "" else ", read only: load ec_sys with write_support=1" });
+    if (ec.readings()) |r| sys.printf("  cpu {d}C, fan {d}%   gpu {d}C, fan {d}%\n", .{ r.cpu_temp, r.cpu_fan, r.gpu_temp, r.gpu_fan });
+    var charge_buf: [16]u8 = undefined;
+    const boost: []const u8 = if (ec.boost()) |b| (if (b) "on" else "off") else "?";
+    const profile: []const u8 = if (ec.profile()) |m| @tagName(m) else "?";
+    const charge: []const u8 = if (ec.chargeLimit()) |c|
+        (if (c == 0) "none" else std.fmt.bufPrint(&charge_buf, "{d}%", .{c}) catch "?")
+    else
+        "not supported";
+    sys.printf("  cooler boost {s}, profile {s}, charge limit {s}\n", .{ boost, profile, charge });
+}
+
+fn isMsi() bool {
+    var path_buf: [256]u8 = undefined;
+    var vendor: [64]u8 = undefined;
+    const text = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/sys/class/dmi/id/sys_vendor" }), &vendor) orelse return false;
+    return std.mem.indexOf(u8, text, "Micro-Star") != null;
 }
 
 /// Each GPU: whether it shows the boot screen, whether it may sleep, and what keeps it awake.

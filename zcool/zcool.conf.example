@@ -14,6 +14,15 @@
 # had set, so this is for fans you simply want left alone.
 # fan.exclude = nct6798/pwm3
 
+# Stop charging the battery at this percent: it lives longer. Stays set when zcool stops.
+# battery.max = 80
+
+# MSI laptops: the EC's own power profile (eco, comfort, sport, turbo) per power source,
+# and `ec = no` to keep zcool away from the EC altogether. See the README.
+# mode.ac = comfort
+# mode.battery = eco
+# ec = no
+
 # Undervolting, Intel only, and only with kernel lockdown off: read the README first.
 # In the BIOS is the better place for it, on Intel and on AMD.
 # undervolt.core = -50

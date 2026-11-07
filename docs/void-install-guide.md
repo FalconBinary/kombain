@@ -675,6 +675,15 @@ doas ln -s /etc/sv/zcool /etc/runit/runsvdir/default/
 doas ln -s /etc/sv/zcool /etc/runit/runsvdir/gaming/
 ```
 
+**Ноутбуки MSI.** Вентиляторами там управляет EC, и `zcool` умеет работать с ним сам: включает Cooler Boost раньше, чем урезать мощность, ставит порог зарядки (`battery.max = 80`) и переключает профили EC на батарее и от сети (`mode.battery = eco`). Это работает только для прошивок EC, которые он знает (GF63 и GF65 Thin), и нужны debugfs и отключённый lockdown (с NVIDIA он уже отключён). Уберите `debugfs=off` из строки `COMMON` в хуке Limine, запустите хук и перезагрузитесь:
+
+```
+doas sed -i 's/ debugfs=off//' /etc/kernel.d/post-install/60-limine
+doas /etc/kernel.d/post-install/60-limine
+```
+
+Что он видит в EC и почему использует его или нет, показывает `zcool list`.
+
 Undervolt через `zcool` не работает при `lockdown=integrity`: делайте его в BIOS. Без lockdown (например, с NVIDIA) `doas zcool undervolt probe` покажет, не закрыла ли его прошивка: он сдвигает напряжение на 1 мВ и сразу возвращает обратно.
 
 Установка Steam:

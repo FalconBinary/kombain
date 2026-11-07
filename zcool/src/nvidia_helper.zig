@@ -94,6 +94,10 @@ fn load() ?Nvml {
 var nvml: ?Nvml = null;
 var ready = false;
 var sandboxed = false;
+/// The library read nothing from a GPU it had not attached: from then on it attaches.
+var attach = false;
+/// What the last failed call returned, for the error line zcool logs.
+var last_rc: c_int = 0;
 
 /// What this process changed on one GPU, to put back.
 const Changed = struct {
@@ -138,9 +142,12 @@ fn entryFor(bus: []const u8) ?*Changed {
 fn start() bool {
     const n = nvml orelse return false;
     if (ready) return true;
-    const rc = if (n.initWithFlags) |f| f(init_no_attach) else n.init.?();
+    const rc = if (n.initWithFlags) |f| f(if (attach) 0 else init_no_attach) else n.init.?();
     ready = rc == success;
-    if (!ready) sys.eprintf("zcool-nvidia: NVIDIA's library did not start ({d})\n", .{rc});
+    if (!ready) {
+        last_rc = rc;
+        sys.eprintf("zcool-nvidia: NVIDIA's library did not start ({d})\n", .{rc});
+    }
     if (!sandboxed) {
         sandboxed = true;
         confine();
@@ -174,7 +181,11 @@ fn device(bus: []const u8) Device {
     var bus_buf: [32]u8 = undefined;
     const bus_z = sys.join(&bus_buf, &.{bus});
     var dev: Device = null;
-    if (nvml.?.byBus(bus_z.ptr, &dev) != success) return null;
+    const rc = nvml.?.byBus(bus_z.ptr, &dev);
+    if (rc != success) {
+        last_rc = rc;
+        return null;
+    }
     return dev;
 }
 
@@ -182,11 +193,15 @@ fn temperature(dev: Device) ?c_int {
     const n = nvml.?;
     if (n.temperatureV) |f| {
         var t = Temperature{ .version = @sizeOf(Temperature) | (1 << 24), .sensor = sensor_gpu, .temperature = 0 };
-        if (f(dev, &t) == success) return t.temperature;
+        const rc = f(dev, &t);
+        if (rc == success) return t.temperature;
+        last_rc = rc;
     }
     if (n.temperature) |f| {
         var t: c_uint = 0;
-        if (f(dev, sensor_gpu, &t) == success) return @intCast(t);
+        const rc = f(dev, sensor_gpu, &t);
+        if (rc == success) return @intCast(t);
+        last_rc = rc;
     }
     return null;
 }
@@ -202,10 +217,20 @@ const Line = struct {
 };
 
 fn read(bus: []const u8) void {
-    const dev = device(bus) orelse return answer("err no device");
+    var dev = device(bus);
+    var temp = if (dev != null) temperature(dev) else null;
+    // A GPU the library has not attached can answer nothing: attach once and ask again.
+    // That costs nothing on a GPU that cannot sleep, and one that can is let go between reads.
+    if (temp == null and !attach) {
+        attach = true;
+        rest();
+        dev = device(bus);
+        temp = if (dev != null) temperature(dev) else null;
+    }
+    if (dev == null) return fail("no device");
     const n = nvml.?;
     var line = Line{};
-    line.add("t", temperature(dev) orelse return answer("err no temperature"));
+    line.add("t", temp orelse return fail("no temperature"));
     var v: c_uint = 0;
     var w: c_uint = 0;
     if (n.power) |f| if (f(dev, &v) == success) line.add("p", v);
@@ -236,6 +261,12 @@ fn read(bus: []const u8) void {
         }
     };
     answer(line.buf[0..line.len]);
+}
+
+/// An error with what the library returned, which `zcool list` and the log show.
+fn fail(what: []const u8) void {
+    var buf: [64]u8 = undefined;
+    answer(std.fmt.bufPrint(&buf, "err {s} (NVML {d})", .{ what, last_rc }) catch "err");
 }
 
 fn answer(text: []const u8) void {
