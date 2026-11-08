@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The embedded controller of MSI laptops: Cooler Boost (both fans at full), the EC's own
-//! power profiles, the battery charge limit, and the temperatures and fan speeds it sees.
+//! The embedded controller of MSI laptops: its fan curves, Cooler Boost (both fans at full),
+//! the EC's own power profiles, the battery charge limit, and the temperatures and fan
+//! speeds it sees.
 //!
 //! It is reached through the kernel's ec_sys, which goes through the kernel's own EC driver,
 //! so zcool never races it. That needs debugfs and `ec_sys write_support=1`; without write
 //! support it is only read. Only firmware listed here is touched, at the addresses the msi-ec
-//! project (github.com/BeardOverflow/msi-ec) lists for it.
+//! project (github.com/BeardOverflow/msi-ec) lists for it, and for the fan curves the ones
+//! isw (github.com/YoyPa/isw) lists for every MSI laptop of its kind.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -18,6 +20,21 @@ const version_len = 12;
 
 /// The EC's own power profiles, as MSI's tools name them.
 pub const Profile = enum { eco, comfort, sport, turbo };
+
+/// MSI's "advanced" fan mode runs each fan by a curve held in the EC: six temperatures, and
+/// the speed in percent below the first, between each two and above the last.
+pub const Curve = struct {
+    advanced: u8,
+    /// for the CPU's fan and the GPU's: where its temperatures start, then its speeds
+    temps: [2]u8,
+    speeds: [2]u8,
+    /// how long one turn takes, two bytes big-endian
+    rpm: [2]u8,
+};
+pub const curve_points = 6;
+/// the temperatures and then the speeds of one fan
+pub const curve_len = 2 * curve_points + 1;
+pub const fan_names = [2][]const u8{ "cpu", "gpu" };
 
 pub const Layout = struct {
     family: []const u8,
@@ -36,6 +53,7 @@ pub const Layout = struct {
     cpu_fan: u8,
     gpu_temp: u8,
     gpu_fan: u8,
+    curve: ?Curve = null,
 };
 
 pub const layouts = [_]Layout{
@@ -59,6 +77,8 @@ pub const layouts = [_]Layout{
         .cpu_fan = 0x71,
         .gpu_temp = 0x80,
         .gpu_fan = 0x89,
+        // isw's MSI_ADDRESS_DEFAULT, and msi-ec's byte for the advanced mode
+        .curve = .{ .advanced = 0x8d, .temps = .{ 0x6a, 0x82 }, .speeds = .{ 0x72, 0x8a }, .rpm = .{ 0xcc, 0xca } },
     },
 };
 
@@ -183,6 +203,45 @@ pub fn setChargeLimit(percent: u8) bool {
     return write(l.charge, 0x80 | percent);
 }
 
+/// Where byte `i` of fan `fan`'s curve is: its temperatures, then its speeds.
+pub fn curveAddr(c: *const Curve, fan: usize, i: usize) u8 {
+    return if (i < curve_points) c.temps[fan] + @as(u8, @intCast(i)) else c.speeds[fan] + @as(u8, @intCast(i - curve_points));
+}
+
+pub fn readCurve(c: *const Curve, fan: usize, out: *[curve_len]u8) bool {
+    for (out, 0..) |*b, i| b.* = read(curveAddr(c, fan, i)) orelse return false;
+    return true;
+}
+
+pub fn writeCurve(c: *const Curve, fan: usize, bytes: *const [curve_len]u8) bool {
+    for (bytes, 0..) |b, i| {
+        if (read(curveAddr(c, fan, i)) == b) continue;
+        if (!write(curveAddr(c, fan, i), b)) return false;
+    }
+    return true;
+}
+
+/// zcool's curve: `speed` below `safe`, and from there every fan at full, so that the EC
+/// still answers the heat by itself if zcool ever stops answering it.
+pub fn ownCurve(speed: u8, safe: u8) [curve_len]u8 {
+    var bytes: [curve_len]u8 = undefined;
+    for (0..curve_points) |i| bytes[i] = safe +| @as(u8, @intCast(i));
+    bytes[curve_points] = speed;
+    for (curve_points + 1..curve_len) |i| bytes[i] = 100;
+    return bytes;
+}
+
+/// A fan's speed: the EC counts how long one turn takes, and 478000 over that is the RPM.
+/// 0 while it stands still.
+pub fn rpm(fan: usize) ?u32 {
+    const c = (layout orelse return null).curve orelse return null;
+    if (fd < 0) return null;
+    var b: [2]u8 = undefined;
+    if ((sys.pread(fd, &b, c.rpm[fan]) orelse 0) != 2) return null;
+    const period = std.mem.readInt(u16, &b, .big);
+    return if (period == 0) 0 else 478000 / @as(u32, period);
+}
+
 pub const Readings = struct { cpu_temp: u8, cpu_fan: u8, gpu_temp: u8, gpu_fan: u8 };
 
 pub fn readings() ?Readings {
@@ -238,4 +297,23 @@ test "profiles are read back by their byte" {
     try std.testing.expectEqualStrings("comfort", profileName(l, 0xc1));
     try std.testing.expectEqualStrings("the firmware's own", profileName(l, 0x80));
     try std.testing.expectEqualStrings("unknown", profileName(l, 0x13));
+}
+
+test "zcool's curve holds one speed below its safe point, full from there" {
+    const bytes = ownCurve(42, 78);
+    try std.testing.expectEqualSlices(u8, &.{ 78, 79, 80, 81, 82, 83 }, bytes[0..curve_points]);
+    try std.testing.expectEqual(@as(u8, 42), bytes[curve_points]);
+    for (bytes[curve_points + 1 ..]) |b| try std.testing.expectEqual(@as(u8, 100), b);
+    // never past what a byte holds
+    try std.testing.expectEqual(@as(u8, 255), ownCurve(0, 252)[5]);
+}
+
+test "a curve's bytes are where isw says" {
+    const c = &layouts[0].curve.?;
+    try std.testing.expectEqual(@as(u8, 0x6a), curveAddr(c, 0, 0));
+    try std.testing.expectEqual(@as(u8, 0x6f), curveAddr(c, 0, 5));
+    try std.testing.expectEqual(@as(u8, 0x72), curveAddr(c, 0, 6));
+    try std.testing.expectEqual(@as(u8, 0x78), curveAddr(c, 0, 12));
+    try std.testing.expectEqual(@as(u8, 0x82), curveAddr(c, 1, 0));
+    try std.testing.expectEqual(@as(u8, 0x90), curveAddr(c, 1, 12));
 }

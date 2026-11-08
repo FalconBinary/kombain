@@ -106,6 +106,8 @@ const Chip = struct {
     throttle: control.Throttle = .{},
     quiet: control.Quiet = .{},
     learned: control.Learned = .{},
+    /// how hard its fans run
+    drive: control.FanDrive = .{},
     learned_logged: bool = false,
     /// what was last written to disk
     learned_saved: f32 = 0,
@@ -177,6 +179,11 @@ const Fan = struct {
     nv_index: i8 = -1,
     /// an MSI laptop's Cooler Boost: both fans at full, or the firmware's curve
     ec_boost: bool = false,
+    /// an MSI laptop's fans through a curve of zcool's own, with Cooler Boost on top
+    ec_curve: bool = false,
+    boost_on: bool = false,
+    /// how long Cooler Boost has been on: the fans take a while to get there
+    full_for: f32 = 0,
 
     fn name(self: *const Fan) []const u8 {
         return self.id[0..self.id_len];
@@ -577,18 +584,30 @@ fn discover() void {
     addEcFan();
 }
 
-/// An MSI laptop's EC: Cooler Boost joins as one of the board's fans, which cool every chip.
+/// An MSI laptop's EC: its fans join as the board's, which cool every chip. Through a curve of
+/// zcool's own they run at any speed, with Cooler Boost past full; without it only Cooler
+/// Boost, which is full or the firmware's curve.
 fn addEcFan() void {
     if (!cfg.use_ec) return;
     ec.open();
-    if (ec.layout == null or !ec.writable or nfans == max_fans) return;
-    const id = "ec/cooler_boost";
-    if (cfg.isExcluded(id)) return;
-    var fan = Fan{ .owner = -1, .ec_boost = true };
-    @memcpy(fan.id[0..id.len], id);
-    fan.id_len = id.len;
+    const l = ec.layout orelse return;
+    if (!ec.writable or nfans == max_fans) return;
+    var fan = Fan{ .owner = -1 };
+    if (cfg.fan_curve and l.curve != null and !cfg.isExcluded("ec/fans")) {
+        fan.ec_curve = true;
+        nameFan(&fan, "ec/fans");
+    } else {
+        if (cfg.isExcluded("ec/cooler_boost")) return;
+        fan.ec_boost = true;
+        nameFan(&fan, "ec/cooler_boost");
+    }
     fans[nfans] = fan;
     nfans += 1;
+}
+
+fn nameFan(fan: *Fan, id: []const u8) void {
+    @memcpy(fan.id[0..id.len], id);
+    fan.id_len = @intCast(id.len);
 }
 
 /// A GPU on NVIDIA's own driver. Its limits and fans come with the first reading, which is
@@ -716,6 +735,7 @@ fn addNvidiaFans(c: *Chip, index: usize, count: u8) void {
 
 /// Each value is read once: what the journal keeps is what `releaseFan` writes back.
 fn takeFan(fan: *Fan) bool {
+    if (fan.ec_curve) return takeCurve(fan);
     if (fan.ec_boost) {
         // on already, from the key on the keyboard say: it stays on
         const on = ec.boost() orelse return false;
@@ -765,6 +785,7 @@ fn takeFan(fan: *Fan) bool {
 fn releaseFan(fan: *Fan) void {
     fan.managed = false;
     if (dry_run) return;
+    if (fan.ec_curve) return restoreCurve(fan);
     if (fan.ec_boost) {
         _ = ec.setBoost(fan.orig_pwm != 0);
         return;
@@ -786,6 +807,7 @@ fn releaseFan(fan: *Fan) void {
 }
 
 fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
+    fan.full_for = if (fan.ec_boost and fan.managed and fan.written == 1) fan.full_for + dt else 0;
     if (fan.unusable) return;
     if (!fan.managed) {
         if (demand <= 0) return;
@@ -803,6 +825,8 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
         fan.managed = true;
         if (fan.ec_boost) {
             sys.printf("{s}: taking over, it was {s}\n", .{ fan.name(), if (fan.written == 1) "on" else "off" });
+        } else if (fan.ec_curve) {
+            sys.printf("{s}: taking over from {d:.0}%{s}\n", .{ fan.name(), fan.floor * 100 / 255, if (fan.boost_on) ", Cooler Boost on" else "" });
         } else {
             sys.printf("{s}: taking over from {d:.0}/255\n", .{ fan.name(), fan.floor });
         }
@@ -814,6 +838,7 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
         return;
     }
     if (fan.ec_boost) return updateBoost(fan);
+    if (fan.ec_curve) return updateCurve(fan, dt);
     const duty: i64 = @intFromFloat(@round(fan.ctl.duty));
     if (fan.written < 0 or @abs(duty - fan.written) >= 2 or (duty == 255 and fan.written != 255)) {
         if (!dry_run) {
@@ -839,6 +864,160 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
             fan.stall_logged = true;
         }
     }
+}
+
+// ---------------------------------------------------------------- an MSI laptop's fans by zcool's curve
+
+/// What the EC held before zcool's curve: its fan mode and each fan's curve, put back when
+/// zcool lets go. Also in the journal, for whatever ends zcool.
+var curve_mode: u8 = 0;
+var curve_original: [2][ec.curve_len]u8 = undefined;
+/// zcool's curve runs a fan at full this far over the highest limit of its chips, by the EC alone
+const curve_safe_above: f32 = 8;
+/// a fan the EC has been seen turning: only then does an RPM of 0 mean it stands still
+var rpm_seen: [2]bool = .{ false, false };
+/// Cooler Boost on top of the curve once it is at full, off again below this: well below, or
+/// it goes off as soon as the power taken brings the chip back, and on again with the next heat
+const curve_boost_off: f32 = 191;
+
+/// The EC reads the CPU for the first fan's curve and the GPU for the second's.
+fn curveSafePoint(fan: usize) u8 {
+    var highest: f32 = 0;
+    var any: f32 = 0;
+    for (chips[0..nchips]) |*c| {
+        if (!c.controlled()) continue;
+        const limit = @max(c.base_limit, c.limit);
+        any = @max(any, limit);
+        if (c.kind == (if (fan == 0) Kind.cpu else Kind.gpu)) highest = @max(highest, limit);
+    }
+    if (highest == 0) highest = if (any > 0) any else 85;
+    return @intFromFloat(std.math.clamp(highest + curve_safe_above, 60, 98));
+}
+
+fn takeCurve(fan: *Fan) bool {
+    const l = ec.layout.?;
+    const c = &l.curve.?;
+    const mode = ec.read(l.fan_mode) orelse return false;
+    if (mode == c.advanced and !fan.journaled) {
+        // a curve someone chose in MSI's tools: it stays theirs
+        sys.printf("{s}: the EC runs a fan curve someone chose, zcool keeps to Cooler Boost\n", .{fan.name()});
+        return boostInstead(fan);
+    }
+    const r = ec.readings() orelse return false;
+    const on = ec.boost() orelse return false;
+    var originals: [2][ec.curve_len]u8 = undefined;
+    for (0..2) |i| if (!ec.readCurve(c, i, &originals[i])) return false;
+    // never below what the firmware runs them at now, and a boost already on stays on
+    const speed: f32 = @floatFromInt(@min(@max(r.cpu_fan, r.gpu_fan), 100));
+    fan.floor = if (on) 255 else speed * 255 / 100;
+    fan.ctl = .{ .duty = fan.floor };
+    fan.boost_on = on;
+    fan.written = -1;
+    if (dry_run) return true;
+    if (!fan.journaled) {
+        var path_buf: [256]u8 = undefined;
+        const p = ec.path(&path_buf);
+        // the mode first: newest first on the way back, so it goes back last, onto its own curve
+        if (!journal.rememberByte(p, l.fan_mode, null, mode)) return false;
+        for (0..2) |i| for (0..ec.curve_len) |k| {
+            if (!journal.rememberByte(p, ec.curveAddr(c, i, k), null, originals[i][k])) return false;
+        };
+        if (!journal.rememberByte(p, l.boost, l.boost_bit, @intFromBool(on))) return false;
+        fan.orig_pwm = @intFromBool(on);
+        curve_original = originals;
+        // the silent curve was zcool's: the one before it goes back
+        curve_mode = fan_mode_original orelse mode;
+        fan.journaled = true;
+    }
+    // the curve holds the mode byte now; the silent curve may come back once it lets go
+    silent_now = false;
+    const percent: u8 = @intFromFloat(@round(fan.floor * 100 / 255));
+    if (!setCurve(percent)) {
+        restoreCurve(fan);
+        sys.printf("{s}: the EC did not take zcool's curve, zcool keeps to Cooler Boost\n", .{fan.name()});
+        return boostInstead(fan);
+    }
+    fan.written = percent;
+    return true;
+}
+
+/// Every fan at `percent` below the safe point, and the mode that runs the curve.
+fn setCurve(percent: u8) bool {
+    const l = ec.layout.?;
+    const c = &l.curve.?;
+    for (0..2) |i| {
+        const bytes = ec.ownCurve(percent, curveSafePoint(i));
+        if (!ec.writeCurve(c, i, &bytes)) return false;
+    }
+    if (!ec.write(l.fan_mode, c.advanced)) return false;
+    return ec.read(l.fan_mode) == c.advanced and ec.read(c.speeds[0]) == percent;
+}
+
+fn restoreCurve(fan: *Fan) void {
+    if (dry_run or !fan.journaled) return;
+    const l = ec.layout.?;
+    for (0..2) |i| _ = ec.writeCurve(&l.curve.?, i, &curve_original[i]);
+    _ = ec.write(l.fan_mode, curve_mode);
+    _ = ec.setBoost(fan.orig_pwm != 0);
+    fan.boost_on = fan.orig_pwm != 0;
+}
+
+/// The fans as Cooler Boost alone, as zcool ran them before it had curves.
+fn boostInstead(fan: *Fan) bool {
+    fan.ec_curve = false;
+    fan.ec_boost = true;
+    nameFan(fan, "ec/cooler_boost");
+    if (cfg.isExcluded("ec/cooler_boost")) {
+        fan.unusable = true;
+        return false;
+    }
+    return takeFan(fan);
+}
+
+fn updateCurve(fan: *Fan, dt: f32) void {
+    const l = ec.layout.?;
+    const c = &l.curve.?;
+    const percent: u8 = @intFromFloat(@round(fan.ctl.duty * 100 / 255));
+    if (!dry_run and ec.read(l.fan_mode) != c.advanced) {
+        // the EC goes back to its own curve by itself, as the power source changes say
+        sys.printf("{s}: the EC went back to its own curve, zcool's again\n", .{fan.name()});
+        if (!setCurve(percent)) return curveFailed(fan);
+        fan.written = percent;
+        if (fan.boost_on and ec.boost() == false and !ec.setBoost(true)) return curveFailed(fan);
+    }
+    if (fan.written < 0 or @abs(@as(i64, percent) - fan.written) >= 2 or (percent == 100 and fan.written != 100)) {
+        if (!dry_run) {
+            for (c.speeds) |addr| if (!ec.write(addr, percent)) return curveFailed(fan);
+        }
+        fan.written = percent;
+    }
+    // past full: Cooler Boost, and off only once the fans have come well down
+    const boost = if (fan.ctl.duty >= 254) true else if (fan.ctl.duty < curve_boost_off) false else fan.boost_on;
+    if (boost != fan.boost_on) {
+        if (!dry_run and !ec.setBoost(boost)) return curveFailed(fan);
+        sys.printf("{s}: Cooler Boost {s}\n", .{ fan.name(), if (boost) "on, every fan past full" else "off" });
+        fan.boost_on = boost;
+    }
+    if (percent < 50) {
+        fan.stalled_for = 0;
+        return;
+    }
+    var still: ?usize = null;
+    for (0..2) |i| {
+        const rpm = ec.rpm(i) orelse continue;
+        if (rpm > 0) rpm_seen[i] = true else if (rpm_seen[i]) still = i;
+    }
+    fan.stalled_for = if (still != null) fan.stalled_for + dt else 0;
+    if (fan.stalled_for >= 5 and !fan.stall_logged) {
+        sys.printf("{s}: the {s} fan is set to {d}% and not turning. Check this fan\n", .{ fan.name(), ec.fan_names[still.?], percent });
+        fan.stall_logged = true;
+    }
+}
+
+fn curveFailed(fan: *Fan) void {
+    sys.printf("{s}: write failed, leaving it to the firmware\n", .{fan.name()});
+    releaseFan(fan);
+    fan.unusable = true;
 }
 
 /// Cooler Boost has two speeds: on near the limit, and off only once the fans would have come
@@ -1178,10 +1357,23 @@ fn fanServes(fan: *const Fan, index: usize) bool {
 fn noMoreCooling(index: usize) bool {
     for (fans[0..nfans]) |*f| {
         if (f.unusable or !fanServes(f, index)) continue;
-        if (!f.managed or f.ctl.duty < 254) return false;
+        if (!f.managed) return false;
+        if (!atFull(f, 254)) return false;
     }
     return true;
 }
+
+/// Cooler Boost on is every fan at full, whatever the duty behind it says. Taken for room,
+/// power went back while the fans had none, and on the GF63 the chip went over its limit. On
+/// the way up the duty says it as before; once the fans have had time to spin up, the boost
+/// does. zcool's curve gets there by the duty itself, so the boost on top is full at once.
+fn atFull(f: *const Fan, duty: f32) bool {
+    if (f.ec_boost) return f.written == 1 and (f.ctl.duty >= duty or f.full_for >= ec_spin_up);
+    if (f.ec_curve and f.boost_on) return true;
+    return f.ctl.duty >= duty;
+}
+
+const ec_spin_up: f32 = 2;
 
 /// Quiet mode is on for the power source zcool is on now.
 var quiet_now: bool = false;
@@ -1261,6 +1453,7 @@ fn adaptFanMode(dt: f32) void {
     }
     for (fans[0..nfans]) |*f| {
         if (f.ec_boost and f.written == 1) busy = true;
+        if (f.ec_curve and f.managed) return;
     }
     const want = fan_mode.update(margin, dt) and !busy;
     if (want != silent_now) setSilent(want);
@@ -1300,17 +1493,25 @@ fn step(dt: f32) void {
     adaptFanMode(dt);
     // quiet mode: whether each chip lets its fans past the firmware's curve yet
     var loud: [max_chips]bool = undefined;
+    var wants: [max_chips]f32 = undefined;
     for (chips[0..nchips], 0..) |*c, index| {
         const quiet = quiet_now and c.controlled() and hasPowerLever(c);
         loud[index] = c.quiet.update(quiet, &c.thermal, c.limit, c.throttle.level, c.emergency, dt);
+        wants[index] = 0;
+        if (!c.controlled() or !c.thermal.ready or c.asleep) continue;
+        if (!loud[index]) {
+            c.drive = .{};
+            continue;
+        }
+        const d = c.drive.update(&c.thermal, c.limit, dt);
+        // a chip going through its critical point gets everything at once
+        wants[index] = if (c.emergency) 1 else d;
     }
     for (fans[0..nfans]) |*f| {
         var demand: f32 = 0;
         for (chips[0..nchips], 0..) |*c, index| {
             if (!c.controlled() or !c.thermal.ready or c.asleep or !fanServes(f, index)) continue;
-            // a chip going through its critical point gets everything at once
-            const d = if (c.emergency) 1 else if (loud[index]) control.fanDemand(c.thermal.forecast(), c.limit) else 0;
-            demand = @max(demand, d);
+            demand = @max(demand, wants[index]);
         }
         updateFan(f, demand, dt);
     }
@@ -1344,10 +1545,7 @@ fn step(dt: f32) void {
 fn nearlyNoMoreCooling(index: usize) bool {
     for (fans[0..nfans]) |*f| {
         if (f.unusable or !fanServes(f, index)) continue;
-        if (!f.managed) return false;
-        if (f.ec_boost) {
-            if (f.written != 1) return false;
-        } else if (f.ctl.duty < 230) return false;
+        if (!f.managed or !atFull(f, 230)) return false;
     }
     return true;
 }
@@ -1380,13 +1578,16 @@ fn report(c: *Chip, loud: bool) void {
             sys.printf("{s}: {d:.1}C, full power again\n", .{ c.name(), c.thermal.temp });
         }
     }
-    const over = c.thermal.temp > c.limit + 2;
+    // over at 2 C past the limit, back under only at it, so one reading does not say both
+    const over = if (c.over_logged) c.thermal.temp > c.limit else c.thermal.temp > c.limit + 2;
     if (over != c.over_logged) {
         c.over_logged = over;
         if (over and c.no_actuator) {
             sys.printf("{s}: {d:.1}C is over the {d:.0}C limit and only fans can help it\n", .{ c.name(), c.thermal.temp, c.limit });
         } else if (over) {
             sys.printf("{s}: {d:.1}C is over the {d:.0}C limit\n", .{ c.name(), c.thermal.temp, c.limit });
+        } else {
+            sys.printf("{s}: {d:.1}C, back under the limit\n", .{ c.name(), c.thermal.temp });
         }
     }
 }
@@ -1712,7 +1913,10 @@ fn runDaemon(selftest: bool) u8 {
     discover();
     if (cfg.learn) loadLearned();
     if (ec.layout != null) {
-        sys.printf("ec: {s}, {s}\n", .{ ec.version(), if (ec.writable) "Cooler Boost joins the fans" else "read only: load ec_sys with write_support=1" });
+        var curve = false;
+        for (fans[0..nfans]) |*f| curve = curve or f.ec_curve;
+        const what: []const u8 = if (!ec.writable) "read only: load ec_sys with write_support=1" else if (curve) "its fans join, at the speed zcool sets and Cooler Boost past full" else "Cooler Boost joins the fans";
+        sys.printf("ec: {s}, {s}\n", .{ ec.version(), what });
     } else if (cfg.use_ec and !ec.present and isMsi()) {
         sys.printf("ec: not reached, {s}\n", .{noEcReason()});
     }
@@ -1838,6 +2042,16 @@ fn listChips() void {
             sys.printf("{s:<24} {s:>5}      -\n", .{ f.name(), if (ec.boost() orelse false) "full" else "auto" });
             continue;
         }
+        if (f.ec_curve) {
+            const l = ec.layout.?;
+            const c = &l.curve.?;
+            var speed_buf: [8]u8 = undefined;
+            var rpm_buf: [8]u8 = undefined;
+            const speed: []const u8 = if (ec.boost() orelse false) "full" else if (ec.read(l.fan_mode) != c.advanced) "auto" else if (ec.read(c.speeds[0])) |p| std.fmt.bufPrint(&speed_buf, "{d}%", .{p}) catch "?" else "?";
+            const rpm: []const u8 = if (ec.rpm(0)) |v| std.fmt.bufPrint(&rpm_buf, "{d}", .{v}) catch "?" else "-";
+            sys.printf("{s:<24} {s:>5}  {s:>5}\n", .{ f.name(), speed, rpm });
+            continue;
+        }
         if (f.nv_index >= 0) {
             const c = &chips[@intCast(f.owner)];
             sys.printf("{s:<24} {d:>4}%      -\n", .{ f.name(), c.nv.fan[@intCast(f.nv_index)] });
@@ -1876,7 +2090,11 @@ fn listPower() void {
     var guard_buf: [128]u8 = undefined;
     if (guard.summary(&guard_buf)) |text| sys.printf("guard: {s}\n", .{text});
     var tcc_buf: [128]u8 = undefined;
-    if (tcc.describe(&tcc_buf)) |text| sys.printf("tcc: {s}\n", .{text});
+    if (tcc.describe(&tcc_buf)) |text| {
+        sys.printf("tcc: {s}\n", .{text});
+    } else if (cfg.tcc and undervolt.isIntel() and std.os.linux.getuid() != 0) {
+        sys.print("tcc: only root reads where the CPU throttles itself: doas zcool list\n");
+    }
     loadLearned();
     var first = true;
     for (chips[0..nchips]) |*c| {
@@ -1909,6 +2127,12 @@ fn listEc() void {
     else
         "not supported";
     sys.printf("  cooler boost {s}, profile {s}, charge limit {s}\n", .{ boost, profile, charge });
+    const c = l.curve orelse return;
+    const mode = ec.read(l.fan_mode) orelse return;
+    const curve: []const u8 = if (mode == c.advanced) "the advanced curve, zcool's while it holds the fans" else if (mode == l.fan_silent) "the firmware's silent curve" else if (mode == l.fan_auto) "the firmware's normal curve" else "unknown";
+    sys.printf("  fans by {s}", .{curve});
+    for (0..2) |i| if (ec.rpm(i)) |rpm| sys.printf("{s}{s} {d} rpm", .{ if (i == 0) "; " else ", ", ec.fan_names[i], rpm });
+    sys.print("\n");
 }
 
 /// What keeps zcool from an MSI laptop's EC, the first thing to fix first.

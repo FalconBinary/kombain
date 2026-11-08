@@ -10,6 +10,7 @@
 //!     battery.max = 80       stop charging at 80%
 //!     learn = no             do not learn what the cooler carries
 //!     fan.silent = no        keep an MSI EC's normal fan curve when cool
+//!     fan.curve = no         an MSI EC's fans: only Cooler Boost, never zcool's curve
 //!     guard.cpu = no         jobs keep their CPU share under pressure
 //!     guard.memory = no      never end a process that starves memory
 //!     tcc = no               leave the CPU's own throttle at TjMax
@@ -70,6 +71,8 @@ pub const Config = struct {
     learn: bool = true,
     /// an MSI EC's silent fan curve while every chip is cool
     fan_silent: bool = true,
+    /// an MSI EC's fans at the speed zcool sets, through a curve of its own
+    fan_curve: bool = true,
     /// jobs yield the CPU to the desktop under pressure
     guard_cpu: bool = true,
     /// a memory hog is ended before the system stalls
@@ -146,6 +149,10 @@ fn apply(c: *Config, key: []const u8, value: []const u8) bool {
     }
     if (std.mem.eql(u8, key, "fan.silent")) {
         c.fan_silent = yesNo(value) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "fan.curve")) {
+        c.fan_curve = yesNo(value) orelse return false;
         return true;
     }
     if (std.mem.eql(u8, key, "guard.cpu")) {
@@ -393,9 +400,9 @@ test "what changes with the power source" {
     try std.testing.expectEqual(@as(i8, 0), c.ac.shift);
     try std.testing.expect(!c.learn);
     try std.testing.expectEqual(@as(u32, 5), c.bad_lines);
-    const g = parse("fan.silent = no\nguard.cpu = no\nguard.memory = no\ntcc = no\n");
-    try std.testing.expect(!g.fan_silent and !g.guard_cpu and !g.guard_memory and !g.tcc and g.bad_lines == 0);
-    try std.testing.expect(c.fan_silent and c.guard_cpu and c.guard_memory);
+    const g = parse("fan.silent = no\nguard.cpu = no\nguard.memory = no\ntcc = no\nfan.curve = no\n");
+    try std.testing.expect(!g.fan_silent and !g.guard_cpu and !g.guard_memory and !g.tcc and !g.fan_curve and g.bad_lines == 0);
+    try std.testing.expect(c.fan_silent and c.guard_cpu and c.guard_memory and c.fan_curve);
     try std.testing.expect(c.ac.any() and c.battery.any());
     try std.testing.expect(c.source(false) == &c.battery);
 }

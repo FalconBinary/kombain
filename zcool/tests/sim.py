@@ -36,9 +36,13 @@ class Chip:
     """One chip with a heat load, a thermal mass and a conductance that depends on its fan,
     and for a GPU in a case a little on the case fan too."""
 
-    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0):
+    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0, r_die=0.0):
         self.load, self.g_min, self.g_max, self.mass, self.g_case = load, g_min, g_max, mass, g_case
         self.temp, self.ambient = temp, ambient
+        # a laptop CPU's die sits above its heat sink by what flows through it: its sensor jumps
+        # with the power at once, while the sink takes its time
+        self.r_die = r_die
+        self.reading = temp
         self.work = 0.0
         self.time = 0.0
         self.peak = temp
@@ -48,9 +52,9 @@ class Chip:
         self.power = 0.0
 
     def step(self, dt, allowed_power, speed, duty, limit, case_duty=0):
-        if self.temp >= 100:
+        if self.reading >= 100:
             self.prochot = True
-        elif self.temp < 95:
+        elif self.reading < 95:
             self.prochot = False
         power = min(self.load, allowed_power)
         perf = speed * (power / self.load) ** 0.4 if self.load > 0 else 1
@@ -61,10 +65,11 @@ class Chip:
         g = self.g_min + (self.g_max - self.g_min) * duty / 255 + self.g_case * case_duty / 255
         self.power = power * speed ** 2.5
         self.temp += (self.power - (self.temp - self.ambient) * g) * dt / self.mass
+        self.reading = self.temp + self.power * self.r_die
         self.work += perf * dt
         self.time += dt
-        self.peak = max(self.peak, self.temp)
-        if limit and self.temp > limit:
+        self.peak = max(self.peak, self.reading)
+        if limit and self.reading > limit:
             self.over += dt
 
     @property
@@ -87,15 +92,28 @@ class Nvidia:
 
 class Ec:
     """An MSI laptop's embedded controller as ec_sys shows it: 256 bytes with the firmware version
-    at 0xa0. Cooler Boost (0x98, bit 7) runs both fans at full; off, the firmware's curve runs them.
-    The other bits of 0x98 are the firmware's own and must survive."""
+    at 0xa0. Cooler Boost (0x98, bit 7) runs both fans at full; off, the firmware's curve runs them,
+    or in the advanced mode the curve held at 0x6a/0x72 for the CPU's fan and 0x82/0x8a for the
+    GPU's. The other bits of 0x98 are the firmware's own and must survive."""
 
     BOOST, PROFILE, CHARGE, CPU_TEMP, GPU_TEMP, FAN_MODE = 0x98, 0xf2, 0xef, 0x68, 0x80, 0xf4
     AUTO, SILENT, ADVANCED = 0x0d, 0x1d, 0x8d
+    CURVES = ((0x6a, 0x72), (0x82, 0x8a))
+    FAN_SPEED, FAN_RPM = (0x71, 0x89), (0xcc, 0xca)
+    # what isw lists for a GF63: MSI's advanced curve until someone changes it
+    CURVE = bytes([55, 64, 73, 76, 82, 88, 35, 38, 42, 45, 50, 55, 62])
 
-    def __init__(self, firmware="16R5EMS1.102", writable=True, boost=0x05, profile=0xc1, charge=0x80, mains=True, fan_mode=0x0d):
-        self.firmware, self.writable, self.mains = firmware, writable, mains
+    def __init__(self, firmware="16R5EMS1.102", writable=True, boost=0x05, profile=0xc1, charge=0x80, mains=True, fan_mode=0x0d,
+                 stalled=False):
+        self.firmware, self.writable, self.mains, self.stalled = firmware, writable, mains, stalled
         self.initial = {self.BOOST: boost, self.PROFILE: profile, self.CHARGE: charge, self.FAN_MODE: fan_mode}
+        for temps, speeds in self.CURVES:
+            for i in range(6):
+                self.initial[temps + i] = self.CURVE[i]
+            for i in range(7):
+                self.initial[speeds + i] = self.CURVE[6 + i]
+        # the fans spin up and down over a second or two, not at once
+        self.spin = [30.0, 30.0]
 
 
 class Machine:
@@ -242,17 +260,35 @@ class Machine:
     def boost(self):
         return bool(self.ec_byte(Ec.BOOST) & 0x80)
 
-    def ec_duty(self):
-        """Both fans at full with Cooler Boost, else the firmware's own curve for the hotter chip."""
+    def ec_target(self):
+        """Each fan's speed in percent: full with Cooler Boost; in the advanced mode its curve at
+        the EC's reading of its chip; else the firmware's own curve for the hotter chip."""
         if self.boost():
-            return 255
-        temp = self.cpu.temp if self.cpu else 40
-        if self.nv and self.nv.chip:
-            temp = max(temp, self.nv.chip.temp)
-        if self.ec_byte(Ec.FAN_MODE) == Ec.SILENT:
+            return [100, 100]
+        cpu = self.cpu.reading if self.cpu else 40
+        gpu = self.nv.chip.temp if self.nv and self.nv.chip and self.nv_status() != "suspended" else 0
+        mode = self.ec_byte(Ec.FAN_MODE)
+        if mode == Ec.ADVANCED:
+            speeds = []
+            for (temps, at), temp in zip(Ec.CURVES, (cpu, gpu)):
+                points = [self.ec_byte(temps + i) for i in range(6)]
+                step = sum(1 for p in points if int(temp) > p)
+                speeds.append(min(self.ec_byte(at + step), 100))
+            return speeds
+        temp = max(cpu, gpu)
+        if mode == Ec.SILENT:
             # the firmware's silent curve: slower, but it still answers the heat
-            return min(255, max(40, 40 + (temp - 50) * 1.2))
-        return min(255, max(70, 70 + (temp - 50) * 1.5))
+            duty = min(255, max(40, 40 + (temp - 50) * 1.2))
+        else:
+            duty = min(255, max(70, 70 + (temp - 50) * 1.5))
+        return [duty * 100 / 255] * 2
+
+    def ec_duty(self, dt=0.05):
+        """Both fans cool the one heat pipe: their mean speed, as they spin up or down to it."""
+        for i, target in enumerate(self.ec_target()):
+            self.ec.spin[i] += (target - self.ec.spin[i]) * min(1, dt / 0.8)
+        mean = sum(self.ec.spin) / 2
+        return 255 if mean >= 99.5 else mean * 255 / 100
 
     def nv_status(self, value=None):
         path = f"{self.root}/sys/bus/pci/devices/{self.nv.bus}/power/runtime_status"
@@ -310,12 +346,20 @@ class Machine:
     def publish(self):
         if self.ec:
             if self.cpu:
-                self.ec_set(Ec.CPU_TEMP, int(self.cpu.temp))
+                self.ec_set(Ec.CPU_TEMP, int(self.cpu.reading))
             if self.nv and self.nv.chip:
                 self.ec_set(Ec.GPU_TEMP, int(self.nv.chip.temp))
+            for i in range(2):
+                speed = 0 if self.ec.stalled and i == 0 else self.ec.spin[i]
+                self.ec_set(Ec.FAN_SPEED[i], int(round(self.ec.spin[i])))
+                # the EC counts how long a turn takes: 478000 / rpm, about 50 rpm per percent
+                period = 0 if speed < 1 else 478000 // int(speed * 50)
+                fd = os.open(self.ec_path, os.O_WRONLY)
+                os.pwrite(fd, struct.pack(">H", period), Ec.FAN_RPM[i])
+                os.close(fd)
         if self.cpu:
-            self._write_temp(f"{self.cpu_dir}/temp1_input", self.cpu.temp)
-            self._write_temp(f"{self.cpu_dir}/temp2_input", self.cpu.temp + 1)
+            self._write_temp(f"{self.cpu_dir}/temp1_input", self.cpu.reading)
+            self._write_temp(f"{self.cpu_dir}/temp2_input", self.cpu.reading + 1)
         if self.gpu:
             self._write_temp(f"{self.gpu_dir}/temp1_input", self.gpu.temp)
         if self.nv and self.nv.chip and self.nv_status() != "suspended":
@@ -330,7 +374,7 @@ class Machine:
             return 0
         if self.read(enable) != "1":
             # firmware's own curve, deliberately lazy
-            temp = self.gpu.temp if directory == self.gpu_dir and self.gpu else (self.cpu.temp if self.cpu else 40)
+            temp = self.gpu.temp if directory == self.gpu_dir and self.gpu else (self.cpu.reading if self.cpu else 40)
             if directory == self.board_dir:
                 # a laptop's fan cools the GPU with the CPU, and its firmware watches both
                 if self.nv and not self.nv.fans and self.nv.chip:
@@ -354,8 +398,8 @@ class Machine:
             dt, last = now - last, now
             board = self.duty(self.board_dir, 1, 70) if self.cpu_fan else 0
             if self.ec:
-                board = self.ec_duty()
-                if board == 255 and self.first_boost is None and self.boost():
+                board = self.ec_duty(dt)
+                if self.first_boost is None and self.boost():
                     self.first_boost = now
             if self.cpu_fan and self.first_case is None and self.read(f"{self.board_dir}/pwm1_enable") == "1":
                 self.first_case = now
@@ -1158,12 +1202,14 @@ def undervolt_is_skipped_after_a_crash(r):
 
 
 EC_CONFIG = "cpu0.max = 85\n"
+# the fans as zcool ran them before it had curves: Cooler Boost, full or the firmware's curve
+BOOST_CONFIG = EC_CONFIG + "fan.curve = no\n"
 
 
 @scenario
 def an_msi_laptop_boosts_its_fans_before_taking_power(r):
     # no fan in hwmon: only the EC's Cooler Boost, and more heat than the fans can carry
-    m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+    m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=BOOST_CONFIG)
     m.start()
     m.advance(40, limit_cpu=85)
     log = m.text()
@@ -1186,7 +1232,7 @@ def an_msi_laptop_boosts_its_fans_before_taking_power(r):
 @scenario
 def cooler_boost_goes_back_however_zcool_ends(r):
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+        m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=BOOST_CONFIG)
         m.start()
         m.advance(25, limit_cpu=85)
         r.check(m.boost(), f"{sig.name}: boost never came on")
@@ -1279,7 +1325,9 @@ def an_ec_zcool_does_not_know_or_cannot_write_is_left_alone(r):
         m.advance(15, limit_cpu=85)
         m.stop()
         after = open(m.ec_path, "rb").read()
-        changed = [hex(i) for i in range(256) if before[i] != after[i] and i not in (Ec.CPU_TEMP, Ec.GPU_TEMP)]
+        # what the simulated EC itself reads: temperatures, fan speeds and RPM
+        own = (Ec.CPU_TEMP, Ec.GPU_TEMP) + Ec.FAN_SPEED + tuple(a + i for a in Ec.FAN_RPM for i in (0, 1))
+        changed = [hex(i) for i in range(256) if before[i] != after[i] and i not in own]
         r.check(not changed, f"{ec.firmware}: written at {changed}")
         m.close()
 
@@ -1292,7 +1340,8 @@ def list_shows_the_ec(r):
     out = m.cmd("list").stdout
     r.check("ec: 16R5EMS1.102, GF63/GF65 Thin" in out, out)
     r.check("cooler boost off, profile the firmware's own, charge limit 80%" in out, out)
-    r.check("ec/cooler_boost" in out and "auto" in out, out)
+    r.check("ec/fans" in out and "auto" in out, out)
+    r.check("fans by the firmware's normal curve; cpu " in out and " rpm, gpu " in out, out)
     r.check("cpu 55C, fan 45%" in out, out)
     m.close()
 
@@ -1397,7 +1446,7 @@ def on_battery_every_limit_is_lower(r):
 @scenario
 def quiet_gives_a_little_power_before_cooler_boost(r):
     # the firmware's curve carries about 100 W at 85 C, Cooler Boost 165 W
-    m = Machine(cpu=Chip(load=110, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config="cpu0.max = 85\nnoise.ac = quiet\n")
+    m = Machine(cpu=Chip(load=110, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=BOOST_CONFIG + "noise.ac = quiet\n")
     m.start()
     m.advance(40, limit_cpu=85)
     log = m.text()
@@ -1409,7 +1458,7 @@ def quiet_gives_a_little_power_before_cooler_boost(r):
     m.stop()
     m.close()
     # more than a little power can cover: then Cooler Boost comes, after the power
-    m = Machine(cpu=Chip(load=160, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config="cpu0.max = 85\nnoise.ac = quiet\n")
+    m = Machine(cpu=Chip(load=160, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=BOOST_CONFIG + "noise.ac = quiet\n")
     m.start()
     m.advance(50, limit_cpu=85)
     log = m.text()
@@ -1417,9 +1466,10 @@ def quiet_gives_a_little_power_before_cooler_boost(r):
             f"power trimmed at {m.first_trim}, boost at {m.first_boost}")
     r.check("the fans join in" in log, log[-400:])
     r.check(m.cpu.peak <= 87, f"peak {m.cpu.peak:.1f}")
-    # with the boost on it gets its power back, and the boost stays while the load does
+    # with the boost on it gets its power back, all but the last percent this close to the
+    # limit, and the boost stays while the load does
     r.check(m.boost(), "the boost should stay on while the load lasts")
-    r.check(float(m.read(m.rapl_path)) >= 290e6 or "full power again" in log, f"cap {m.read(m.rapl_path)}")
+    r.check(float(m.read(m.rapl_path)) >= 0.98 * 160e6 or "full power again" in log, f"cap {m.read(m.rapl_path)}")
     r.note(f"160 W: power first, then the boost; peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
     m.stop()
     m.close()
@@ -1705,6 +1755,128 @@ def the_burst_limit_goes_down_with_the_long_one(r):
     r.note(f"long-term limit alone: peak {m.cpu.peak:.1f} C, settled {min(temps):.1f}..{max(temps):.1f} C")
     m.stop()
     m.close()
+
+
+def ec_curve(m, fan=0):
+    temps, speeds = Ec.CURVES[fan]
+    return bytes(m.ec_byte(temps + i) for i in range(6)) + bytes(m.ec_byte(speeds + i) for i in range(7))
+
+
+@scenario
+def an_msi_laptops_fans_follow_the_heat_through_zcools_curve(r):
+    # 100 W: more than the firmware's curve carries at 85 C, far less than every fan at full
+    m = Machine(cpu=Chip(load=100, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+    m.start()
+    speeds = []
+    for _ in range(60):
+        m.advance(0.5, limit_cpu=85)
+        speeds.append(m.ec_byte(Ec.CURVES[0][1]))
+    log = m.text()
+    r.check("ec/fans: taking over from" in log, log[-500:])
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.ADVANCED, f"0xf4 is {m.ec_byte(Ec.FAN_MODE):#x} while zcool runs the fans")
+    curve = ec_curve(m)
+    # one speed below the safe point, 8 C over the limit; every fan at full from there
+    r.check(list(curve[:6]) == [93, 94, 95, 96, 97, 98] and list(curve[7:]) == [100] * 6, f"curve {list(curve)}")
+    r.check(ec_curve(m, 1)[6] == curve[6], "both fans at one speed")
+    held = speeds[-10:]
+    r.check(40 < min(held) and max(held) < 95, f"the fans should settle part way, at {held}")
+    r.check(not m.boost() and m.first_boost is None, "Cooler Boost is for when the curve is at full")
+    r.check(m.first_trim is None, f"no power should be taken while the fans have room, cap {m.first_cap}")
+    r.check(m.cpu.peak <= 85.5 and m.cpu.temp < 84, f"peak {m.cpu.peak:.1f}, now {m.cpu.temp:.1f}")
+    r.note(f"100 W: fans settle at {held[-1]}%, {m.cpu.temp:.1f} C, peak {m.cpu.peak:.1f} C")
+    # far more heat: the curve goes to full, then Cooler Boost, then power
+    m.cpu.load = 220
+    for _ in range(50):
+        m.advance(0.5, limit_cpu=85)
+        if m.boost() and m.first_trim is None:
+            r.check(m.ec_byte(Ec.CURVES[0][1]) == 100, "Cooler Boost before the curve was at full")
+    log = m.text()
+    r.check("ec/fans: Cooler Boost on, every fan past full" in log, log[-500:])
+    r.check(m.first_boost is not None and (m.first_trim is None or m.first_boost <= m.first_trim + 0.3),
+            f"boost at {m.first_boost}, power trimmed at {m.first_trim}")
+    r.check(m.cpu.peak <= 87, f"peak {m.cpu.peak:.1f}")
+    # the heat goes: back to the firmware, its curve and mode as they were
+    m.cpu.load = 10
+    m.advance(60, limit_cpu=85)
+    log = m.text()
+    r.check("ec/fans: back to the firmware" in log, log[-400:])
+    # its own curve and mode, or the silent one once everything has been cool a while
+    r.check(m.ec_byte(Ec.FAN_MODE) in (Ec.AUTO, Ec.SILENT) and ec_curve(m) == Ec.CURVE and ec_curve(m, 1) == Ec.CURVE,
+            f"0xf4 {m.ec_byte(Ec.FAN_MODE):#x}, curve {list(ec_curve(m))}")
+    r.check(not m.boost(), "Cooler Boost left on")
+    m.stop()
+    m.close()
+
+
+@scenario
+def zcools_curve_goes_back_however_zcool_ends(r):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+        m.start()
+        m.advance(25, limit_cpu=85)
+        r.check(m.ec_byte(Ec.FAN_MODE) == Ec.ADVANCED, f"{sig.name}: zcool's curve never came")
+        m.stop(sig)
+        if sig == signal.SIGKILL:
+            m.cmd("restore")
+        r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO, f"{sig.name}: 0xf4 is {m.ec_byte(Ec.FAN_MODE):#x}")
+        r.check(ec_curve(m) == Ec.CURVE and ec_curve(m, 1) == Ec.CURVE, f"{sig.name}: curve {list(ec_curve(m))}")
+        r.check(m.ec_byte(Ec.BOOST) == 0x05, f"{sig.name}: 0x98 is {m.ec_byte(Ec.BOOST):#x}")
+        r.check(get(m.rapl_path) == "300000000", f"{sig.name}: power not given back")
+        m.close()
+
+
+@scenario
+def the_ec_dropping_zcools_curve_is_noticed(r):
+    m = Machine(cpu=Chip(load=100, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+    m.start()
+    m.advance(20, limit_cpu=85)
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.ADVANCED, "zcool's curve never came")
+    # as the EC does when the charger comes or goes
+    m.ec_set(Ec.FAN_MODE, Ec.AUTO)
+    for i in range(6):
+        m.ec_set(Ec.CURVES[0][0] + i, Ec.CURVE[i])
+    m.advance(3, limit_cpu=85)
+    log = m.text()
+    r.check("ec/fans: the EC went back to its own curve, zcool's again" in log, log[-400:])
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.ADVANCED and ec_curve(m)[0] == 93, f"curve {list(ec_curve(m))}")
+    r.check(ec_curve(m, 1)[0] == 93, f"the GPU's fan has no GPU to watch: the CPU's point, {list(ec_curve(m, 1))}")
+    m.stop()
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO and ec_curve(m) == Ec.CURVE, "not given back after the EC dropped it")
+    m.close()
+
+
+@scenario
+def a_fan_that_stands_still_is_reported(r):
+    m = Machine(cpu=Chip(load=220, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config=EC_CONFIG)
+    m.start()
+    m.advance(12, limit_cpu=85)
+    r.check("not turning" not in m.text(), "both fans turn")
+    m.ec.stalled = True
+    m.advance(10, limit_cpu=85)
+    log = m.text()
+    r.check("ec/fans: the cpu fan is set to" in log and "not turning. Check this fan" in log, log[-400:])
+    r.check(m.cpu.peak <= 87, f"peak {m.cpu.peak:.1f}")
+    m.stop()
+    m.close()
+
+
+@scenario
+def power_comes_back_only_with_room_for_the_burst(r):
+    # as on a real GF63 at a 70 C limit: every fan at full carries about 40 W, the work asks 90, and
+    # its die jumps with the power. zcool took the boost for room and gave power back near the
+    # limit, and the burst took the chip from 68 C to 72 within a second.
+    for config, how in ((BOOST_CONFIG, "Cooler Boost"), (EC_CONFIG, "zcool's curve")):
+        m = Machine(cpu=Chip(load=90, g_min=0.5, g_max=1.2, mass=30, r_die=0.12), cpu_fan=False, ec=Ec(), rapl_window=True,
+                    config=config.replace("cpu0.max = 85", "cpu0.max = 70"))
+        m.start()
+        m.advance(90, limit_cpu=70)
+        log = m.text()
+        r.check("trimming power" in log, f"{how}: the work should be more than the cooler carries:\n" + log[-300:])
+        r.check("full power again" not in log, f"{how}: full power came back near the limit:\n" + log[-600:])
+        r.check("is over the" not in log and m.cpu.peak <= 71.5, f"{how}: peak {m.cpu.peak:.1f}\n" + log[-600:])
+        r.note(f"{how}: peak {m.cpu.peak:.1f} C at a 70 C limit, speed {m.cpu.perf * 100:.1f}%")
+        m.stop()
+        m.close()
 
 
 def tcc_machine(config="cpu0.max = 85\n", cpuinfo="GenuineIntel", lockdown="[none] integrity confidentiality"):

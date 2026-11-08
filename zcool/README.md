@@ -4,16 +4,18 @@ Keeps every chip under the temperature you set, and gives up as little speed as 
 can: the CPU, every GPU, NVMe. It learns how much power the cooler carries, and next time
 goes straight there. On battery it can lower the limits, turn turbo off, make the CPU
 prefer efficient clocks and the fans quiet. A GPU that shows nothing is let sleep when
-idle. On MSI laptops it also drives the embedded controller: Cooler Boost, the battery
-charge limit, the EC's power profiles and its silent fan curve while everything is cool.
+idle. On MSI laptops it also drives the embedded controller: its fans at the speed the heat
+needs, Cooler Boost past that, the battery charge limit, the EC's power profiles and its
+silent fan curve while everything is cool.
 Under work heavier than the machine can do, it keeps the desktop answering: jobs yield the
 CPU to it, and a process about to starve memory is ended before the system stalls.
 `zcool menu` shows every setting on one screen.
-Pure Zig with no libc: a 225 KiB binary that uses under 200 KiB of memory. NVIDIA's own
+Pure Zig with no libc: a 269 KiB binary (x86_64) that uses under 200 KiB of memory. NVIDIA's own
 driver needs one more, small program, see below.
 
-**It has not run on real hardware yet.** Everything below was checked against a
-thermal simulator. Start with `--dry-run`, which writes nothing.
+It runs on an MSI GF63 Thin 10SC, whose logs found the burst and the slow trim described
+below. Everything else was checked against a thermal simulator. Start with `--dry-run`,
+which writes nothing.
 
 ## What it can and cannot promise
 
@@ -23,11 +25,15 @@ software keeps it at your limit at full speed. So the order is:
 1. **Forecast.** It reacts to where the temperature is heading, not where it is, but at most
    8 C ahead of it: a CPU's die jumps 20 C within a second when work starts and levels off as
    soon, and following that slope further took power at 65 C on a real laptop.
-2. **Fans first.** They rise before the limit and reach full speed at it. Speed is not touched.
+2. **Fans first.** They rise before the limit and reach full speed at it; under a steady
+   heat they settle it 2 C under the limit, no faster than it needs. Speed is not touched.
    A GPU's own fans go first; the case fans join once those are at full.
 3. **Then a little power,** only when the fans have nothing left, and only as much as needed.
-   Once zcool has learned what the cooler carries, the power goes straight there.
-4. **Give it back** as soon as there is room, and while the fans still have some.
+   Once zcool has learned what the cooler carries, the power goes straight there. Over the
+   limit it takes more, as a die follows its power at once: back within seconds, not a minute.
+4. **Give it back** as soon as there is room, and while the fans still have some. With every
+   fan at full, all of it only 3 C under the limit: full power lets a CPU burst at once, and
+   on the GF63 that took it from 68 C to 72 within a second.
 
 In quiet mode 2 and 3 swap places for the first 15% of power: see below.
 
@@ -66,6 +72,18 @@ turbo.battery = no    # what follows the power source, see below
 
 Each chip gets its own limit. One you set above the chip's critical point minus 5 C
 is lowered, with a message.
+
+## How the fans run
+
+The fans start 8 C under the limit and reach full speed at it, rising with the forecast, so
+a heat that is still climbing finds them already turning. Once the heat holds steady they
+find the speed it needs: a little less while the chip stays well under the fan point, 2 C
+under the limit, a little more while it stays over. So it settles at the fan point instead
+of wherever the band happens to balance it lower down: the same heat for less fan, 9% less
+in the model at 90 W. Within a degree of the fan point nothing changes, as fans that chase
+every tenth of a degree are heard doing it. New work that climbs gets the band back at once,
+and the last degree and a half before the limit gets every fan. Fans go up at once and down
+slowly, so they do not pump.
 
 ## It learns the cooler
 
@@ -195,10 +213,22 @@ On many MSI laptops Linux cannot turn the fans: they belong to the EC, and the k
 `msi-ec` knows only some firmware. zcool talks to the EC itself, through the kernel's
 `ec_sys`, which goes through the kernel's own EC driver, so the two never race. What it does:
 
-- **Cooler Boost joins the fans.** It has two speeds, the firmware's curve and both fans at
-  full. zcool turns it on when a chip is forecast within 2 C of its limit, before any power
-  is taken, and off only once the fans would have come well down, so it does not switch back
-  and forth. A boost you turned on with the key stays on.
+- **The fans at any speed.** MSI's "advanced" fan mode runs each fan by a curve held in the
+  EC. When the heat needs more than the firmware's curve gives, zcool writes a curve of its
+  own: one speed, the one it wants, up to 8 C over the highest limit, and every fan at full
+  from there. So the EC goes on answering the heat by itself if zcool ever stops answering.
+  It starts from the speed the firmware ran, never below it, and changes only the speed byte
+  while it runs, by 2% or more. The EC drops back to its own curve when the charger comes or
+  goes: zcool notices and writes its own again. Once the heat is gone the EC's curve and mode
+  go back as they were. A fan set past half that does not turn is reported. Addresses from
+  [isw](https://github.com/YoyPa/isw), the same for every MSI laptop of this kind.
+- **Cooler Boost past full.** Once zcool's curve is at full, Cooler Boost; off again only
+  once the fans have come well down, so it does not switch back and forth. With Cooler Boost
+  on, the fans count as at full whatever the curve says, so power is not given back while
+  they have nothing left: on the GF63 it was, and the chip went over its limit. With Cooler
+  Boost alone the same holds once it has been on 2 s, time for the fans to spin up. A boost
+  you turned on with the key stays on. `fan.curve = no` leaves only Cooler Boost: the firmware's
+  curve, or both fans at full.
 - **The GPU's temperature,** when NVIDIA's library reads none.
 - **`battery.max`:** a charge limit, from 10 to 100%. Unlike everything else it stays when
   zcool stops, so that it holds while the laptop is off and plugged in; `battery.max = 100`
@@ -207,8 +237,8 @@ On many MSI laptops Linux cannot turn the fans: they belong to the EC, and the k
 - **The silent fan curve.** The firmware has a quieter fan curve of its own. zcool takes it while
   every chip has been 25 C below its limit for 20 s, and gives the normal curve back as soon as
   one comes within 18 C, before Cooler Boost and before any power. The firmware keeps its own
-  protection on either curve. A curve chosen in MSI's tools (advanced) is left alone, and
-  `fan.silent = no` keeps the normal one.
+  protection on either curve. A curve chosen in MSI's tools (advanced) is left alone, zcool
+  keeps to Cooler Boost then, and `fan.silent = no` keeps the normal one.
 - **`mode.ac` and `mode.battery`:** the EC's own power profiles, `eco`, `comfort`, `sport`
   or `turbo`, switched when the power source changes. Left out, the firmware's own stays;
   with one of the two set, the other source gets the firmware's own back.
@@ -222,7 +252,8 @@ lists is touched: today the GF63 Thin 8RC, 9SC, 10SC, 10U and GF65 Thin 9S, 10S,
 (firmware 16R1, 16R3, 16R4, 16R5, 16W1, 16W2). Any other EC is only named in `zcool list`
 and left alone, and so is one without write support. Of the byte that holds Cooler Boost
 only its bit is changed; the rest belongs to the firmware. `ec = no` keeps zcool away from
-the EC, and `fan.exclude = ec/cooler_boost` from Cooler Boost alone.
+the EC, `fan.exclude = ec/fans` from its fans (Cooler Boost alone is used then), and
+`fan.exclude = ec/cooler_boost` from Cooler Boost too.
 
 ## Safety
 
@@ -231,7 +262,8 @@ the EC, and `fan.exclude = ec/cooler_boost` from Cooler Boost alone.
   crash, a panic and `kill -9` all end in the originals: the last one through the
   runit `finish` script, or at the next start.
 - **Lost sensors hand everything back.** The daemon exits and runit restarts it.
-- **The EC goes back too:** Cooler Boost and the power profile are journaled like the rest.
+- **The EC goes back too:** its fan mode, both fan curves, Cooler Boost and the power profile
+  are journaled like the rest.
   The charge limit is the one setting that stays, see above.
 - **NVIDIA's settings go back however zcool ends.** When zcool goes, `zcool-nvidia`'s input
   ends and it gives back every limit and fan it set. If both are killed, the GPUs it changed
@@ -286,7 +318,10 @@ fan and a clock limit, a desktop one with its own fan, the case fan and its powe
 an Intel GPU's power1_max, an idle GPU read rarely enough to sleep, one asleep never
 reached, and NVIDIA's settings given back after `kill -9` of zcool and of both. A NVIDIA
 library that reads only an attached GPU, and one that reads nothing, read through the EC.
-For an MSI EC: Cooler Boost before any power is taken and off after the heat, the
+For an MSI EC: its fans held part way through zcool's curve for a heat that needs part of
+them, then at full, then Cooler Boost, then power, and the EC's own curve and mode back after
+the heat, SIGTERM and `kill -9`; the EC dropping zcool's curve and getting it back; a fan
+that stands still reported. Cooler Boost alone before any power is taken and off after the heat, the
 firmware's bits left as they were, everything back after SIGTERM and `kill -9`, a boost
 turned on by hand left on, the charge limit (and the kernel's own where there is one), the
 profile following the power source, and an unknown or read-only EC never written. The
@@ -296,7 +331,9 @@ power is enough; the cooler learned, kept on disk and used on the next run; and 
 driven through a terminal, saving what it changed and restarting the service. The silent fan
 curve while cool and the normal one back before Cooler Boost; a package that bursts to its
 short-term limit for the long one's 28 s window, held by power alone once both go down, and
-held without swinging where only the long one exists; the TCC offset set, put back after
+held without swinging where only the long one exists; a die that follows its power at once
+at a 70 C limit with every fan at full, held without going over and without power coming
+back near the limit, by Cooler Boost alone and by zcool's curve; the TCC offset set, put back after
 SIGTERM and `kill -9`, and left alone on AMD, under lockdown or with `tcc = no`; a job yielding under CPU pressure
 while a game and the desktop keep theirs; a memory hog ended and the session spared. It proves
 the logic. It proves nothing about any real driver or NVIDIA's real library, and a real

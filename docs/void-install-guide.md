@@ -676,7 +676,7 @@ doas ln -s /etc/sv/zcool /etc/runit/runsvdir/default/
 doas ln -s /etc/sv/zcool /etc/runit/runsvdir/gaming/
 ```
 
-**Ноутбуки MSI.** Вентиляторами там управляет EC, и `zcool` умеет работать с ним сам: включает Cooler Boost раньше, чем урезать мощность, ставит порог зарядки (`battery.max = 80`) и переключает профили EC на батарее и от сети (`mode.battery = eco`). Это работает только для прошивок EC, которые он знает (GF63 и GF65 Thin), и нужны debugfs и отключённый lockdown (с NVIDIA он уже отключён). Уберите `debugfs=off` из строки `COMMON` в хуке Limine, запустите хук и перезагрузитесь:
+**Ноутбуки MSI.** Вентиляторами там управляет EC, и `zcool` умеет работать с ним сам: крутит вентиляторы ровно с той скоростью, какая нужна под нагрузку (через собственную кривую в EC), включает Cooler Boost раньше, чем урезать мощность, ставит порог зарядки (`battery.max = 80`) и переключает профили EC на батарее и от сети (`mode.battery = eco`). Это работает только для прошивок EC, которые он знает (GF63 и GF65 Thin), и нужны debugfs и отключённый lockdown (с NVIDIA он уже отключён). Уберите `debugfs=off` из строки `COMMON` в хуке Limine, запустите хук и перезагрузитесь:
 
 ```
 doas sed -i 's/ debugfs=off//' /etc/kernel.d/post-install/60-limine

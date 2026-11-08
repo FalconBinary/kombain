@@ -24,7 +24,7 @@ mango, dependencies included, from the Void x86_64 index in November 2026.
 | Terminal | foot, as a server | 1 MiB | alacritty (8.6 MiB), kitty (80.5 MiB) |
 | Screen lock | swaylock | 0.1 MiB | |
 | Firewall | nftables, loaded before the network | 25.4 MiB | |
-| Temperatures | [zcool](zcool/): a limit per chip, CPU and every GPU, fans first, then a little power; learns what the cooler carries; turbo, energy preference, quiet fans and lower limits on battery; the EC's silent fan curve when cool; the CPU's short-term power limit and its own throttle just above the limit; jobs yield the CPU to the desktop and a memory hog is ended before a freeze; `zcool menu` for every setting; a GPU that shows nothing sleeps when idle | 0.2 MiB, 0.2 MiB more with NVIDIA's driver | |
+| Temperatures | [zcool](zcool/): a limit per chip, CPU and every GPU, fans first and no faster than the heat needs, then a little power; learns what the cooler carries; an MSI EC's fans at any speed through a curve of its own; turbo, energy preference, quiet fans and lower limits on battery; the EC's silent fan curve when cool; the CPU's short-term power limit and its own throttle just above the limit; jobs yield the CPU to the desktop and a memory hog is ended before a freeze; `zcool menu` for every setting; a GPU that shows nothing sleeps when idle | 0.3 MiB, 0.2 MiB more with NVIDIA's driver | |
 | Search | ripgrep, fd, fzf, jq | 15.3 MiB | |
 | Multiplexer | tmux | 1.6 MiB | zellij (49.3 MiB) |
 | Files | nnn | 0.4 MiB | yazi (41.2 MiB) |

@@ -242,6 +242,12 @@ fn buildItems(info: *const Info) void {
     }, "tcc");
     if (info.ec) add(.{
         .kind = .choice,
+        .label = "zcool runs the fans",
+        .choices = &yes_first,
+        .help = "zcool sets the EC's fans to the speed the heat needs, through a curve of its own; no: only Cooler Boost, on or off.",
+    }, "fan.curve");
+    if (info.ec) add(.{
+        .kind = .choice,
         .label = "Silent fan curve when cool",
         .choices = &yes_first,
         .help = "The EC's own silent curve while every chip is 25 C below its limit; its normal curve the moment one heads up.",

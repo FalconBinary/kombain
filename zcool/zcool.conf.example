@@ -41,6 +41,10 @@
 # An MSI EC's silent fan curve while every chip is far below its limit.
 # fan.silent = no
 
+# An MSI EC's fans at the speed the heat needs, through a curve of zcool's own.
+# no: only Cooler Boost, which is the firmware's curve or both fans at full.
+# fan.curve = no
+
 # Intel: the CPU's own thermal throttle 3 C above the limit, catching what comes too fast.
 # tcc = no
 

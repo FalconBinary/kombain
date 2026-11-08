@@ -3,8 +3,9 @@
 //! The decisions, with no system calls, so they can be tested against a model.
 //!
 //! The order is what keeps a chip fast: forecast the temperature, spin the fans
-//! up before the limit, and only when the fans have nothing left take a little
-//! power away, in small steps, giving it back as soon as there is room.
+//! up before the limit, no faster than the heat needs, and only when the fans have
+//! nothing left take a little power away, in small steps, giving it back as soon as
+//! there is room.
 
 const std = @import("std");
 
@@ -14,8 +15,16 @@ pub const horizon: f32 = 4;
 /// second when a burst of work starts, and levels off as soon after: following that slope any
 /// further spun fans and took power for heat that never came (seen on a real laptop at 65 C).
 pub const max_lead: f32 = 8;
-/// Fans start this far below the limit and reach full speed at the limit.
+/// Within this much of the limit nothing is quiet: the firmware's silent curve goes, and the
+/// temperature is read often.
 pub const fan_band: f32 = 8;
+/// The fans hold a chip this far under its limit: no faster than the heat needs, and the last
+/// degrees are left for a burst to land in before any power is taken.
+pub const fan_margin: f32 = 2;
+/// With every fan at full, power comes back in full only this far under the limit. Full power
+/// gives a CPU its short-term limit back too, and it bursts to that at once, with nothing left
+/// to catch it: on a real laptop from 68 C to over its 70 C limit within a second.
+pub const release_margin: f32 = 3;
 /// A chip is never throttled below this level; below that the hardware protects itself.
 pub const min_level: f32 = 0.3;
 /// Fans return to firmware control after this long with nothing to do.
@@ -44,10 +53,39 @@ pub const Thermal = struct {
     }
 };
 
-/// 0 means the firmware curve is fine, 1 means full speed.
-pub fn fanDemand(forecast: f32, limit: f32) f32 {
-    return std.math.clamp((forecast - (limit - fan_band)) / fan_band, 0, 1);
-}
+/// How hard the fans run for one chip: 0 leaves them to the firmware's curve, 1 is full speed.
+///
+/// They start `fan_band` under the limit and reach full speed at it, rising with the forecast,
+/// so a heat that is still climbing finds them already turning. Once the heat holds steady, the
+/// fans find the speed it needs: a little less while the chip stays well under the fan point,
+/// 2 C under the limit, and a little more while it stays over it. So the temperature settles at
+/// the fan point instead of wherever the band happens to balance it lower down: the same heat
+/// for less fan. Within a degree of the fan point it finds nothing new, as fans that chase every
+/// tenth of a degree are heard doing it.
+pub const FanDrive = struct {
+    /// what the steady heat was found to need, on top of the band or under it
+    held: f32 = 0,
+
+    pub fn update(self: *FanDrive, thermal: *const Thermal, limit: f32, dt: f32) f32 {
+        const forecast = thermal.forecast();
+        const band = std.math.clamp((forecast - (limit - fan_band)) / fan_band, 0, 1);
+        const off = forecast - (limit - fan_margin);
+        if (off > 0.5) {
+            self.held += (off - 0.5) * 0.008 * dt;
+        } else if (off < -1 and thermal.slope < 0.05) {
+            // steady, or the heat going: not while it still climbs
+            self.held += (off + 1) * 0.008 * dt;
+        }
+        // the trim under the band was for a steady heat: new work that climbs gets the band back,
+        // faster than the slow rise the trim itself brings
+        if (thermal.slope > 0.3 and self.held < 0) self.held = @min(0, self.held + 0.1 * dt);
+        // never under the firmware's speed, never past full: nothing builds up that is not used
+        self.held = std.math.clamp(self.held, -band, 1 - band);
+        // and the last degree and a half before the limit gets every fan, whatever was found
+        const last = (forecast - (limit - 1.5)) / 1.5;
+        return std.math.clamp(@max(band + self.held, last), 0, 1);
+    }
+};
 
 pub const Fan = struct {
     duty: f32 = 0,
@@ -92,8 +130,13 @@ pub const Throttle = struct {
         // while the fans still have room they get to act before any power is taken,
         // and power taken earlier comes back: the fans carry it
         if (!no_more_cooling and !over) rate = if (temp < limit - 0.5) @max(rate, 0.02) else @max(rate, 0);
+        // over the limit with nothing left to cool it: a CPU's die follows its power at once,
+        // so taking a little more brings it back within seconds instead of a minute
+        if (no_more_cooling and temp > limit) rate -= (temp - limit) * 0.03;
         if (over) rate -= (temp - limit) * 0.05;
         self.level = std.math.clamp(self.level + std.math.clamp(rate, -0.5, 0.1) * dt, min_level, 1);
+        // all of it only with room for the burst it lets loose
+        if (self.level >= 1 and no_more_cooling and temp > limit - release_margin) self.level = 0.99;
     }
 };
 
@@ -251,13 +294,14 @@ const Plant = struct {
 fn simulate(plant: *Plant, limit: f32, seconds: f32) struct { peak: f32, level: f32 } {
     var thermal = Thermal{};
     var fan = Fan{ .duty = 80 };
+    var drive = FanDrive{};
     var throttle = Throttle{};
     var peak: f32 = 0;
     const dt: f32 = 0.25;
     var t: f32 = 0;
     while (t < seconds) : (t += dt) {
         thermal.update(plant.temp, dt);
-        fan.update(80, fanDemand(thermal.forecast(), limit), dt);
+        fan.update(80, drive.update(&thermal, limit, dt), dt);
         throttle.update(&thermal, limit, 100, fan.duty >= 255, dt);
         plant.step(throttle.level, fan.duty, dt);
         peak = @max(peak, plant.temp);
@@ -296,7 +340,8 @@ test "a burst far below the limit forecasts nothing near it" {
     var temp: f32 = 45;
     while (temp < 65) : (temp += 5) t.update(temp, 0.25);
     try std.testing.expect(t.forecast() <= t.temp + max_lead);
-    try std.testing.expect(fanDemand(t.forecast(), 90) == 0);
+    var drive = FanDrive{};
+    try std.testing.expect(drive.update(&t, 90, 0.25) == 0);
 }
 
 test "near the critical point power drops at once" {
@@ -353,6 +398,7 @@ test "quiet mode takes a little power before the fans, and keeps the fans once i
     var plant = Plant{ .power = 125, .g_min = 0.9, .g_max = 3 };
     var thermal = Thermal{};
     var fan = Fan{ .duty = 0 };
+    var drive = FanDrive{};
     var throttle = Throttle{};
     var quiet = Quiet{};
     const dt: f32 = 0.25;
@@ -362,7 +408,7 @@ test "quiet mode takes a little power before the fans, and keeps the fans once i
     while (t < 400) : (t += dt) {
         thermal.update(plant.temp, dt);
         const loud = quiet.update(true, &thermal, 85, throttle.level, false, dt);
-        const demand = if (loud) fanDemand(thermal.forecast(), 85) else 0;
+        const demand = if (loud) drive.update(&thermal, 85, dt) else 0;
         fan.update(0, demand, dt);
         if (fan.duty > 0 and fans_at < 0) fans_at = t;
         if (fans_at < 0) lowest_before_fans = @min(lowest_before_fans, throttle.level);
@@ -381,7 +427,7 @@ test "quiet mode takes a little power before the fans, and keeps the fans once i
     while (t < 200) : (t += dt) {
         thermal.update(plant.temp, dt);
         const loud = quiet.update(true, &thermal, 85, throttle.level, false, dt);
-        fan.update(0, if (loud) fanDemand(thermal.forecast(), 85) else 0, dt);
+        fan.update(0, if (loud) drive.update(&thermal, 85, dt) else 0, dt);
         throttle.update(&thermal, 85, 100, fan.duty >= 255 or !loud, dt);
         plant.stepLinear(throttle.level, fan.duty, dt);
     }
@@ -464,4 +510,98 @@ test "the silent fan curve while everything is cool, the normal one before it is
     try std.testing.expect(!mode.update(22, 30));
     try std.testing.expect(!mode.update(30, 19));
     try std.testing.expect(mode.update(30, 2));
+}
+
+test "power comes back in full only with room for the burst" {
+    var t = Thermal{ .temp = 83, .ready = true };
+    var throttle = Throttle{ .level = 0.9 };
+    var i: u32 = 0;
+    // 2 C under the limit with every fan at full: close to all of it, never all of it
+    while (i < 200) : (i += 1) throttle.update(&t, 85, 100, true, 0.25);
+    try std.testing.expect(throttle.level > 0.95 and throttle.level < 1);
+    // fans that still have room catch the burst: all of it
+    i = 0;
+    while (i < 200) : (i += 1) throttle.update(&t, 85, 100, false, 0.25);
+    try std.testing.expectEqual(@as(f32, 1), throttle.level);
+    // well under it with every fan at full: all of it too
+    throttle.level = 0.9;
+    t.temp = 80;
+    i = 0;
+    while (i < 100) : (i += 1) throttle.update(&t, 85, 100, true, 0.25);
+    try std.testing.expectEqual(@as(f32, 1), throttle.level);
+}
+
+/// Where the fans settle for a heat that needs some of them, and how hard they run there.
+fn settle(plant: *Plant, band_only: bool, seconds: f32) struct { temp: f32, duty: f32, peak: f32 } {
+    var thermal = Thermal{};
+    var fan = Fan{ .duty = 60 };
+    var drive = FanDrive{};
+    var peak: f32 = 0;
+    const dt: f32 = 0.25;
+    var t: f32 = 0;
+    while (t < seconds) : (t += dt) {
+        thermal.update(plant.temp, dt);
+        // what zcool did before: from 8 C under the limit, linearly to full at it
+        const demand = if (band_only) std.math.clamp((thermal.forecast() - 77) / 8, 0, 1) else drive.update(&thermal, 85, dt);
+        fan.update(60, demand, dt);
+        plant.stepLinear(1, fan.duty, dt);
+        peak = @max(peak, plant.temp);
+    }
+    return .{ .temp = plant.temp, .duty = fan.duty, .peak = peak };
+}
+
+test "a steady heat is held near the fan point with less fan than the band alone" {
+    // 90 W: the band alone settles it at 78.6 C
+    var a = Plant{ .power = 90, .g_min = 0.5, .g_max = 4 };
+    const drive = settle(&a, false, 600);
+    var b = Plant{ .power = 90, .g_min = 0.5, .g_max = 4 };
+    const band = settle(&b, true, 600);
+    try std.testing.expect(drive.temp > 81 and drive.temp < 85 - fan_margin + 0.6);
+    try std.testing.expect(drive.peak <= 85);
+    try std.testing.expect(drive.duty < band.duty - 5);
+}
+
+test "a heat that climbs finds the fans as the band has them, and every fan at the limit" {
+    var t = Thermal{ .temp = 85, .ready = true };
+    var drive = FanDrive{};
+    try std.testing.expectEqual(@as(f32, 1), drive.update(&t, 85, 0.25));
+    t.temp = 70;
+    drive = .{};
+    try std.testing.expectEqual(@as(f32, 0), drive.update(&t, 85, 0.25));
+    // trimmed for a steady heat, then it climbs: the trim goes within seconds
+    t = .{ .temp = 80, .slope = 0.5, .ready = true };
+    drive = .{ .held = -0.2 };
+    var i: u32 = 0;
+    while (i < 12) : (i += 1) _ = drive.update(&t, 85, 0.25);
+    try std.testing.expect(drive.held > -0.1);
+    // at the limit every fan, whatever the trim
+    t = .{ .temp = 85, .ready = true };
+    drive = .{ .held = -0.5 };
+    try std.testing.expectEqual(@as(f32, 1), drive.update(&t, 85, 0.25));
+    // the heat goes: what was found on top goes with it, and the fans go back to the firmware
+    t = .{ .temp = 60, .slope = -0.5, .ready = true };
+    drive = .{ .held = 0.3 };
+    i = 0;
+    while (i < 80) : (i += 1) _ = drive.update(&t, 85, 0.25);
+    try std.testing.expectEqual(@as(f32, 0), drive.update(&t, 85, 0.25));
+}
+
+test "over the limit with every fan at full, power goes until it is back within seconds" {
+    // a die over its sink by 0.12 C per watt, as a laptop CPU's is: 90 W asked, 40 W carried
+    var sink: f32 = 64;
+    var thermal = Thermal{};
+    var throttle = Throttle{ .level = 0.7 };
+    const dt: f32 = 0.25;
+    var t: f32 = 0;
+    var over_for: f32 = 0;
+    while (t < 60) : (t += dt) {
+        const watts = 90 * throttle.level;
+        const die = sink + watts * 0.12;
+        thermal.update(die, dt);
+        throttle.update(&thermal, 70, 100, true, dt);
+        sink += (watts - (sink - 30) * 1.2) * dt / 30;
+        if (die > 70.5) over_for += dt;
+    }
+    try std.testing.expect(over_for < 6);
+    try std.testing.expect(thermal.temp > 67 and thermal.temp < 70.5);
 }
