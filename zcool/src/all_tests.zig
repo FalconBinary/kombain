@@ -10,4 +10,5 @@ test {
     _ = @import("journal.zig");
     _ = @import("menu.zig");
     _ = @import("guard.zig");
+    _ = @import("tcc.zig");
 }

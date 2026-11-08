@@ -20,6 +20,7 @@ const nvidia = @import("nvidia.zig");
 const ec = @import("ec.zig");
 const menu = @import("menu.zig");
 const guard = @import("guard.zig");
+const tcc = @import("tcc.zig");
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = false,
@@ -43,6 +44,8 @@ var restoring: bool = false;
 fn emergencyRestore() void {
     if (restoring) return;
     restoring = true;
+    // through the registers it keeps open; the journal cannot reach /dev from the sandbox
+    tcc.restore();
     if (!dry_run) _ = journal.restore();
     // zcool-nvidia puts NVIDIA's settings back when its input ends
     nvidia.closeNow();
@@ -210,6 +213,10 @@ const CpuPower = struct {
     rapl_reference: [max_packages]f32 = undefined,
     rapl_sampled_ms: i64 = 0,
     rapl_saved: bool = false,
+    /// the short-term limit (PL2), which the CPU may burst to for the long one's whole window
+    pl2: [max_packages]bool = @splat(false),
+    pl2_original: [max_packages]i64 = @splat(0),
+    pl2_saved: [max_packages]bool = @splat(false),
     freq_saved: bool = false,
     freq_active: bool = false,
     escalated: bool = false,
@@ -471,6 +478,13 @@ fn discoverCpuPower() void {
         cpu_power.rapl_energy[n] = -1;
         cpu_power.rapl_watts[n] = 0;
         cpu_power.rapl_reference[n] = @floatFromInt(base);
+        var name_buf: [32]u8 = undefined;
+        const name = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_1_name" }), &name_buf) orelse "";
+        if (std.mem.eql(u8, std.mem.trim(u8, name, " \n"), "short_term")) {
+            const pl2 = sys.readInt(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_1_power_limit_uw" })) orelse 0;
+            cpu_power.pl2[n] = pl2 > 0 and pl2 < 1_000_000_000;
+            cpu_power.pl2_original[n] = pl2;
+        }
         cpu_power.rapl_count += 1;
     }
     var dir = sys.Dir.open(sys.join(&dir_buf, &.{ sys.root, "/sys/devices/system/cpu/cpufreq" })) orelse return;
@@ -881,13 +895,41 @@ fn applyRapl(level: f32, starting: bool) bool {
             cpu_power.rapl_reference[i] = if (milliwatts > 5000) @min(milliwatts * 1000, base) else base;
         }
         const target: i64 = if (level >= 1) cpu_power.rapl_original[i] else @intFromFloat(cpu_power.rapl_reference[i] * level);
+        // back up: the short-term limit first, so the long one is never above it
+        if (level >= 1) setPl2(i, null);
         if (!sys.writeInt(path, target)) return false;
         // some firmware takes the write and keeps its own value
         const back = sys.readInt(path) orelse return false;
         if (@abs(back - target) > @divTrunc(target, 20)) return false;
+        // down: the short-term limit with it, or the CPU bursts to it for the long one's whole window
+        if (level < 1) setPl2(i, target);
     }
     cpu_power.rapl_saved = true;
     return true;
+}
+
+/// The short-term limit of package `i`: `target`, or with null what it was.
+fn setPl2(i: usize, target: ?i64) void {
+    if (!cpu_power.pl2[i]) return;
+    var path_buf: [256]u8 = undefined;
+    var num: [4]u8 = undefined;
+    const digits = std.fmt.bufPrint(&num, "{d}", .{cpu_power.rapl_index[i]}) catch return;
+    const path = sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_1_power_limit_uw" });
+    if (!cpu_power.pl2_saved[i]) {
+        if (target == null) return;
+        if (!journal.remember(path)) {
+            cpu_power.pl2[i] = false;
+            return;
+        }
+        cpu_power.pl2_saved[i] = true;
+    }
+    const value = @min(target orelse cpu_power.pl2_original[i], cpu_power.pl2_original[i]);
+    const back = if (sys.writeInt(path, value)) sys.readInt(path) else null;
+    if (target != null and (back == null or @abs(back.? - value) > @divTrunc(value, 20))) {
+        sys.print("cpu: the short-term power limit does not stick here, the long-term one alone holds it\n");
+        _ = sys.writeInt(path, cpu_power.pl2_original[i]);
+        cpu_power.pl2[i] = false;
+    }
 }
 
 fn applyFreq(level: f32) void {
@@ -927,18 +969,33 @@ fn applyCpu(level: f32) void {
     if (level >= 1) cpu_power.escalated = false;
 }
 
-/// A power limit can be accepted and then have no effect. If the temperature stays
-/// over the limit in spite of it, frequency limits join in.
+/// The package draws well above the limit it was given, or its energy cannot be read to tell.
+fn powerOverLimit() bool {
+    if (cpu_power.applied >= 1) return false;
+    for (0..cpu_power.rapl_count) |i| {
+        if (cpu_power.rapl_energy_fd[i] < 0 or cpu_power.rapl_energy[i] < 0) return true;
+        const limit_mw = cpu_power.rapl_reference[i] * cpu_power.applied / 1000;
+        if (cpu_power.rapl_watts[i] > limit_mw * 1.15) return true;
+    }
+    return false;
+}
+
+/// A power limit can be accepted and then have no effect. If the temperature stays over the
+/// limit in spite of it, the power limits go back and frequency limits hold the chip from then
+/// on: two levers that act at different speeds would swing it between full and cut.
 fn watchEscalation(hottest_over: bool, dt: f32) void {
     if (cpu_power.rapl_count == 0 or cpu_power.escalated) return;
-    cpu_power.over_for = if (hottest_over) cpu_power.over_for + dt else 0;
+    // over the limit while drawing what the limit allows is a slow cooler, not an ignored limit
+    cpu_power.over_for = if (hottest_over and powerOverLimit()) cpu_power.over_for + dt else 0;
     if (cpu_power.over_for >= 3 and cpu_power.npolicies > 0) {
         cpu_power.escalated = true;
-        sys.print("cpu: the power limit is not holding the temperature, also limiting frequency\n");
+        sys.print("cpu: the power limit is not holding the temperature, frequency limits hold it from now on\n");
         if (!dry_run) {
+            _ = applyRapl(1, false);
             applyFreq(cpu_power.applied);
             cpu_power.freq_active = true;
         }
+        cpu_power.rapl_count = 0;
     }
 }
 
@@ -1687,6 +1744,16 @@ fn runDaemon(selftest: bool) u8 {
         var lib_buf: [256]u8 = undefined;
         sys.mkdir(sys.join(&lib_buf, &.{ sys.root, "/var/lib/zcool" }));
     }
+    // the CPU's own throttle just above the limit: its registers are open only before the sandbox
+    if (cfg.tcc and undervolt.isIntel()) {
+        if (undervolt.lockdownActive()) {
+            sys.print("tcc: kernel lockdown blocks MSR writes, the CPU's own throttle stays at TjMax\n");
+        } else for (chips[0..nchips]) |*c| {
+            if (c.kind != .cpu or !c.controlled()) continue;
+            tcc.apply(c.base_limit, dry_run);
+            break;
+        }
+    }
     const sandboxed = applySandbox();
     sys.printf("sandbox: {s}\n", .{@tagName(sandboxed)});
     if (selftest) {
@@ -1808,6 +1875,8 @@ fn listPower() void {
     if (n > 0) sys.printf("\npower: {s}\n", .{line[0..n]});
     var guard_buf: [128]u8 = undefined;
     if (guard.summary(&guard_buf)) |text| sys.printf("guard: {s}\n", .{text});
+    var tcc_buf: [128]u8 = undefined;
+    if (tcc.describe(&tcc_buf)) |text| sys.printf("tcc: {s}\n", .{text});
     loadLearned();
     var first = true;
     for (chips[0..nchips]) |*c| {

@@ -41,6 +41,9 @@
 # An MSI EC's silent fan curve while every chip is far below its limit.
 # fan.silent = no
 
+# Intel: the CPU's own thermal throttle 3 C above the limit, catching what comes too fast.
+# tcc = no
+
 # Under work heavier than the machine can do: jobs yield the CPU to the desktop, and a
 # process about to starve memory is ended before the system stalls. See the README.
 # guard.cpu = no

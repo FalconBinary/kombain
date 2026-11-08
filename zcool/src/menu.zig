@@ -234,6 +234,12 @@ fn buildItems(info: *const Info) void {
         .choices = &yes_first,
         .help = "With memory and swap all but gone, the process holding the most is ended before the system stalls for minutes. Never the session.",
     }, "guard.memory");
+    add(.{
+        .kind = .choice,
+        .label = "CPU's own throttle at limit+3",
+        .choices = &yes_first,
+        .help = "Intel: the CPU throttles itself in microseconds 3 C above the limit, catching spikes too fast for any program.",
+    }, "tcc");
     if (info.ec) add(.{
         .kind = .choice,
         .label = "Silent fan curve when cool",

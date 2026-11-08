@@ -30,7 +30,7 @@ pub fn explain(reason: Refusal) []const u8 {
     };
 }
 
-fn isIntel() bool {
+pub fn isIntel() bool {
     var path_buf: [256]u8 = undefined;
     var buf: [512]u8 = undefined;
     const text = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/proc/cpuinfo" }), &buf) orelse return false;

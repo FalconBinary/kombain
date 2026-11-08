@@ -50,6 +50,39 @@ pub fn rememberByte(path: [:0]const u8, offset: u8, bit: ?u3, value: u8) bool {
     return sys.appendFile(journalPath(), line);
 }
 
+/// Remembers a model-specific register, all eight bytes: `path#register`.
+pub fn rememberMsr(path: [:0]const u8, register: u32, value: u64) bool {
+    var line_buf: [400]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{s}#{d}\t{d}\n", .{ path, register, value }) catch return false;
+    return sys.appendFile(journalPath(), line);
+}
+
+const MsrTarget = struct { path: []const u8, register: u32 };
+
+/// Only the thermal target register of a CPU's msr device, nothing else in /dev.
+fn msrTarget(key: []const u8) ?MsrTarget {
+    const hash = std.mem.lastIndexOfScalar(u8, key, '#') orelse return null;
+    const register = std.fmt.parseInt(u32, key[hash + 1 ..], 10) catch return null;
+    if (register != 0x1a2) return null;
+    const path = key[0..hash];
+    var prefix_buf: [256]u8 = undefined;
+    const prefix = sys.join(&prefix_buf, &.{ sys.root, "/dev/cpu/" });
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, "/msr")) return null;
+    const cpu = path[prefix.len .. path.len - 4];
+    _ = std.fmt.parseInt(u16, cpu, 10) catch return null;
+    return .{ .path = path, .register = register };
+}
+
+fn restoreMsr(t: MsrTarget, text: []const u8) bool {
+    const value = std.fmt.parseInt(u64, text, 10) catch return false;
+    var target_buf: [300]u8 = undefined;
+    const fd = sys.openReadWrite(sys.join(&target_buf, &.{t.path})) orelse return false;
+    defer sys.close(fd);
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    return (sys.pwrite(fd, &bytes, t.register) orelse 0) == 8;
+}
+
 const ByteTarget = struct { path: []const u8, offset: u8, bit: ?u3 };
 
 /// `path@offset` or `path@offset:bit`, as rememberByte writes it.
@@ -85,6 +118,7 @@ pub fn restore() u32 {
     const n = sys.pread(fd, &buf, 0) orelse 0;
     sys.close(fd);
     var restored: u32 = 0;
+    var failed: u32 = 0;
     var end = n;
     while (end > 0) {
         var start = end - 1;
@@ -92,6 +126,11 @@ pub fn restore() u32 {
         const line = std.mem.trimEnd(u8, buf[start..end], "\n");
         end = start;
         const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        if (msrTarget(line[0..tab])) |t| {
+            // inside the sandbox /dev is closed: `zcool restore` from runit's finish does it
+            if (restoreMsr(t, line[tab + 1 ..])) restored += 1 else failed += 1;
+            continue;
+        }
         if (!allowed(line[0..tab])) continue;
         if (byteTarget(line[0..tab])) |t| {
             if (restoreByte(t, line[tab + 1 ..])) restored += 1;
@@ -101,7 +140,8 @@ pub fn restore() u32 {
         const target = sys.join(&target_buf, &.{line[0..tab]});
         if (sys.writeFile(target, line[tab + 1 ..])) restored += 1;
     }
-    sys.unlink(path);
+    // what could not go back now stays for the next restore; the rest is idempotent
+    if (failed == 0) sys.unlink(path);
     return restored;
 }
 
@@ -123,4 +163,14 @@ test "a byte or a bit of a binary file is named in the journal" {
     try std.testing.expect(byteTarget("/sys/class/hwmon/hwmon1/pwm1") == null);
     try std.testing.expect(byteTarget("/sys/x@300") == null);
     try std.testing.expect(byteTarget("/sys/x@1:9") == null);
+}
+
+test "a CPU's thermal target register, and nothing else in /dev" {
+    const t = msrTarget("/dev/cpu/3/msr#418").?;
+    try std.testing.expectEqualStrings("/dev/cpu/3/msr", t.path);
+    try std.testing.expectEqual(@as(u32, 0x1a2), t.register);
+    try std.testing.expect(msrTarget("/dev/cpu/3/msr#336") == null);
+    try std.testing.expect(msrTarget("/dev/sda#418") == null);
+    try std.testing.expect(msrTarget("/dev/cpu/../../etc/msr#418") == null);
+    try std.testing.expect(msrTarget("/sys/class/hwmon/hwmon1/pwm1") == null);
 }

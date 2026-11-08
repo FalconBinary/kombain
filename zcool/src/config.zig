@@ -12,6 +12,7 @@
 //!     fan.silent = no        keep an MSI EC's normal fan curve when cool
 //!     guard.cpu = no         jobs keep their CPU share under pressure
 //!     guard.memory = no      never end a process that starves memory
+//!     tcc = no               leave the CPU's own throttle at TjMax
 //!     ec = no                leave an MSI laptop's EC alone
 //!
 //! And per power source, with `.ac` or `.battery` after the name:
@@ -73,6 +74,8 @@ pub const Config = struct {
     guard_cpu: bool = true,
     /// a memory hog is ended before the system stalls
     guard_memory: bool = true,
+    /// Intel: the CPU's own throttle just above the limit
+    tcc: bool = true,
     bad_lines: u32 = 0,
 
     pub fn limitFor(self: *const Config, id: []const u8) ?f32 {
@@ -147,6 +150,10 @@ fn apply(c: *Config, key: []const u8, value: []const u8) bool {
     }
     if (std.mem.eql(u8, key, "guard.cpu")) {
         c.guard_cpu = yesNo(value) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "tcc")) {
+        c.tcc = yesNo(value) orelse return false;
         return true;
     }
     if (std.mem.eql(u8, key, "guard.memory")) {
@@ -386,8 +393,8 @@ test "what changes with the power source" {
     try std.testing.expectEqual(@as(i8, 0), c.ac.shift);
     try std.testing.expect(!c.learn);
     try std.testing.expectEqual(@as(u32, 5), c.bad_lines);
-    const g = parse("fan.silent = no\nguard.cpu = no\nguard.memory = no\n");
-    try std.testing.expect(!g.fan_silent and !g.guard_cpu and !g.guard_memory and g.bad_lines == 0);
+    const g = parse("fan.silent = no\nguard.cpu = no\nguard.memory = no\ntcc = no\n");
+    try std.testing.expect(!g.fan_silent and !g.guard_cpu and !g.guard_memory and !g.tcc and g.bad_lines == 0);
     try std.testing.expect(c.fan_silent and c.guard_cpu and c.guard_memory);
     try std.testing.expect(c.ac.any() and c.battery.any());
     try std.testing.expect(c.source(false) == &c.battery);

@@ -101,12 +101,15 @@ class Ec:
 class Machine:
     def __init__(self, cpu=None, gpu=None, rapl=True, rapl_enforced=True, rapl_writable=True, freq=True, cpu_fan=True, pump=False, config="",
                  cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu", ec=None,
-                 epp=None, turbo=None, mains=None):
+                 epp=None, turbo=None, mains=None, rapl_window=False, pl2=True):
         self.root = tempfile.mkdtemp(prefix="zcool-")
         self.cpu, self.gpu, self.nv, self.gpu_driver, self.ec = cpu, gpu, nvidia, gpu_driver, ec
         self.first_case = self.first_own_full = self.first_boost = self.first_trim = self.first_cap = None
         self.env = dict(os.environ, LD_LIBRARY_PATH=FAKE_LIB, FAKE_NVML=f"{self.root}/dev/nvml", FAKE_NVML_SYS=self.root)
         self.rapl, self.rapl_enforced, self.cpu_fan, self.pump = rapl, rapl_enforced, cpu_fan, pump
+        # a real package: the long-term limit is an average over a window of ~28 s, and until
+        # that average reaches it the CPU may draw up to the short-term limit
+        self.rapl_window, self.window_avg = rapl_window, 0.0
         self.energy = 0.0
         self.freq, self.cores = freq, cores
         self.proc = None
@@ -155,9 +158,13 @@ class Machine:
             put(f"{self.nvme_dir}/temp1_crit", 84000)
             put(f"{self.nvme_dir}/temp1_input", nvme_temp * 1000)
         self.rapl_path = f"{r}/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
+        self.pl2_path = f"{r}/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw"
         if rapl:
             put(self.rapl_path, 300000000)
             put(f"{r}/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw", 300000000)
+            if pl2:
+                put(f"{r}/sys/class/powercap/intel-rapl:0/constraint_1_name", "short_term")
+                put(self.pl2_path, 300000000)
             put(f"{r}/sys/class/powercap/intel-rapl:0/energy_uj", 0)
             if not rapl_writable:
                 os.chmod(self.rapl_path, 0o444)
@@ -363,6 +370,14 @@ class Machine:
                     if cap < 300 and self.first_trim is None:
                         self.first_trim = now
                         self.first_cap = cap
+                    if self.rapl_window:
+                        try:
+                            short = int(self.read(self.pl2_path)) / 1e6 if os.path.exists(self.pl2_path) else 300
+                        except ValueError:
+                            short = 300
+                        self.window_avg += (self.cpu.power - self.window_avg) * dt / 28
+                        if self.window_avg < cap:
+                            cap = short
                 if self.freq:
                     try:
                         speed = min(int(self.read(f"{self.root}/sys/devices/system/cpu/cpufreq/policy{i}/scaling_max_freq")) for i in range(self.cores)) / 5000000
@@ -721,7 +736,7 @@ def a_power_limit_with_no_effect_is_noticed(r):
     m = Machine(cpu=Chip(load=280, g_max=3.4, temp=70), rapl_enforced=False, config=CONFIG)
     m.start()
     m.advance(35, limit_cpu=85)
-    r.check("also limiting frequency" in m.text(), "should notice")
+    r.check("frequency limits hold it" in m.text(), "should notice")
     freq = int(m.read(f"{m.root}/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"))
     r.check(freq < 5000000, "should limit frequency")
     r.check(m.cpu.prochot_time == 0, f"reached PROCHOT, peak {m.cpu.peak:.1f}")
@@ -1655,6 +1670,83 @@ def memory_all_but_gone_ends_the_hog_never_the_session(r):
     finally:
         hog.kill()
         hog.wait()
+        m.close()
+
+
+@scenario
+def the_burst_limit_goes_down_with_the_long_one(r):
+    # 280 W against 3.4 W/K, on a package whose long-term limit is a 28 s average
+    m = Machine(cpu=Chip(load=280, g_max=3.4), rapl_window=True, config=CONFIG)
+    m.start()
+    lowest = 300e6
+    for _ in range(80):
+        m.advance(0.5, limit_cpu=85)
+        lowest = min(lowest, float(m.read(m.pl2_path)))
+    log = m.text()
+    r.check("frequency limits hold it" not in log, "the power limit should hold it without frequency limits:\n" + log[-300:])
+    r.check(lowest < 250e6, f"the short-term limit should go down too, lowest {lowest / 1e6:.0f} W")
+    r.check(m.cpu.peak <= 88, f"peak {m.cpu.peak:.1f}")
+    r.note(f"with both limits: peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
+    m.stop()
+    r.check(get(m.pl2_path) == "300000000", f"short-term limit back: {get(m.pl2_path)}")
+    m.close()
+    # where the firmware shows no short-term limit, frequency limits take over, and smoothly
+    m = Machine(cpu=Chip(load=280, g_max=3.4), rapl_window=True, pl2=False, config=CONFIG)
+    m.start()
+    m.advance(30, limit_cpu=85)
+    temps = []
+    for _ in range(30):
+        m.advance(0.5, limit_cpu=85)
+        temps.append(m.cpu.temp)
+    log = m.text()
+    r.check("frequency limits hold it" in log, "without a short-term limit the long one cannot hold it alone")
+    r.check(log.count("full power again") <= 1, "it must not swing between full power and cut:\n" + log[-400:])
+    r.check(max(temps) - min(temps) < 4, f"settled within {max(temps) - min(temps):.1f} C")
+    r.note(f"long-term limit alone: peak {m.cpu.peak:.1f} C, settled {min(temps):.1f}..{max(temps):.1f} C")
+    m.stop()
+    m.close()
+
+
+def tcc_machine(config="cpu0.max = 85\n", cpuinfo="GenuineIntel", lockdown="[none] integrity confidentiality"):
+    m = undervolt_machine(cpuinfo=cpuinfo, lockdown=lockdown, config=config)
+    with open(f"{m.root}/dev/cpu/0/msr", "r+b") as f:
+        f.seek(0x1a2)
+        f.write(struct.pack("<Q", (100 << 16) | (0x0a << 8) | (1 << 31)))
+    return m
+
+
+def tcc_offset(m):
+    with open(f"{m.root}/dev/cpu/0/msr", "rb") as f:
+        f.seek(0x1a2)
+        return (struct.unpack("<Q", f.read(8))[0] >> 24) & 0x3f
+
+
+@scenario
+def the_cpus_own_throttle_sits_just_above_the_limit(r):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        m = tcc_machine()
+        m.start()
+        m.advance(2)
+        r.check(tcc_offset(m) == 12, f"85 + 3 = 88 C, 12 below TjMax: offset {tcc_offset(m)}")
+        r.check("tcc: the CPU throttles itself from 88C" in m.text(), m.text()[-300:])
+        m.stop(sig)
+        if sig == signal.SIGKILL:
+            r.check(tcc_offset(m) == 12, "kill -9 leaves it until runit's finish")
+            m.cmd("restore")
+        r.check(tcc_offset(m) == 0, f"back at TjMax after {sig.name}: offset {tcc_offset(m)}")
+        m.close()
+    for config, cpuinfo, lockdown, said in (
+        ("cpu0.max = 85\ntcc = no\n", "GenuineIntel", "[none] integrity", None),
+        ("cpu0.max = 85\n", "AuthenticAMD", "[none] integrity", None),
+        ("cpu0.max = 85\n", "GenuineIntel", "none [integrity] confidentiality", "kernel lockdown blocks MSR writes"),
+    ):
+        m = tcc_machine(config=config, cpuinfo=cpuinfo, lockdown=lockdown)
+        m.start()
+        m.advance(2)
+        r.check(tcc_offset(m) == 0, f"{config.strip()} {cpuinfo} {lockdown}: offset {tcc_offset(m)}")
+        if said:
+            r.check(said in m.text(), m.text()[-200:])
+        m.stop()
         m.close()
 
 

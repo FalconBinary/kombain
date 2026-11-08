@@ -101,6 +101,24 @@ limits.battery = -10
 
 `zcool menu` has three presets for all of these at once: quiet, balanced and fast.
 
+## The CPU's power limits, and its own throttle
+
+An Intel package has two power limits: a long-term one (PL1), which is an average over a
+window of about 28 s, and a short-term one (PL2) it may burst to until that average reaches
+PL1. Lowering PL1 alone does nothing for those 28 s: on the GF63 the temperature went on
+rising and frequency limits had to step in every time. So zcool lowers PL2 with it and the
+power drops at once; both go back together. If a package still draws well above its limit,
+frequency limits hold it from then on, alone, since two levers that act at different speeds
+swing a chip between full power and cut.
+
+A laptop CPU's die can climb 7 C in a quarter of a second, faster than any program reads it.
+The CPU's own thermal throttle (TCC) acts in microseconds, at TjMax (usually 100 C) unless
+told otherwise: zcool moves it to 3 C above the limit, through MSR 0x1a2, before its sandbox
+closes, journaled and put back when it stops, `kill -9` included. It only throttles earlier,
+which cannot harm a chip; firmware that ignores the offset is noticed and left alone, and
+`zcool list` shows where it acts. Intel only, the `msr` module (the service loads it) and no
+kernel lockdown; `tcc = no` leaves it at TjMax. Unlike undervolting, firmware rarely locks it.
+
 ## Under heavy work
 
 Heat is one way a machine stops answering; a CPU that every job wants at once, and memory
@@ -125,7 +143,7 @@ pressure.
 
 | Chip | Reads | Acts through |
 |---|---|---|
-| Intel CPU | `coretemp`, RAPL energy | fans, RAPL power limit, then frequency |
+| Intel CPU | `coretemp`, RAPL energy | fans, RAPL power limits (long- and short-term), then frequency; its own throttle (TCC) just above the limit |
 | AMD CPU | `k10temp`, `zenpower` | fans, then frequency; RAPL if the firmware honors it |
 | AMD GPU | `amdgpu` | its own fan, then case fans, `power1_cap` |
 | Intel discrete GPU | `xe`, `i915` | case fans, `power1_max` |
@@ -276,7 +294,10 @@ energy preference, turbo and limits following the power source and coming back a
 `kill -9`; quiet mode taking power before Cooler Boost, and no boost at all where a little
 power is enough; the cooler learned, kept on disk and used on the next run; and the menu,
 driven through a terminal, saving what it changed and restarting the service. The silent fan
-curve while cool and the normal one back before Cooler Boost; a job yielding under CPU pressure
+curve while cool and the normal one back before Cooler Boost; a package that bursts to its
+short-term limit for the long one's 28 s window, held by power alone once both go down, and
+held without swinging where only the long one exists; the TCC offset set, put back after
+SIGTERM and `kill -9`, and left alone on AMD, under lockdown or with `tcc = no`; a job yielding under CPU pressure
 while a game and the desktop keep theirs; a memory hog ended and the session spared. It proves
 the logic. It proves nothing about any real driver or NVIDIA's real library, and a real
 chip's numbers will differ.

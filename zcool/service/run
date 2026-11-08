@@ -5,4 +5,6 @@ if grep -qs Micro-Star /sys/class/dmi/id/sys_vendor; then
 	mountpoint -q /sys/kernel/debug || mount -t debugfs -o nosuid,nodev,noexec debugfs /sys/kernel/debug 2>/dev/null
 	modprobe -q ec_sys write_support=1
 fi
+# Intel: the CPU's thermal target register (see tcc in the README), and undervolting if set
+grep -qs GenuineIntel /proc/cpuinfo && modprobe -q msr
 exec /usr/local/bin/zcool run
