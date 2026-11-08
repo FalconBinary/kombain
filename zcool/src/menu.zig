@@ -42,6 +42,8 @@ pub const Info = struct {
     ec_gpu_fan: ?u8 = null,
     has_epp: bool = false,
     has_turbo: bool = false,
+    /// the CPU has a short-term power limit zcool can hold
+    has_burst: bool = false,
     undervolt_note: []const u8 = "",
 };
 
@@ -153,6 +155,17 @@ fn buildItems(info: *const Info) void {
             .unset = 0,
             .help = "Lowers every chip's limit on this source: on battery, -10 keeps the laptop cooler and quieter.",
         }, joined(&key, "limits", suffix));
+        if (info.has_burst) add(.{
+            .kind = .number,
+            .label = "CPU bursts up to",
+            .min = 20,
+            .max = 120,
+            .step = 5,
+            .unset = 15,
+            .unset_label = "the firmware's",
+            .unit = " W",
+            .help = "The CPU's short-term power limit (PL2). A thin laptop's firmware often allows far more than its cooler carries, so each burst overheats it; zcool calibrate suggests a value.",
+        }, joined(&key, "burst", suffix));
         if (info.ec) add(.{
             .kind = .choice,
             .label = "MSI EC power profile",

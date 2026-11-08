@@ -121,7 +121,8 @@ class Ec:
 class Machine:
     def __init__(self, cpu=None, gpu=None, rapl=True, rapl_enforced=True, rapl_writable=True, freq=True, cpu_fan=True, pump=False, config="",
                  cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu", ec=None,
-                 epp=None, turbo=None, mains=None, rapl_window=False, pl2=True, cal_full=None):
+                 epp=None, turbo=None, mains=None, rapl_window=False, pl2=True, cal_full=None, pl1_watts=300, pl2_watts=300,
+                 psys=False):
         self.root = tempfile.mkdtemp(prefix="zcool-")
         self.cpu, self.gpu, self.nv, self.gpu_driver, self.ec = cpu, gpu, nvidia, gpu_driver, ec
         self.first_case = self.first_own_full = self.first_boost = self.first_trim = self.first_cap = None
@@ -183,15 +184,23 @@ class Machine:
             put(f"{self.nvme_dir}/temp1_input", nvme_temp * 1000)
         self.rapl_path = f"{r}/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
         self.pl2_path = f"{r}/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw"
+        self.pl1_uw, self.pl2_uw = pl1_watts * 1000000, pl2_watts * 1000000
         if rapl:
-            put(self.rapl_path, 300000000)
+            put(f"{r}/sys/class/powercap/intel-rapl:0/name", "package-0")
+            put(self.rapl_path, self.pl1_uw)
             put(f"{r}/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw", 300000000)
             if pl2:
                 put(f"{r}/sys/class/powercap/intel-rapl:0/constraint_1_name", "short_term")
-                put(self.pl2_path, 300000000)
+                put(self.pl2_path, self.pl2_uw)
             put(f"{r}/sys/class/powercap/intel-rapl:0/energy_uj", 0)
             if not rapl_writable:
                 os.chmod(self.rapl_path, 0o444)
+        if psys:
+            # the whole platform's limit, as a GF63 shows it: off, with a most it could be
+            p = f"{r}/sys/class/powercap/intel-rapl:1"
+            for name, value in (("name", "psys"), ("constraint_0_power_limit_uw", 0), ("constraint_0_max_power_uw", 200000000),
+                                ("constraint_1_name", "short_term"), ("constraint_1_power_limit_uw", 0), ("energy_uj", 0)):
+                put(f"{p}/{name}", value)
         for i in range(cores if freq else 0):
             base = f"{r}/sys/devices/system/cpu/cpufreq/policy{i}"
             put(f"{base}/scaling_max_freq", 5000000)
@@ -1600,7 +1609,7 @@ def the_menu_changes_settings_and_saves_them(r):
     r.check("zcool restarted" in out, out[-300:])
     # the balanced preset, and the excluded fan taken back
     keys(b"2")
-    keys(b"\x1b[B" * 12)
+    keys(b"\x1b[B" * 14)
     keys(b"\x1b[C")
     keys(b"s", 1.0)
     conf = get(f"{m.root}/etc/zcool.conf")
@@ -1925,7 +1934,7 @@ def gf63(config="cpu0.max = 70\n", **kw):
     """As a GF63 Thin 10SC: one fan that carries about 42 W at 70 C, a die over its sink by
     0.12 C per watt, and 90 W asked on every core."""
     return Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=30, r_die=0.12), cpu_fan=False, ec=Ec(one_fan=True),
-                   rapl_window=True, config=config, cal_full=90, **kw)
+                   rapl_window=True, config=config, cal_full=90, pl1_watts=45, pl2_watts=107, psys=True, **kw)
 
 
 def calibrate(m, seconds=600):
@@ -1961,16 +1970,20 @@ def calibration_learns_the_fans_and_the_power_and_gives_everything_back(r):
         r.note("fans carry " + ", ".join(f"{p} {lines[p][2]} W" for p in ("boost", "100%", "80%", "60%")) + f" at 70 C; took {took:.0f} s")
     power = [l.split() for l in cal.splitlines() if l.startswith("power ")]
     r.check(len(power) >= 4, cal)
+    # steps of the firmware's 45 W long-term limit, from 30% of it
+    r.check(power and abs(float(power[0][1]) - 13.5) < 2.5, f"first power point {power[:1]}")
     mhz = [float(p[2]) for p in power]
     r.check(mhz == sorted(mhz), f"more power runs faster: {mhz}")
     r.check(len([l for l in cal.splitlines() if l.startswith("cores ")]) == 3, cal)
     r.check("1 fan turns" in log and "they follow zcool's curve" in log, log[-800:])
+    r.check("  1 CPU: " in log and "burst.ac = " in log, log[-800:])
     learned = get(f"{m.root}/var/lib/zcool/learned") if os.path.exists(f"{m.root}/var/lib/zcool/learned") else ""
     r.check(learned.startswith("cpu0 "), f"learned {learned!r}")
     # everything as it was
     r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO and ec_curve(m) == Ec.CURVE and m.ec_byte(Ec.BOOST) == 0x05,
             f"0xf4 {m.ec_byte(Ec.FAN_MODE):#x}, curve {list(ec_curve(m))}, 0x98 {m.ec_byte(Ec.BOOST):#x}")
-    r.check(get(m.rapl_path) == "300000000" and get(m.pl2_path) == "300000000", f"limits {get(m.rapl_path)} {get(m.pl2_path)}")
+    r.check(get(m.rapl_path) == "45000000" and get(m.pl2_path) == "107000000", f"limits {get(m.rapl_path)} {get(m.pl2_path)}")
+    r.check(get(f"{m.root}/sys/class/powercap/intel-rapl:1/constraint_0_power_limit_uw") == "0", "psys is not the CPU's")
     r.check(not os.path.exists(f"{m.root}/run/zcool/state"), "the journal should be gone")
     r.check(m.cpu.peak <= 74, f"peak {m.cpu.peak:.1f}")
     out = m.cmd("list").stdout
@@ -1994,7 +2007,7 @@ def calibration_stopped_keeps_nothing_and_gives_everything_back(r):
     r.check("calibration stopped: nothing was kept" in m.text(), m.text()[-500:])
     r.check(not os.path.exists(f"{m.root}/var/lib/zcool/calibration"), "a stopped calibration should keep nothing")
     r.check(m.told == b"du", f"the service should come back: {m.told!r}")
-    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO and get(m.rapl_path) == "300000000", "not given back")
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO and get(m.rapl_path) == "45000000", "not given back")
     m.proc = None
     m.close()
     # on battery it does not start
@@ -2039,6 +2052,34 @@ def dump_shows_registers_clocks_and_the_ec(r):
     out = m.cmd("dump").stdout
     r.check("ec 16R5EMS1.102, GF63/GF65 Thin" in out, out[-1200:])
     r.check("  f0:" in out and "fan mode" in out, out[-1200:])
+    m.close()
+
+
+@scenario
+def a_burst_limit_holds_the_short_term_power_and_psys_stays_alone(r):
+    # bursts up to 64 W on mains and 30 W on battery, against the firmware's 107 W
+    m = Machine(cpu=Chip(load=20, g_max=1.6), rapl_window=True, pl1_watts=45, pl2_watts=107, psys=True, mains=True,
+                config="cpu0.max = 85\nburst.ac = 64\nburst.battery = 30\n")
+    m.start()
+    m.advance(3, limit_cpu=85)
+    r.check(get(m.pl2_path) == "64000000", f"PL2 {get(m.pl2_path)} on mains")
+    r.check("bursts up to 64 W" in m.text(), m.text()[-300:])
+    # a heat that needs power taken: the short-term limit stays under the cap all the while
+    m.cpu.load = 120
+    highest = 0
+    for _ in range(40):
+        m.advance(0.5, limit_cpu=85)
+        highest = max(highest, int(get(m.pl2_path)))
+    r.check(highest <= 64000000, f"PL2 went to {highest / 1e6:.0f} W")
+    m.cpu.load = 20
+    put(f"{m.root}/sys/class/power_supply/ADP1/online", 0)
+    m.advance(4, limit_cpu=85)
+    r.check(int(get(m.pl2_path)) <= 30000000, f"PL2 {get(m.pl2_path)} on battery")
+    psys = f"{m.root}/sys/class/powercap/intel-rapl:1"
+    r.check(get(f"{psys}/constraint_0_power_limit_uw") == "0" and get(f"{psys}/constraint_1_power_limit_uw") == "0",
+            "the platform's limit was taken for the CPU's")
+    m.stop()
+    r.check(get(m.pl2_path) == "107000000" and get(m.rapl_path) == "45000000", f"back: {get(m.rapl_path)} {get(m.pl2_path)}")
     m.close()
 
 

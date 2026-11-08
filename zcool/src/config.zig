@@ -23,6 +23,7 @@
 //!     noise.battery = quiet         a little power before loud fans
 //!     limits.battery = -10          every limit 10 C lower
 //!     mode.battery = eco            an MSI EC's own power profile
+//!     burst.ac = 64                 the CPU's short-term power limit (PL2), in watts
 
 const std = @import("std");
 const ec = @import("ec.zig");
@@ -49,9 +50,11 @@ pub const Source = struct {
     shift: i8 = 0,
     /// an MSI EC's own power profile
     mode: ?ec.Profile = null,
+    /// the most the CPU may burst to, in watts: its short-term power limit (PL2)
+    burst: ?u16 = null,
 
     pub fn any(self: *const Source) bool {
-        return self.epp != null or self.turbo != null or self.quiet or self.shift != 0 or self.mode != null;
+        return self.epp != null or self.turbo != null or self.quiet or self.shift != 0 or self.mode != null or self.burst != null;
     }
 };
 
@@ -220,6 +223,10 @@ fn applySource(s: *Source, name: []const u8, value: []const u8) bool {
         s.shift = shift;
     } else if (std.mem.eql(u8, name, "mode")) {
         s.mode = std.meta.stringToEnum(ec.Profile, value) orelse return false;
+    } else if (std.mem.eql(u8, name, "burst")) {
+        const watts = std.fmt.parseInt(u16, value, 10) catch return false;
+        if (watts < 10 or watts > 500) return false;
+        s.burst = watts;
     } else return false;
     return true;
 }
@@ -457,4 +464,12 @@ test "set handles one of many fan.exclude lines" {
     try std.testing.expectEqualStrings(text ++ "fan.exclude = c/pwm3\n", set(text, "fan.exclude", "c/pwm3", "c/pwm3", &out).?);
     const c = parse(set(text, "fan.exclude", null, "a/pwm1", &out).?);
     try std.testing.expect(!c.isExcluded("a/pwm1") and c.isExcluded("b/pwm2"));
+}
+
+test "a burst limit per power source" {
+    const c = parse("burst.ac = 64\nburst.battery = 25\nburst.ac = 5\n");
+    try std.testing.expectEqual(@as(u16, 64), c.ac.burst.?);
+    try std.testing.expectEqual(@as(u16, 25), c.battery.burst.?);
+    try std.testing.expect(c.ac.any() and c.battery.any());
+    try std.testing.expectEqual(@as(u32, 1), c.bad_lines);
 }

@@ -226,6 +226,8 @@ const CpuPower = struct {
     /// the short-term limit (PL2), which the CPU may burst to for the long one's whole window
     pl2: [max_packages]bool = @splat(false),
     pl2_original: [max_packages]i64 = @splat(0),
+    /// the most it may be: the firmware's, or the power source's `burst`
+    pl2_cap: [max_packages]i64 = @splat(0),
     pl2_saved: [max_packages]bool = @splat(false),
     freq_saved: bool = false,
     freq_active: bool = false,
@@ -472,10 +474,15 @@ fn discoverCpuPower() void {
     var path_buf: [256]u8 = undefined;
     var dir_buf: [256]u8 = undefined;
     var i: u8 = 0;
-    while (i < max_packages) : (i += 1) {
+    while (i < 16 and cpu_power.rapl_count < max_packages) : (i += 1) {
         var num: [4]u8 = undefined;
         const digits = std.fmt.bufPrint(&num, "{d}", .{i}) catch break;
         const limit = sys.readInt(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_0_power_limit_uw" })) orelse break;
+        // psys is the whole platform's power, the GPU's with it: only a package is the CPU's
+        var zone_buf: [32]u8 = undefined;
+        if (sys.readFile(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/name" }), &zone_buf)) |zone| {
+            if (!std.mem.startsWith(u8, zone, "package")) continue;
+        }
         const most = sys.readInt(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_0_max_power_uw" })) orelse limit;
         // firmware sometimes reports "no limit" as thousands of watts
         const base = if (limit > 0 and limit < 1_000_000_000) limit else most;
@@ -494,6 +501,7 @@ fn discoverCpuPower() void {
             const pl2 = sys.readInt(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_1_power_limit_uw" })) orelse 0;
             cpu_power.pl2[n] = pl2 > 0 and pl2 < 1_000_000_000;
             cpu_power.pl2_original[n] = pl2;
+            cpu_power.pl2_cap[n] = pl2;
         }
         cpu_power.rapl_count += 1;
     }
@@ -1109,17 +1117,18 @@ fn setPl2(i: usize, target: ?i64) void {
     var num: [4]u8 = undefined;
     const digits = std.fmt.bufPrint(&num, "{d}", .{cpu_power.rapl_index[i]}) catch return;
     const path = sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_1_power_limit_uw" });
+    const cap = cpu_power.pl2_cap[i];
     if (!cpu_power.pl2_saved[i]) {
-        if (target == null) return;
+        if (target == null and cap == cpu_power.pl2_original[i]) return;
         if (!journal.remember(path)) {
             cpu_power.pl2[i] = false;
             return;
         }
         cpu_power.pl2_saved[i] = true;
     }
-    const value = @min(target orelse cpu_power.pl2_original[i], cpu_power.pl2_original[i]);
+    const value = @min(target orelse cap, cap);
     const back = if (sys.writeInt(path, value)) sys.readInt(path) else null;
-    if (target != null and (back == null or @abs(back.? - value) > @divTrunc(value, 20))) {
+    if ((target != null or cap != cpu_power.pl2_original[i]) and (back == null or @abs(back.? - value) > @divTrunc(value, 20))) {
         sys.print("cpu: the short-term power limit does not stick here, the long-term one alone holds it\n");
         _ = sys.writeInt(path, cpu_power.pl2_original[i]);
         cpu_power.pl2[i] = false;
@@ -1723,6 +1732,7 @@ fn applySource(mains: bool) void {
     if (src.epp != null and hasEpp()) n = appendf(&buf, n, ", energy preference {s}", .{@tagName(src.epp.?)});
     if (src.turbo != null and turbo.len > 0) n = appendf(&buf, n, ", turbo {s}", .{if (src.turbo.?) "on" else "off"});
     if (src.quiet) n = appendf(&buf, n, ", quiet fans", .{});
+    if (src.burst) |w| n = appendf(&buf, n, ", bursts up to {d} W", .{w});
     const what = if (n > 2) buf[2..n] else "the firmware's own settings";
     // a config with only the EC's profiles says so in the EC's own line
     if (generalSettings(&cfg.ac) or generalSettings(&cfg.battery)) {
@@ -1730,11 +1740,24 @@ fn applySource(mains: bool) void {
     }
     applyEpp(src.epp);
     applyTurbo(src.turbo);
+    applyBurst(src.burst);
     if (ec_modes) applyEcMode(src.mode, source);
 }
 
 fn generalSettings(src: *const config.Source) bool {
-    return src.shift != 0 or src.epp != null or src.turbo != null or src.quiet;
+    return src.shift != 0 or src.epp != null or src.turbo != null or src.quiet or src.burst != null;
+}
+
+/// The CPU's short-term limit held at `watts`, never above the firmware's; null gives the
+/// firmware's back. Power taken for the heat stays under it as well.
+fn applyBurst(watts: ?u16) void {
+    for (0..cpu_power.rapl_count) |i| {
+        if (!cpu_power.pl2[i]) continue;
+        const want: i64 = if (watts) |w| @as(i64, w) * 1_000_000 else cpu_power.pl2_original[i];
+        cpu_power.pl2_cap[i] = @min(want, cpu_power.pl2_original[i]);
+        // under a cut the next one writes it, already under the cap
+        if (!dry_run and cpu_power.applied >= 1) setPl2(i, null);
+    }
 }
 
 /// Adds to a line being built; what does not fit is left out.
@@ -2283,6 +2306,7 @@ fn menuInfo(info: *menu.Info) void {
         if (sys.readIntFd(fd)) |v| info.on_mains = v == 1;
     }
     info.ec = ec.layout != null;
+    info.has_burst = cpu_power.rapl_count > 0 and cpu_power.pl2[0];
     if (ec.readings()) |r| {
         info.ec_cpu = r.cpu_temp;
         info.ec_gpu = r.gpu_temp;
@@ -2326,12 +2350,15 @@ fn calibrationStep(cores: usize) void {
 var cal_line_buf: [256]u8 = undefined;
 var cal_line = Text{ .buf = &cal_line_buf };
 
-/// The CPU clocks, the mean of every policy's: a CPU-bound load runs in proportion to them.
-fn meanMhz() f32 {
+/// The clocks of the first `cpus` CPUs, where the load runs, their mean: a CPU-bound load runs
+/// in proportion to them. The idle ones sit at their lowest and say nothing about it: on the
+/// GF63 one loaded CPU of twelve read as 1564 MHz.
+fn meanMhz(cpus: usize) f32 {
     var path_buf: [256]u8 = undefined;
     var sum: f32 = 0;
     var n: f32 = 0;
     for (cpu_power.policies[0..cpu_power.npolicies]) |p| {
+        if (p.index >= cpus) continue;
         var num: [8]u8 = undefined;
         const digits = std.fmt.bufPrint(&num, "{d}", .{p.index}) catch continue;
         const khz = sys.readInt(policyPath(&path_buf, digits, "scaling_cur_freq")) orelse continue;
@@ -2370,12 +2397,15 @@ fn holdFans(duty: f32, boost: bool, dt: f32) void {
     }
 }
 
-/// The package held at `level` of the power it drew with nothing holding it back.
-fn holdPower(level: f32, full_mw: []const f32) bool {
+/// The package held at `level` of the long-term limit its firmware gave it. What it drew on
+/// every CPU is no measure: by then zcool held it at the limit, and on the GF63 that read 37 W
+/// for a CPU the firmware lets draw 45.
+fn holdPower(level_wanted: f32) bool {
     for (0..cpu_power.rapl_count) |i| {
-        const base: f32 = @floatFromInt(cpu_power.rapl_base[i]);
-        cpu_power.rapl_reference[i] = @min(full_mw[i] * 1000, base);
+        cpu_power.rapl_reference[i] = @floatFromInt(cpu_power.rapl_base[i]);
     }
+    // all of it would be the firmware's limits back, its short-term one too: 107 W on the GF63
+    const level = @min(level_wanted, 0.999);
     cpu_power.applied = level;
     return applyRapl(level, false);
 }
@@ -2384,7 +2414,6 @@ const Calibration = struct {
     c: *Chip,
     load: calibrate.Load = .{},
     result: calibrate.Result = .{},
-    full_mw: [max_packages]f32 = @splat(0),
     cores: usize,
     last: i64 = 0,
 
@@ -2414,7 +2443,7 @@ const Calibration = struct {
         return dt;
     }
 
-    /// The load on `n` cores for `seconds`, power held at the limit: what it draws and how fast.
+    /// The load on `n` CPUs for 10 s, power held at the limit: what it draws and how fast.
     fn coresPoint(self: *Calibration, i: usize, n: usize) bool {
         calibrationStep(n);
         if (sys.root.len == 0) self.load.set(n);
@@ -2424,26 +2453,23 @@ const Calibration = struct {
         var t: f32 = 0;
         while (t < 10) {
             t += self.tick(255, true, true) orelse return false;
-            if (n == self.cores) {
-                for (0..cpu_power.rapl_count) |k| self.full_mw[k] = @max(self.full_mw[k], cpu_power.rapl_watts[k]);
-            }
             if (t < 5) continue;
             watts += cpuWatts();
-            mhz += meanMhz();
+            mhz += meanMhz(n);
             samples += 1;
         }
         self.result.core_counts[i] = @intCast(n);
         self.result.cores[i] = .{ .watts = watts / samples, .mhz = mhz / samples };
         const line = &cal_line;
-        line.add("  ").num(@intCast(n)).add(if (n == 1) " core: " else " cores: ").whole(mhz / samples).add(" MHz at ").tenth(watts / samples).add(" W").line();
+        line.add("  ").num(@intCast(n)).add(if (n == 1) " CPU: " else " CPUs: ").whole(mhz / samples).add(" MHz at ").tenth(watts / samples).add(" W").line();
         return true;
     }
 
-    /// Every core at `level` of its full power with every fan at full: how fast it runs there.
+    /// Every CPU loaded at `level` of the long-term limit, every fan at full: how fast it runs.
     /// False once the cooler cannot hold it, or calibration has to stop.
     fn powerPoint(self: *Calibration, i: usize, level: f32) bool {
         calibrationStep(self.cores);
-        if (!holdPower(level, &self.full_mw)) return false;
+        if (!holdPower(level)) return false;
         var watts: f32 = 0;
         var mhz: f32 = 0;
         var samples: f32 = 0;
@@ -2457,7 +2483,7 @@ const Calibration = struct {
             }
             if (t < 5) continue;
             watts += cpuWatts();
-            mhz += meanMhz();
+            mhz += meanMhz(self.cores);
             samples += 1;
         }
         self.result.power[i] = .{ .watts = watts / samples, .mhz = mhz / samples };
@@ -2592,13 +2618,13 @@ fn runCalibrate() u8 {
 }
 
 fn measure(run: *Calibration) bool {
-    sys.print("how fast it runs on one core, half of them and all\n");
+    sys.print("how fast it runs on one CPU, half of them and all\n");
     const counts = [calibrate.core_points]usize{ 1, @max(run.cores / 2, 1), run.cores };
     for (counts, 0..) |n, i| {
         if (i > 0 and n == counts[i - 1]) continue;
         if (!run.coresPoint(i, n)) return false;
     }
-    sys.print("how fast it runs at each power, every fan at full\n");
+    sys.print("how fast it runs at each power, every CPU loaded and every fan at full\n");
     var held: f32 = calibrate.power_points[0];
     for (calibrate.power_points, 0..) |level, i| {
         if (!run.powerPoint(i, level)) {
@@ -2655,10 +2681,19 @@ fn describeCalibration() void {
     }
     if (!first) t.line();
     if (cal.quietFloor()) |floor| t.add("  quiet mode may give up ").whole((1 - floor) * 100).add("% of the power for 5% of the speed").line();
+    // the firmware's bursts against what the cooler carries: on the GF63 107 W against 32
+    const carries = if (cal.carries[0] > 0) cal.carries[0] else cal.carries[1];
+    if (cpu_power.rapl_count > 0 and cpu_power.pl2[0] and carries > 0) {
+        const burst: f32 = @as(f32, @floatFromInt(cpu_power.pl2_original[0])) / 1e6;
+        if (burst > carries * 2 + 10) {
+            _ = t.add("  bursts: the firmware lets it draw ").whole(burst).add(" W for a while and the cooler carries ").whole(carries);
+            t.add(" W: burst.ac = ").whole(@round(carries * 2 / 5) * 5).add(" holds them to twice that").line();
+        }
+    }
     first = true;
     for (cal.cores, cal.core_counts) |p, n| {
         if (p.watts <= 0) continue;
-        _ = t.add(if (first) "  cores: " else ", ").num(n).add(": ").whole(p.mhz).add(" MHz at ").whole(p.watts).add(" W");
+        _ = t.add(if (first) "  on " else ", ").num(n).add(if (n == 1) " CPU " else " CPUs ").whole(p.mhz).add(" MHz at ").whole(p.watts).add(" W");
         first = false;
     }
     if (!first) t.line();

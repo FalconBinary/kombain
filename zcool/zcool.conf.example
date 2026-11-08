@@ -35,6 +35,12 @@
 # mode.battery = eco
 # ec = no
 
+# The most the CPU may burst to, in watts: its short-term power limit (PL2), never above
+# the firmware's. `zcool calibrate` suggests a value when the firmware allows far more
+# than the cooler carries.
+# burst.ac = 64
+# burst.battery = 30
+
 # zcool learns how much power the cooler carries at the limit and starts there next time.
 # learn = no
 

@@ -108,11 +108,13 @@ as the cooler would carry it. `learn = no` turns it off.
 `doas zcool calibrate`, once, plugged in, in 3 to 8 minutes: zcool loads the CPU itself and
 measures what it otherwise finds out while the heat comes.
 
-- **How fast it runs** on one core, on half of them and on all, held at its limit.
-- **How fast it runs at each power,** from 30% of what it draws on every core to all of it,
-  every fan at full, until the cooler no longer holds the limit. Usually the last third of
-  the power buys a few percent of speed. Quiet mode then gives up the power that costs at most
-  5% of the speed before the fans get louder, instead of a fixed 15%.
+- **How fast it runs** on one CPU, on half of them and on all, held at its limit: the clocks of
+  the CPUs it loads, not of the idle ones.
+- **How fast it runs at each power,** from 30% of the firmware's long-term limit (PL1) to all
+  of it, every CPU loaded and every fan at full, until the cooler no longer holds the limit.
+  Usually the last third of the power buys a few percent of speed: on the GF63 31 W ran at
+  3.3 GHz and 26 W at 3.2. Quiet mode then gives up the power that costs at most 5% of the
+  speed before the fans get louder, instead of a fixed 15%.
 - **What each fan speed carries at the limit:** Cooler Boost, 100%, 80% and 60%, the CPU held
   at its limit at each until it settles. With that the fans go straight to the speed a steady
   heat needs instead of finding it over minutes, and the power limit starts where the cooler
@@ -120,6 +122,10 @@ measures what it otherwise finds out while the heat comes.
 - **Which fans turn, and whether they follow zcool's curve.** A GF63 Thin has one fan, though
   its EC keeps two curves. If 60% turns them as fast as 100%, the EC ignores the curve, and
   zcool keeps to Cooler Boost from then on.
+
+On the GF63 at 70 C the fan carried 27 W at 60% (3734 rpm) and 32 W with Cooler Boost (6927):
+nearly twice the speed, far louder, for a fifth more heat. Where the firmware bursts far past
+what the cooler carries, calibration says so, and suggests a `burst` of twice that.
 
 The service stops while it runs and starts again after. Ctrl-C, or any chip 4 C over its limit,
 stops it: nothing is kept and everything is put back. It goes to `/var/lib/zcool/calibration`;
@@ -134,9 +140,10 @@ and zcool puts back what it changed when it stops, like everything else.
 |---|---|---|
 | `epp` | `performance`, `balance_performance`, `balance_power`, `power`, `default` | The CPU's energy preference (intel_pstate, amd-pstate): how readily it climbs to high clocks. On battery `balance_power` or `power` saves a lot for a little speed. |
 | `turbo` | `yes`, `no` | Clocks above the base clock. Off on battery: a cool, quiet laptop that lasts much longer, and a slower one. |
-| `noise` | `normal`, `quiet` | Quiet: a chip first gives up to 15% of its power before its fans go past the firmware's curve or Cooler Boost comes on. If that is not enough the fans join, and stay until the heat is gone for 30 s, so they do not come and go. |
+| `noise` | `normal`, `quiet` | Quiet: a chip first gives up to 15% of its power, or what calibration found costs at most 5% of the speed, before its fans go past the firmware's curve or Cooler Boost comes on. If that is not enough the fans join, and stay until the heat is gone for 30 s, so they do not come and go. |
 | `limits` | `0` to `-30` | Every chip's limit moves by this: `limits.battery = -10` keeps a laptop on battery 10 C cooler. |
 | `mode` | `eco`, `comfort`, `sport`, `turbo` | An MSI EC's own power profile, see below. |
+| `burst` | `10` to `500` | Watts the CPU may burst to: its short-term power limit (PL2), never above the firmware's. A thin laptop's firmware often allows far more than its cooler carries: the GF63's 107 W against 32, so every burst from idle shoots its die past the limit. Power taken for the heat stays under it as well. `zcool calibrate` suggests twice what the cooler carries. |
 
 ```ini
 epp.ac = balance_performance
@@ -156,7 +163,8 @@ PL1. Lowering PL1 alone does nothing for those 28 s: on the GF63 the temperature
 rising and frequency limits had to step in every time. So zcool lowers PL2 with it and the
 power drops at once; both go back together. If a package still draws well above its limit,
 frequency limits hold it from then on, alone, since two levers that act at different speeds
-swing a chip between full power and cut.
+swing a chip between full power and cut. Only the CPU's packages are taken: psys, the
+whole platform's limit next to it on many laptops, would hold the GPU and all with it.
 
 A laptop CPU's die can climb 7 C in a quarter of a second, faster than any program reads it.
 The CPU's own thermal throttle (TCC) acts in microseconds, at TjMax (usually 100 C) unless
@@ -354,7 +362,8 @@ fan and a clock limit, a desktop one with its own fan, the case fan and its powe
 an Intel GPU's power1_max, an idle GPU read rarely enough to sleep, one asleep never
 reached, and NVIDIA's settings given back after `kill -9` of zcool and of both. A NVIDIA
 library that reads only an attached GPU, and one that reads nothing, read through the EC.
-Calibration on a GF63-like laptop with one fan: the fans' carry at each speed, the speed at
+A burst limit held on mains and on battery, under a cut as well, and given back; psys never
+taken for the CPU's. Calibration on a GF63-like laptop with one fan: the fans' carry at each speed, the speed at
 each power and core count, the service stopped and started again, what was learned seeded, and
 everything back after it and after Ctrl-C; refused on battery; a calibration whose fans
 ignored the curve keeping zcool to Cooler Boost, and its quiet floor. `zcool dump` decoding
