@@ -19,8 +19,11 @@ fn flags(o: linux.O) usize {
     return @as(u32, @bitCast(o));
 }
 
+// The helpers marked noinline are called from hundreds of places: inlined at each one they came
+// to a seventh of the binary, and a call costs nothing next to the system call it makes.
+
 /// Joins path pieces into `buf`. A path that does not fit becomes "", which fails to open.
-pub fn join(buf: []u8, parts: []const []const u8) [:0]const u8 {
+pub noinline fn join(buf: []u8, parts: []const []const u8) [:0]const u8 {
     var n: usize = 0;
     for (parts) |part| {
         if (n + part.len + 1 > buf.len) {
@@ -34,7 +37,7 @@ pub fn join(buf: []u8, parts: []const []const u8) [:0]const u8 {
     return buf[0..n :0];
 }
 
-pub fn openRead(path: [:0]const u8) ?i32 {
+pub noinline fn openRead(path: [:0]const u8) ?i32 {
     const o: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true };
     const rc = ok(linux.syscall4(.openat, at_fdcwd, @intFromPtr(path.ptr), flags(o), 0)) orelse return null;
     return @intCast(rc);
@@ -64,7 +67,7 @@ pub fn pwrite(fd: i32, buf: []const u8, offset: u64) ?usize {
     return ok(linux.syscall4(.pwrite64, @as(usize, @intCast(fd)), @intFromPtr(buf.ptr), buf.len, offset));
 }
 
-pub fn readFile(path: [:0]const u8, buf: []u8) ?[]u8 {
+pub noinline fn readFile(path: [:0]const u8, buf: []u8) ?[]u8 {
     const fd = openRead(path) orelse return null;
     defer close(fd);
     const n = pread(fd, buf, 0) orelse return null;
@@ -72,7 +75,7 @@ pub fn readFile(path: [:0]const u8, buf: []u8) ?[]u8 {
 }
 
 /// The file must exist: this never creates anything in /sys.
-pub fn writeFile(path: [:0]const u8, data: []const u8) bool {
+pub noinline fn writeFile(path: [:0]const u8, data: []const u8) bool {
     const o: linux.O = .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true };
     const rc = ok(linux.syscall4(.openat, at_fdcwd, @intFromPtr(path.ptr), flags(o), 0)) orelse return false;
     const fd: i32 = @intCast(rc);
@@ -81,7 +84,7 @@ pub fn writeFile(path: [:0]const u8, data: []const u8) bool {
 }
 
 /// Replaces a file in one step, so a crash leaves the old content or the new, never half.
-pub fn replaceFile(path: [:0]const u8, data: []const u8) bool {
+pub noinline fn replaceFile(path: [:0]const u8, data: []const u8) bool {
     var tmp_buf: [300]u8 = undefined;
     const tmp = join(&tmp_buf, &.{ path, ".tmp" });
     const o: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true };
@@ -112,7 +115,7 @@ pub fn mkdir(path: [:0]const u8) void {
     _ = linux.syscall3(.mkdirat, at_fdcwd, @intFromPtr(path.ptr), 0o700);
 }
 
-pub fn exists(path: [:0]const u8) bool {
+pub noinline fn exists(path: [:0]const u8) bool {
     const fd = openRead(path) orelse return false;
     close(fd);
     return true;
@@ -122,18 +125,18 @@ pub fn parseInt(text: []const u8) ?i64 {
     return std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t\r\n"), 10) catch null;
 }
 
-pub fn readInt(path: [:0]const u8) ?i64 {
+pub noinline fn readInt(path: [:0]const u8) ?i64 {
     var buf: [32]u8 = undefined;
     return parseInt(readFile(path, &buf) orelse return null);
 }
 
-pub fn readIntFd(fd: i32) ?i64 {
+pub noinline fn readIntFd(fd: i32) ?i64 {
     var buf: [32]u8 = undefined;
     const n = pread(fd, &buf, 0) orelse return null;
     return parseInt(buf[0..n]);
 }
 
-pub fn writeInt(path: [:0]const u8, value: i64) bool {
+pub noinline fn writeInt(path: [:0]const u8, value: i64) bool {
     var buf: [24]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return false;
     return writeFile(path, text);
@@ -241,6 +244,35 @@ pub fn reap(pid: i32, ms: i64) bool {
         sleepMs(20);
         waited += 20;
     }
+}
+
+/// A process that only burns one core, `cpu`, until it is killed, or zcool goes however it goes.
+pub fn forkWorker(cpu: usize) ?i32 {
+    const parent = linux.getpid();
+    const pid = ok(linux.fork()) orelse return null;
+    if (pid != 0) return @intCast(pid);
+    prctl(1, @backingInt(linux.SIG.KILL)); // PR_SET_PDEATHSIG
+    if (linux.getppid() != parent) linux.exit_group(0);
+    var mask: [16]usize = @splat(0);
+    const bits = @bitSizeOf(usize);
+    if (cpu / bits < mask.len) {
+        mask[cpu / bits] = @as(usize, 1) << @intCast(cpu % bits);
+        _ = linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(mask)), @intFromPtr(&mask));
+    }
+    var x: f64 = 1;
+    while (true) {
+        x = x * 1.0000001 + 0.000001;
+        std.mem.doNotOptimizeAway(x);
+    }
+}
+
+/// The CPUs this process may run on.
+pub fn cpuCount() usize {
+    var mask: [16]usize = @splat(0);
+    _ = ok(linux.syscall3(.sched_getaffinity, 0, @sizeOf(@TypeOf(mask)), @intFromPtr(&mask))) orelse return 1;
+    var n: usize = 0;
+    for (mask) |word| n += @popCount(word);
+    return @max(n, 1);
 }
 
 pub fn kill(pid: i32, signal: linux.SIG) void {

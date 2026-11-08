@@ -20,6 +20,9 @@ const nvidia = @import("nvidia.zig");
 const ec = @import("ec.zig");
 const menu = @import("menu.zig");
 const guard = @import("guard.zig");
+const dump = @import("dump.zig");
+const calibrate = @import("calibrate.zig");
+const Text = @import("text.zig").Text;
 const tcc = @import("tcc.zig");
 
 pub const std_options: std.Options = .{
@@ -872,6 +875,18 @@ fn updateFan(fan: *Fan, demand: f32, dt: f32) void {
 /// zcool lets go. Also in the journal, for whatever ends zcool.
 var curve_mode: u8 = 0;
 var curve_original: [2][ec.curve_len]u8 = undefined;
+/// What calibration says the board's fans need for what the CPU draws now, held at its fan point,
+/// as a demand over the speed zcool took them from. Null while nothing tells.
+fn calibratedNeed(c: *const Chip, index: usize) ?f32 {
+    if (c.kind != .cpu or !cal.known()) return null;
+    const duty = cal.fanDuty(chipWatts(c) orelse return null, c.limit - control.fan_margin) orelse return null;
+    for (fans[0..nfans]) |*f| {
+        if (f.unusable or !f.managed or f.owner >= 0 or !fanServes(f, index)) continue;
+        return std.math.clamp((duty - f.floor) / @max(255 - f.floor, 1), 0, 1);
+    }
+    return null;
+}
+
 /// zcool's curve runs a fan at full this far over the highest limit of its chips, by the EC alone
 const curve_safe_above: f32 = 8;
 /// a fan the EC has been seen turning: only then does an RPM of 0 mean it stands still
@@ -992,7 +1007,7 @@ fn updateCurve(fan: *Fan, dt: f32) void {
         fan.written = percent;
     }
     // past full: Cooler Boost, and off only once the fans have come well down
-    const boost = if (fan.ctl.duty >= 254) true else if (fan.ctl.duty < curve_boost_off) false else fan.boost_on;
+    const boost = !boost_barred and (if (fan.ctl.duty >= 254) true else if (fan.ctl.duty < curve_boost_off) false else fan.boost_on);
     if (boost != fan.boost_on) {
         if (!dry_run and !ec.setBoost(boost)) return curveFailed(fan);
         sys.printf("{s}: Cooler Boost {s}\n", .{ fan.name(), if (boost) "on, every fan past full" else "off" });
@@ -1503,9 +1518,12 @@ fn step(dt: f32) void {
             c.drive = .{};
             continue;
         }
+        c.drive.need = calibratedNeed(c, index);
         const d = c.drive.update(&c.thermal, c.limit, dt);
-        // a chip going through its critical point gets everything at once
-        wants[index] = if (c.emergency) 1 else d;
+        // a chip going through its critical point gets everything at once, and one whose power
+        // is taken keeps every fan until it has it all back: power first, then quiet. Fans
+        // that came down while it was cut went off and on again on the GF63.
+        wants[index] = if (c.emergency or c.throttle.level < 1) 1 else d;
     }
     for (fans[0..nfans]) |*f| {
         var demand: f32 = 0;
@@ -1912,6 +1930,19 @@ fn runDaemon(selftest: bool) u8 {
     if (cfg.gpu_sleep) gpus.allowSleep(dry_run);
     discover();
     if (cfg.learn) loadLearned();
+    loadCalibration();
+    for (fans[0..nfans]) |*f| {
+        // calibration found the fans turn as fast at 60% as at full: the EC does not follow the curve
+        if (f.ec_curve and cal.curveFollowed() == false) {
+            sys.printf("{s}: calibration found the fans do not follow zcool's curve: Cooler Boost alone\n", .{f.name()});
+            f.ec_curve = false;
+            f.ec_boost = true;
+            nameFan(f, "ec/cooler_boost");
+        }
+    }
+    for (chips[0..nchips]) |*c| {
+        if (c.kind == .cpu and cal.known()) c.quiet.floor = cal.quietFloor() orelse control.quiet_floor;
+    }
     if (ec.layout != null) {
         var curve = false;
         for (fans[0..nfans]) |*f| curve = curve or f.ec_curve;
@@ -2103,6 +2134,13 @@ fn listPower() void {
         first = false;
         sys.printf("  {s:<12} {d:>5.0} W at {d:.0}C\n", .{ c.name(), c.learned.watts, c.learned.at });
     }
+    loadCalibration();
+    if (cal.known()) {
+        sys.print("\n");
+        describeCalibration();
+    } else {
+        sys.print("\nnot calibrated: doas zcool calibrate, plugged in, a few minutes\n");
+    }
 }
 
 /// An MSI laptop's EC: what it reads, and why zcool does or does not use it.
@@ -2131,7 +2169,10 @@ fn listEc() void {
     const mode = ec.read(l.fan_mode) orelse return;
     const curve: []const u8 = if (mode == c.advanced) "the advanced curve, zcool's while it holds the fans" else if (mode == l.fan_silent) "the firmware's silent curve" else if (mode == l.fan_auto) "the firmware's normal curve" else "unknown";
     sys.printf("  fans by {s}", .{curve});
-    for (0..2) |i| if (ec.rpm(i)) |rpm| sys.printf("{s}{s} {d} rpm", .{ if (i == 0) "; " else ", ", ec.fan_names[i], rpm });
+    // a fan that does not turn is often not there: a GF63 Thin has one, the EC keeps two curves
+    for (0..2) |i| if (ec.rpm(i)) |rpm| {
+        if (i == 0 or rpm > 0) sys.printf("{s}{s} {d} rpm", .{ if (i == 0) "; " else ", ", ec.fan_names[i], rpm });
+    };
     sys.print("\n");
 }
 
@@ -2253,10 +2294,382 @@ fn menuInfo(info: *menu.Info) void {
     info.undervolt_note = if (undervolt.lockdownActive()) "kernel lockdown is on: refused" else "";
 }
 
+// ---------------------------------------------------------------- calibration
+
+/// What `zcool calibrate` measured last, from /var/lib/zcool/calibration.
+var cal = calibrate.Result{};
+/// Calibration holds zcool's curve at full without Cooler Boost for one of its points.
+var boost_barred = false;
+
+fn calibrationPath(buf: []u8) [:0]const u8 {
+    return sys.join(buf, &.{ sys.root, "/var/lib/zcool/calibration" });
+}
+
+fn loadCalibration() void {
+    var path_buf: [256]u8 = undefined;
+    var text: [2048]u8 = undefined;
+    cal = calibrate.parse(sys.readFile(calibrationPath(&path_buf), &text) orelse return);
+}
+
+/// What calibration does now, in /run/zcool/calibration: `cores 3` while it loads three cores,
+/// `idle` once it is done. Under a fake root nothing real is loaded, and the simulator models
+/// the load it reads here.
+fn calibrationStep(cores: usize) void {
+    var text_buf: [32]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    var t = Text{ .buf = &text_buf };
+    if (cores == 0) _ = t.add("idle\n") else _ = t.add("cores ").num(@intCast(cores)).add("\n");
+    _ = sys.replaceFile(sys.join(&path_buf, &.{ sys.root, "/run/zcool/calibration" }), t.str());
+}
+
+/// Calibration's lines, built without std.fmt: see text.zig.
+var cal_line_buf: [256]u8 = undefined;
+var cal_line = Text{ .buf = &cal_line_buf };
+
+/// The CPU clocks, the mean of every policy's: a CPU-bound load runs in proportion to them.
+fn meanMhz() f32 {
+    var path_buf: [256]u8 = undefined;
+    var sum: f32 = 0;
+    var n: f32 = 0;
+    for (cpu_power.policies[0..cpu_power.npolicies]) |p| {
+        var num: [8]u8 = undefined;
+        const digits = std.fmt.bufPrint(&num, "{d}", .{p.index}) catch continue;
+        const khz = sys.readInt(policyPath(&path_buf, digits, "scaling_cur_freq")) orelse continue;
+        sum += @floatFromInt(khz);
+        n += 1;
+    }
+    return if (n > 0) sum / n / 1000 else 0;
+}
+
+fn cpuWatts() f32 {
+    var mw: f32 = 0;
+    for (cpu_power.rapl_watts[0..cpu_power.rapl_count]) |w| mw += w;
+    return mw / 1000;
+}
+
+/// RPM of the CPU's fan and the GPU's: through the EC, or the first fans hwmon shows.
+fn fanRpm() [2]u32 {
+    if (ec.layout) |l| if (l.curve != null) return .{ ec.rpm(0) orelse 0, ec.rpm(1) orelse 0 };
+    var rpm: [2]u32 = .{ 0, 0 };
+    var n: usize = 0;
+    for (fans[0..nfans]) |*f| {
+        if (f.input_fd < 0 or n == 2) continue;
+        rpm[n] = @intCast(@max(sys.readIntFd(f.input_fd) orelse 0, 0));
+        n += 1;
+    }
+    return rpm;
+}
+
+/// Every fan zcool can run held at `duty`; never under the firmware's speed, as always.
+fn holdFans(duty: f32, boost: bool, dt: f32) void {
+    boost_barred = !boost;
+    for (fans[0..nfans]) |*f| {
+        if (f.unusable) continue;
+        const demand = if (f.managed) std.math.clamp((duty - f.floor) / @max(255 - f.floor, 1), 0.001, 1) else 1;
+        updateFan(f, demand, dt);
+    }
+}
+
+/// The package held at `level` of the power it drew with nothing holding it back.
+fn holdPower(level: f32, full_mw: []const f32) bool {
+    for (0..cpu_power.rapl_count) |i| {
+        const base: f32 = @floatFromInt(cpu_power.rapl_base[i]);
+        cpu_power.rapl_reference[i] = @min(full_mw[i] * 1000, base);
+    }
+    cpu_power.applied = level;
+    return applyRapl(level, false);
+}
+
+const Calibration = struct {
+    c: *Chip,
+    load: calibrate.Load = .{},
+    result: calibrate.Result = .{},
+    full_mw: [max_packages]f32 = @splat(0),
+    cores: usize,
+    last: i64 = 0,
+
+    /// One tick: read everything, keep the CPU at its limit if asked, and watch every chip.
+    /// False when calibration has to stop.
+    fn tick(self: *Calibration, fan_duty: ?f32, boost: bool, hold_limit: bool) ?f32 {
+        sys.sleepMs(250);
+        const now = sys.nowMs();
+        const dt = @as(f32, @floatFromInt(now - self.last)) / 1000;
+        self.last = now;
+        if (stop_requested or !readChips(now)) return null;
+        sampleCpuPower(now);
+        if (fan_duty) |duty| holdFans(duty, boost, dt);
+        const c = self.c;
+        if (hold_limit) {
+            c.throttle.update(&c.thermal, c.limit, c.crit, true, dt);
+            applyCpu(c.throttle.level);
+        }
+        for (chips[0..nchips]) |*other| {
+            if (!other.controlled() or !other.thermal.ready or other.asleep) continue;
+            if (other.thermal.temp > other.limit + 4 or other.emergency) {
+                const t = &cal_line;
+                t.add(other.name()).add(": ").tenth(other.thermal.temp).add("C, far over its ").whole(other.limit).add("C limit: calibration stops").line();
+                return null;
+            }
+        }
+        return dt;
+    }
+
+    /// The load on `n` cores for `seconds`, power held at the limit: what it draws and how fast.
+    fn coresPoint(self: *Calibration, i: usize, n: usize) bool {
+        calibrationStep(n);
+        if (sys.root.len == 0) self.load.set(n);
+        var watts: f32 = 0;
+        var mhz: f32 = 0;
+        var samples: f32 = 0;
+        var t: f32 = 0;
+        while (t < 10) {
+            t += self.tick(255, true, true) orelse return false;
+            if (n == self.cores) {
+                for (0..cpu_power.rapl_count) |k| self.full_mw[k] = @max(self.full_mw[k], cpu_power.rapl_watts[k]);
+            }
+            if (t < 5) continue;
+            watts += cpuWatts();
+            mhz += meanMhz();
+            samples += 1;
+        }
+        self.result.core_counts[i] = @intCast(n);
+        self.result.cores[i] = .{ .watts = watts / samples, .mhz = mhz / samples };
+        const line = &cal_line;
+        line.add("  ").num(@intCast(n)).add(if (n == 1) " core: " else " cores: ").whole(mhz / samples).add(" MHz at ").tenth(watts / samples).add(" W").line();
+        return true;
+    }
+
+    /// Every core at `level` of its full power with every fan at full: how fast it runs there.
+    /// False once the cooler cannot hold it, or calibration has to stop.
+    fn powerPoint(self: *Calibration, i: usize, level: f32) bool {
+        calibrationStep(self.cores);
+        if (!holdPower(level, &self.full_mw)) return false;
+        var watts: f32 = 0;
+        var mhz: f32 = 0;
+        var samples: f32 = 0;
+        var t: f32 = 0;
+        while (t < 10) {
+            t += self.tick(255, true, false) orelse return false;
+            if (self.c.thermal.temp > self.c.limit + 1) {
+                const line = &cal_line;
+                line.add("  past ").tenth(cpuWatts()).add(" W the cooler does not hold ").whole(self.c.limit).add("C").line();
+                return false;
+            }
+            if (t < 5) continue;
+            watts += cpuWatts();
+            mhz += meanMhz();
+            samples += 1;
+        }
+        self.result.power[i] = .{ .watts = watts / samples, .mhz = mhz / samples };
+        // this close, the next step would take it over: a die follows its power at once
+        if (self.c.thermal.temp > self.c.limit - 1.5) {
+            const line = &cal_line;
+            line.add("  ").tenth(watts / samples).add(" W: ").whole(mhz / samples).add(" MHz, and the cooler holds no more").line();
+            return false;
+        }
+        const line = &cal_line;
+        line.add("  ").tenth(watts / samples).add(" W: ").whole(mhz / samples).add(" MHz").line();
+        return true;
+    }
+
+    /// Every fan at one speed and the CPU held at its limit: the power it settles at is what
+    /// that speed carries. False when calibration has to stop.
+    fn fanPoint(self: *Calibration, i: usize) bool {
+        const p = calibrate.fan_points[i];
+        calibrationStep(self.cores);
+        var watts = calibrate.Settle{};
+        var temps = calibrate.Settle{};
+        var t: f32 = 0;
+        while (t < 90) {
+            t += self.tick(p.duty, p.boost, true) orelse return false;
+            watts.add(cpuWatts());
+            temps.add(self.c.thermal.temp);
+            if (t >= 20 and watts.steady(0.06) and temps.steady(0.015)) break;
+        }
+        const temp = temps.mean();
+        if (temp <= calibrate.ambient + 5) return true;
+        // where it settled is near the limit: what it carries at the limit itself
+        self.result.carries[i] = watts.mean() * (self.c.limit - calibrate.ambient) / (temp - calibrate.ambient);
+        self.result.rpm[i] = fanRpm();
+        const line = &cal_line;
+        _ = line.add("  fans at ").add(p.name).add(": ").tenth(self.result.carries[i]).add(" W at ").whole(self.c.limit).add("C");
+        if (t >= 90) _ = line.add(" (still moving after 90 s)");
+        for (self.result.rpm[i], 0..) |rpm, k| {
+            if (rpm > 0) _ = line.add(", ").add(ec.fan_names[k]).add(" fan ").num(rpm).add(" rpm");
+        }
+        line.line();
+        return true;
+    }
+};
+
+fn runCalibrate() u8 {
+    if (std.os.linux.getuid() != 0 and sys.root.len == 0) {
+        sys.print("calibration sets power limits and fans: doas zcool calibrate\n");
+        return 1;
+    }
+    if (dry_run) {
+        sys.print("calibration has no dry run: it measures what limits and fans do\n");
+        return 2;
+    }
+    if (openMains()) |fd| {
+        defer sys.close(fd);
+        if (sys.readIntFd(fd) == 0) {
+            sys.print("on battery: plug the charger in, calibration measures full power\n");
+            return 1;
+        }
+    }
+    // the service runs the same fans and limits: it stops for the few minutes, and comes back
+    var stopped = false;
+    if (menu.serviceRunning()) {
+        sys.print("stopping the zcool service while calibration runs\n");
+        stopped = menu.tellService("d") orelse false;
+        var waited: u32 = 0;
+        while (menu.serviceRunning() and waited < 50) : (waited += 1) sys.sleepMs(200);
+        if (menu.serviceRunning()) {
+            sys.print("the service did not stop: doas sv stop zcool, then try again\n");
+            return 1;
+        }
+    }
+    defer if (stopped) {
+        _ = menu.tellService("u");
+        sys.print("the zcool service runs again, with what was measured\n");
+    };
+    journal.prepare();
+    _ = journal.restore();
+    gpus.scan();
+    discover();
+    if (cfg.learn) loadLearned();
+    var cpu: ?*Chip = null;
+    for (chips[0..nchips]) |*c| {
+        if (c.kind == .cpu and c.controlled()) {
+            cpu = c;
+            break;
+        }
+    }
+    const c = cpu orelse {
+        sys.print("no CPU with a limit: nothing to calibrate\n");
+        return 1;
+    };
+    if (cpu_power.rapl_count == 0) {
+        sys.print("this CPU shows no power limit (RAPL): nothing to calibrate\n");
+        return 1;
+    }
+    installSignals();
+    if (cfg.tcc and undervolt.isIntel() and !undervolt.lockdownActive()) tcc.apply(c.base_limit, false);
+    var path_buf: [256]u8 = undefined;
+    sys.mkdir(sys.join(&path_buf, &.{ sys.root, "/var/lib/zcool" }));
+
+    const cores = if (sys.root.len > 0) @max(cpu_power.npolicies, 1) else sys.cpuCount();
+    var run = Calibration{ .c = c, .cores = cores, .last = sys.nowMs() };
+    run.result.limit = c.limit;
+    cal_line.add("calibrating ").add(c.name()).add(" at its ").whole(c.limit).add("C limit, for 3 to 8 minutes; Ctrl-C stops it and keeps nothing").line();
+    const ok = measure(&run);
+    run.load.stop();
+    calibrationStep(0);
+    // power, fans, everything back as it was
+    emergencyRestore();
+    restoring = false;
+    if (!ok) {
+        sys.print("calibration stopped: nothing was kept, everything is back as it was\n");
+        return 1;
+    }
+    var buf: [2048]u8 = undefined;
+    if (!sys.replaceFile(calibrationPath(&path_buf), calibrate.format(&run.result, &buf))) {
+        sys.print("cannot write /var/lib/zcool/calibration\n");
+        return 1;
+    }
+    // what Cooler Boost or full speed carries is what the cooler carries
+    const full = if (run.result.carries[0] > 0) run.result.carries[0] else run.result.carries[1];
+    if (cfg.learn and full > 0) {
+        c.learned = .{ .watts = full, .at = c.limit, .seconds = 60 };
+        c.learned_saved = 0;
+        saveLearned(sys.nowMs(), true);
+    }
+    cal = run.result;
+    sys.print("\n");
+    describeCalibration();
+    return 0;
+}
+
+fn measure(run: *Calibration) bool {
+    sys.print("how fast it runs on one core, half of them and all\n");
+    const counts = [calibrate.core_points]usize{ 1, @max(run.cores / 2, 1), run.cores };
+    for (counts, 0..) |n, i| {
+        if (i > 0 and n == counts[i - 1]) continue;
+        if (!run.coresPoint(i, n)) return false;
+    }
+    sys.print("how fast it runs at each power, every fan at full\n");
+    var held: f32 = calibrate.power_points[0];
+    for (calibrate.power_points, 0..) |level, i| {
+        if (!run.powerPoint(i, level)) {
+            if (stop_requested) return false;
+            break;
+        }
+        held = level;
+    }
+    // the cooler held at the limit at each fan speed: from the top, so the heat is there
+    // already, and from the power it held last, not all of it at once
+    run.c.throttle = .{ .level = held };
+    var has_curve = false;
+    var has_pwm = false;
+    var has_boost = false;
+    for (fans[0..nfans]) |*f| {
+        if (f.unusable) continue;
+        has_curve = has_curve or f.ec_curve;
+        has_boost = has_boost or f.ec_boost or f.ec_curve;
+        has_pwm = has_pwm or (!f.ec_boost and !f.ec_curve and f.nv_index < 0);
+    }
+    if (!has_curve and !has_pwm and !has_boost) {
+        sys.print("no fans zcool can run: what the cooler carries is learned as zcool runs\n");
+        return true;
+    }
+    sys.print("what each fan speed carries at the limit\n");
+    for (calibrate.fan_points, 0..) |p, i| {
+        // Cooler Boost alone has no speeds between the firmware's curve and full
+        if (p.boost and !has_boost) continue;
+        if (!p.boost and !has_curve and !has_pwm) continue;
+        if (!run.fanPoint(i)) return false;
+    }
+    return true;
+}
+
+fn describeCalibration() void {
+    if (!cal.known()) return;
+    const t = &cal_line;
+    t.add("calibrated at ").whole(cal.limit).add("C").line();
+    var listed = false;
+    for (calibrate.fan_points, 0..) |p, i| {
+        if (cal.carries[i] <= 0) continue;
+        _ = t.add(if (listed) ", " else "  fans carry: ").add(p.name).add(" ").whole(cal.carries[i]).add(" W");
+        listed = true;
+    }
+    const turning = cal.fansTurning();
+    if (turning > 0) _ = t.add("; ").num(turning).add(if (turning == 1) " fan turns" else " fans turn");
+    if (cal.curveFollowed()) |followed| _ = t.add(if (followed) "; they follow zcool's curve" else "; they do not follow zcool's curve: Cooler Boost alone");
+    t.line();
+    var first = true;
+    for (cal.power) |p| {
+        if (p.watts <= 0) continue;
+        _ = t.add(if (first) "  power: " else ", ").whole(p.watts).add(" W ").whole(p.mhz).add(" MHz");
+        first = false;
+    }
+    if (!first) t.line();
+    if (cal.quietFloor()) |floor| t.add("  quiet mode may give up ").whole((1 - floor) * 100).add("% of the power for 5% of the speed").line();
+    first = true;
+    for (cal.cores, cal.core_counts) |p, n| {
+        if (p.watts <= 0) continue;
+        _ = t.add(if (first) "  cores: " else ", ").num(n).add(": ").whole(p.mhz).add(" MHz at ").whole(p.watts).add(" W");
+        first = false;
+    }
+    if (!first) t.line();
+}
+
 const usage =
     \\zcool: keeps chips under the temperature you set, losing as little speed as it can
     \\
     \\  zcool list                what is here: chips, limits, fans
+    \\  zcool dump                the CPU's registers, clocks, power limits, GPUs, EC and sensors, read only
+    \\  zcool calibrate           3 to 8 minutes of load that teach zcool its fans and power
     \\  zcool menu                every setting on one screen; saving restarts the service
     \\  zcool run [--dry-run]     the daemon; --dry-run only says what it would do
     \\  zcool restore             puts back everything an earlier run changed
@@ -2305,6 +2718,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (std.mem.eql(u8, command, "list")) {
         loadConfig(config_path);
         listChips();
+        return 0;
+    }
+    if (std.mem.eql(u8, command, "calibrate")) {
+        loadConfig(config_path);
+        return runCalibrate();
+    }
+    if (std.mem.eql(u8, command, "dump")) {
+        dump.run();
         return 0;
     }
     if (std.mem.eql(u8, command, "menu")) {

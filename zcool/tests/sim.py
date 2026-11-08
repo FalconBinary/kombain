@@ -43,6 +43,7 @@ class Chip:
         # with the power at once, while the sink takes its time
         self.r_die = r_die
         self.reading = temp
+        self.now_perf = 1.0
         self.work = 0.0
         self.time = 0.0
         self.peak = temp
@@ -66,6 +67,7 @@ class Chip:
         self.power = power * speed ** 2.5
         self.temp += (self.power - (self.temp - self.ambient) * g) * dt / self.mass
         self.reading = self.temp + self.power * self.r_die
+        self.now_perf = perf
         self.work += perf * dt
         self.time += dt
         self.peak = max(self.peak, self.reading)
@@ -104,8 +106,8 @@ class Ec:
     CURVE = bytes([55, 64, 73, 76, 82, 88, 35, 38, 42, 45, 50, 55, 62])
 
     def __init__(self, firmware="16R5EMS1.102", writable=True, boost=0x05, profile=0xc1, charge=0x80, mains=True, fan_mode=0x0d,
-                 stalled=False):
-        self.firmware, self.writable, self.mains, self.stalled = firmware, writable, mains, stalled
+                 stalled=False, one_fan=False):
+        self.firmware, self.writable, self.mains, self.stalled, self.one_fan = firmware, writable, mains, stalled, one_fan
         self.initial = {self.BOOST: boost, self.PROFILE: profile, self.CHARGE: charge, self.FAN_MODE: fan_mode}
         for temps, speeds in self.CURVES:
             for i in range(6):
@@ -119,7 +121,7 @@ class Ec:
 class Machine:
     def __init__(self, cpu=None, gpu=None, rapl=True, rapl_enforced=True, rapl_writable=True, freq=True, cpu_fan=True, pump=False, config="",
                  cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu", ec=None,
-                 epp=None, turbo=None, mains=None, rapl_window=False, pl2=True):
+                 epp=None, turbo=None, mains=None, rapl_window=False, pl2=True, cal_full=None):
         self.root = tempfile.mkdtemp(prefix="zcool-")
         self.cpu, self.gpu, self.nv, self.gpu_driver, self.ec = cpu, gpu, nvidia, gpu_driver, ec
         self.first_case = self.first_own_full = self.first_boost = self.first_trim = self.first_cap = None
@@ -130,6 +132,10 @@ class Machine:
         self.rapl_window, self.window_avg = rapl_window, 0.0
         self.energy = 0.0
         self.freq, self.cores = freq, cores
+        # under calibration the load is what zcool asks for in /run/zcool/calibration: this much on every core
+        self.cal_full = cal_full
+        self.supervise = None
+        self.told = b""
         self.proc = None
         self.seen = {}
         self.log = os.path.join(self.root, "log")
@@ -189,6 +195,7 @@ class Machine:
         for i in range(cores if freq else 0):
             base = f"{r}/sys/devices/system/cpu/cpufreq/policy{i}"
             put(f"{base}/scaling_max_freq", 5000000)
+            put(f"{base}/scaling_cur_freq", 800000)
             put(f"{base}/cpuinfo_max_freq", 5000000)
             put(f"{base}/cpuinfo_min_freq", 800000)
             if epp is not None:
@@ -350,7 +357,8 @@ class Machine:
             if self.nv and self.nv.chip:
                 self.ec_set(Ec.GPU_TEMP, int(self.nv.chip.temp))
             for i in range(2):
-                speed = 0 if self.ec.stalled and i == 0 else self.ec.spin[i]
+                # a GF63 Thin has one fan: the EC keeps the second's curve and speed all the same
+                speed = 0 if (self.ec.stalled and i == 0) or (self.ec.one_fan and i == 1) else self.ec.spin[i]
                 self.ec_set(Ec.FAN_SPEED[i], int(round(self.ec.spin[i])))
                 # the EC counts how long a turn takes: 478000 / rpm, about 50 rpm per percent
                 period = 0 if speed < 1 else 478000 // int(speed * 50)
@@ -360,6 +368,11 @@ class Machine:
         if self.cpu:
             self._write_temp(f"{self.cpu_dir}/temp1_input", self.cpu.reading)
             self._write_temp(f"{self.cpu_dir}/temp2_input", self.cpu.reading + 1)
+            if self.freq:
+                # the clocks a CPU-bound load runs at: what its power allows of the 5 GHz top
+                khz = int(5000000 * max(0.16, min(1, self.cpu.now_perf))) if self.cpu.load > 5 else 800000
+                for i in range(self.cores):
+                    self._write_duty(f"{self.root}/sys/devices/system/cpu/cpufreq/policy{i}/scaling_cur_freq", khz)
         if self.gpu:
             self._write_temp(f"{self.gpu_dir}/temp1_input", self.gpu.temp)
         if self.nv and self.nv.chip and self.nv_status() != "suspended":
@@ -396,6 +409,10 @@ class Machine:
             time.sleep(tick)
             now = time.time()
             dt, last = now - last, now
+            if self.supervise:
+                self.supervisor()
+            if self.cal_full and self.cpu:
+                self.calibration_load()
             board = self.duty(self.board_dir, 1, 70) if self.cpu_fan else 0
             if self.ec:
                 board = self.ec_duty(dt)
@@ -479,9 +496,34 @@ class Machine:
                 self.first_own_full = now
         nv.chip.step(dt, cap, speed, duty, limit, case_duty=board)
 
-    def start(self, *args):
+    def start(self, *args, command="run"):
         self.logf = open(self.log, "ab")
-        self.proc = subprocess.Popen([ZCOOL, "run", "--root", self.root, *args], stdout=self.logf, stderr=subprocess.STDOUT, env=self.env)
+        self.proc = subprocess.Popen([ZCOOL, command, "--root", self.root, *args], stdout=self.logf, stderr=subprocess.STDOUT, env=self.env)
+
+    def service(self):
+        """A running runit service, whose supervisor stops on `d` and starts on `u`."""
+        self.supervise = f"{self.root}/etc/sv/zcool/supervise"
+        os.makedirs(self.supervise)
+        put(f"{self.supervise}/stat", "run")
+        os.mkfifo(f"{self.supervise}/control")
+        self.control = os.open(f"{self.supervise}/control", os.O_RDONLY | os.O_NONBLOCK)
+
+    def supervisor(self):
+        try:
+            said = os.read(self.control, 16)
+        except BlockingIOError:
+            said = b""
+        for c in said:
+            self.told += bytes([c])
+            put(f"{self.supervise}/stat", {ord("d"): "down", ord("u"): "run"}.get(c, get(f"{self.supervise}/stat")))
+
+    def calibration_load(self):
+        step = get(f"{self.root}/run/zcool/calibration") if os.path.exists(f"{self.root}/run/zcool/calibration") else ""
+        if step.startswith("cores "):
+            share = min(1, int(step.split()[1]) / self.cores)
+            self.cpu.load = 5 + (self.cal_full - 5) * share ** 0.8
+        else:
+            self.cpu.load = 5
 
     def stop(self, sig=signal.SIGTERM):
         if self.proc and self.proc.poll() is None:
@@ -917,7 +959,7 @@ def dry_run_changes_nothing(r):
             for f in files:
                 if f.startswith("temp") and f.endswith("_input"):
                     continue
-                if f in ("pwm1", "pwm2", "fan1_input", "energy_uj", "power1_average"):
+                if f in ("pwm1", "pwm2", "fan1_input", "energy_uj", "power1_average", "scaling_cur_freq"):
                     continue  # the simulated hardware moves these itself
                 out[os.path.join(d, f)] = get(os.path.join(d, f))
         return out
@@ -1877,6 +1919,127 @@ def power_comes_back_only_with_room_for_the_burst(r):
         r.note(f"{how}: peak {m.cpu.peak:.1f} C at a 70 C limit, speed {m.cpu.perf * 100:.1f}%")
         m.stop()
         m.close()
+
+
+def gf63(config="cpu0.max = 70\n", **kw):
+    """As a GF63 Thin 10SC: one fan that carries about 42 W at 70 C, a die over its sink by
+    0.12 C per watt, and 90 W asked on every core."""
+    return Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=30, r_die=0.12), cpu_fan=False, ec=Ec(one_fan=True),
+                   rapl_window=True, config=config, cal_full=90, **kw)
+
+
+def calibrate(m, seconds=600):
+    m.start(command="calibrate")
+    end = time.time() + seconds
+    while m.proc.poll() is None and time.time() < end:
+        m.advance(1, limit_cpu=70)
+    code = m.proc.poll()
+    if code is None:
+        m.stop(signal.SIGKILL)
+    m.proc = None
+    return code
+
+
+@scenario
+def calibration_learns_the_fans_and_the_power_and_gives_everything_back(r):
+    m = gf63()
+    m.service()
+    started = time.time()
+    code = calibrate(m)
+    took = time.time() - started
+    log = m.text()
+    r.check(code == 0, f"exit {code}:\n" + log[-1500:])
+    r.check(m.told == b"du", f"the service should stop and start again: {m.told!r}")
+    cal = get(f"{m.root}/var/lib/zcool/calibration") if os.path.exists(f"{m.root}/var/lib/zcool/calibration") else ""
+    lines = dict((l.split()[1], l.split()) for l in cal.splitlines() if l.startswith("fans "))
+    r.check(cal.startswith("limit 70\n") and set(lines) == {"boost", "100%", "80%", "60%"}, cal)
+    if len(lines) == 4:
+        carries = [float(lines[p][2]) for p in ("boost", "100%", "80%", "60%")]
+        # the model carries 42 W at 70 C at full, 33 W at 60%
+        r.check(35 < carries[0] < 50 and carries[3] < carries[1] - 3, f"carried {carries}")
+        r.check(all(int(lines[p][4]) == 0 for p in lines), "the second fan does not turn here")
+        r.note("fans carry " + ", ".join(f"{p} {lines[p][2]} W" for p in ("boost", "100%", "80%", "60%")) + f" at 70 C; took {took:.0f} s")
+    power = [l.split() for l in cal.splitlines() if l.startswith("power ")]
+    r.check(len(power) >= 4, cal)
+    mhz = [float(p[2]) for p in power]
+    r.check(mhz == sorted(mhz), f"more power runs faster: {mhz}")
+    r.check(len([l for l in cal.splitlines() if l.startswith("cores ")]) == 3, cal)
+    r.check("1 fan turns" in log and "they follow zcool's curve" in log, log[-800:])
+    learned = get(f"{m.root}/var/lib/zcool/learned") if os.path.exists(f"{m.root}/var/lib/zcool/learned") else ""
+    r.check(learned.startswith("cpu0 "), f"learned {learned!r}")
+    # everything as it was
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO and ec_curve(m) == Ec.CURVE and m.ec_byte(Ec.BOOST) == 0x05,
+            f"0xf4 {m.ec_byte(Ec.FAN_MODE):#x}, curve {list(ec_curve(m))}, 0x98 {m.ec_byte(Ec.BOOST):#x}")
+    r.check(get(m.rapl_path) == "300000000" and get(m.pl2_path) == "300000000", f"limits {get(m.rapl_path)} {get(m.pl2_path)}")
+    r.check(not os.path.exists(f"{m.root}/run/zcool/state"), "the journal should be gone")
+    r.check(m.cpu.peak <= 74, f"peak {m.cpu.peak:.1f}")
+    out = m.cmd("list").stdout
+    r.check("calibrated at 70C" in out and "quiet mode may give up" in out, out[-800:])
+    m.close()
+
+
+@scenario
+def calibration_stopped_keeps_nothing_and_gives_everything_back(r):
+    m = gf63()
+    m.service()
+    m.start(command="calibrate")
+    m.advance(20, limit_cpu=70)
+    m.proc.send_signal(signal.SIGINT)
+    for _ in range(20):
+        if m.proc.poll() is not None:
+            break
+        m.advance(0.5, limit_cpu=70)
+    code = m.proc.poll()
+    r.check(code == 1, f"exit {code}")
+    r.check("calibration stopped: nothing was kept" in m.text(), m.text()[-500:])
+    r.check(not os.path.exists(f"{m.root}/var/lib/zcool/calibration"), "a stopped calibration should keep nothing")
+    r.check(m.told == b"du", f"the service should come back: {m.told!r}")
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO and get(m.rapl_path) == "300000000", "not given back")
+    m.proc = None
+    m.close()
+    # on battery it does not start
+    m = Machine(cpu=Chip(load=5), cpu_fan=False, ec=Ec(mains=False), config="cpu0.max = 70\n")
+    out = m.cmd("calibrate")
+    r.check(out.returncode == 1 and "on battery" in out.stdout, out.stdout)
+    m.close()
+
+
+@scenario
+def a_calibration_says_what_the_daemon_does(r):
+    # the fans turned as fast at 60% as at full: this EC does not follow zcool's curve
+    m = gf63(config="cpu0.max = 70\nnoise.ac = quiet\n")
+    put(f"{m.root}/var/lib/zcool/calibration", "limit 70\nfans boost 42.0 6900 0\nfans 100% 41.8 6800 0\n"
+        "fans 80% 37.6 6800 0\nfans 60% 33.1 6700 0\npower 27.0 2000\npower 36.0 3000\npower 45.0 3600\n"
+        "power 54.0 3900\npower 63.0 4000\n")
+    m.start()
+    m.advance(3, limit_cpu=70)
+    log = m.text()
+    r.check("calibration found the fans do not follow zcool's curve: Cooler Boost alone" in log, log[-500:])
+    out = m.cmd("list").stdout
+    # 95% of 4000 MHz is reached at 54 of 63 W: up to 14% of the power for 5% of the speed
+    r.check("quiet mode may give up 14% of the power" in out, out[-600:])
+    m.stop()
+    m.close()
+
+
+@scenario
+def dump_shows_registers_clocks_and_the_ec(r):
+    m = undervolt_machine(config="cpu0.max = 85\n")
+    with open(f"{m.root}/dev/cpu/0/msr", "r+b") as f:
+        f.seek(0x1a2)
+        f.write(struct.pack("<Q", (100 << 16) | (27 << 24)))
+        f.seek(0x194)
+        f.write(struct.pack("<Q", 1 << 20))
+    out = m.cmd("dump").stdout
+    r.check("TjMax 100C, offset 27: throttles itself from 73C" in out, out[:800])
+    r.check("overclocking lock  set" in out, out[:800])
+    r.check("policy0" in out and "hwmon" in out and "coretemp" in out, out[-800:])
+    m.close()
+    m = Machine(cpu=Chip(load=10), cpu_fan=False, ec=Ec())
+    out = m.cmd("dump").stdout
+    r.check("ec 16R5EMS1.102, GF63/GF65 Thin" in out, out[-1200:])
+    r.check("  f0:" in out and "fan mode" in out, out[-1200:])
+    m.close()
 
 
 def tcc_machine(config="cpu0.max = 85\n", cpuinfo="GenuineIntel", lockdown="[none] integrity confidentiality"):

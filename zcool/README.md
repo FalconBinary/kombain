@@ -10,7 +10,7 @@ silent fan curve while everything is cool.
 Under work heavier than the machine can do, it keeps the desktop answering: jobs yield the
 CPU to it, and a process about to starve memory is ended before the system stalls.
 `zcool menu` shows every setting on one screen.
-Pure Zig with no libc: a 269 KiB binary (x86_64) that uses under 200 KiB of memory. NVIDIA's own
+Pure Zig with no libc: a 296 KiB binary (x86_64) that uses under 200 KiB of memory. NVIDIA's own
 driver needs one more, small program, see below.
 
 It runs on an MSI GF63 Thin 10SC, whose logs found the burst and the slow trim described
@@ -32,10 +32,14 @@ software keeps it at your limit at full speed. So the order is:
    Once zcool has learned what the cooler carries, the power goes straight there. Over the
    limit it takes more, as a die follows its power at once: back within seconds, not a minute.
 4. **Give it back** as soon as there is room, and while the fans still have some. With every
-   fan at full, all of it only 3 C under the limit: full power lets a CPU burst at once, and
-   on the GF63 that took it from 68 C to 72 within a second.
+   fan at full, all of it only once the chip has stayed 3 C under the limit for 5 s: full
+   power lets a CPU burst at once, and on the GF63 that took it from 68 C to 72 within a
+   second. Its die reads cool right after a deep cut while the work goes on, so a moment
+   there is not enough.
+5. **Then the fans come down,** once power is all back: while it is cut they stay at full.
 
-In quiet mode 2 and 3 swap places for the first 15% of power: see below.
+In quiet mode 2 and 3 swap places for the first 15% of power, or what calibration found
+costs at most 5% of the speed: see below.
 
 Below your limit it costs nothing. At your limit it costs what the cooler lacks. In
 the simulator that beat leaving it to the hardware throttle, which slams power down:
@@ -52,6 +56,8 @@ turn it off, and it keeps working if zcool is gone.
 
 ```sh
 zcool list                # chips, limits, fans, GPUs and what keeps them awake
+doas zcool calibrate      # once, plugged in: a few minutes of load that teach it the machine
+doas zcool dump           # the CPU's registers, clocks, limits, GPUs, EC and sensors, read only
 doas zcool run --dry-run  # says what it would do, writes nothing
 doas zcool menu           # every setting, with what it does; s saves and restarts the service
 doas ln -s /etc/sv/zcool /etc/runit/runsvdir/default/
@@ -83,7 +89,8 @@ of wherever the band happens to balance it lower down: the same heat for less fa
 in the model at 90 W. Within a degree of the fan point nothing changes, as fans that chase
 every tenth of a degree are heard doing it. New work that climbs gets the band back at once,
 and the last degree and a half before the limit gets every fan. Fans go up at once and down
-slowly, so they do not pump.
+slowly, so they do not pump. After `zcool calibrate` they go straight to the speed a steady
+heat needs, from what each speed was measured to carry.
 
 ## It learns the cooler
 
@@ -95,6 +102,28 @@ feeling its way down from full power: in the simulator the first limit after lea
 168 W against 275 W cold, for a cooler that carries 181 W. It keeps learning, so dust, a
 warm room or a new paste move it. A limit moved by the power source scales what it learned
 as the cooler would carry it. `learn = no` turns it off.
+
+## Calibration
+
+`doas zcool calibrate`, once, plugged in, in 3 to 8 minutes: zcool loads the CPU itself and
+measures what it otherwise finds out while the heat comes.
+
+- **How fast it runs** on one core, on half of them and on all, held at its limit.
+- **How fast it runs at each power,** from 30% of what it draws on every core to all of it,
+  every fan at full, until the cooler no longer holds the limit. Usually the last third of
+  the power buys a few percent of speed. Quiet mode then gives up the power that costs at most
+  5% of the speed before the fans get louder, instead of a fixed 15%.
+- **What each fan speed carries at the limit:** Cooler Boost, 100%, 80% and 60%, the CPU held
+  at its limit at each until it settles. With that the fans go straight to the speed a steady
+  heat needs instead of finding it over minutes, and the power limit starts where the cooler
+  holds it (it seeds what is learned above).
+- **Which fans turn, and whether they follow zcool's curve.** A GF63 Thin has one fan, though
+  its EC keeps two curves. If 60% turns them as fast as 100%, the EC ignores the curve, and
+  zcool keeps to Cooler Boost from then on.
+
+The service stops while it runs and starts again after. Ctrl-C, or any chip 4 C over its limit,
+stops it: nothing is kept and everything is put back. It goes to `/var/lib/zcool/calibration`;
+`zcool list` shows it. Calibrate again after cleaning the fans or a new paste.
 
 ## What follows the power source
 
@@ -235,8 +264,10 @@ On many MSI laptops Linux cannot turn the fans: they belong to the EC, and the k
   takes it away. Where the kernel has its own setting (`charge_control_end_threshold`:
   ThinkPads, ASUS, Dell and others), that is used instead, on any laptop.
 - **The silent fan curve.** The firmware has a quieter fan curve of its own. zcool takes it while
-  every chip has been 25 C below its limit for 20 s, and gives the normal curve back as soon as
-  one comes within 18 C, before Cooler Boost and before any power. The firmware keeps its own
+  every chip has been 25 C below its limit for 20 s, and gives the normal curve back once one
+  has stayed within 18 C for 3 s, or at once within 10 C, before Cooler Boost and before any
+  power: a desktop's short bursts lift a die that far for a second, and on the GF63 they
+  swapped the curves every half minute while it sat idle. The firmware keeps its own
   protection on either curve. A curve chosen in MSI's tools (advanced) is left alone, zcool
   keeps to Cooler Boost then, and `fan.silent = no` keeps the normal one.
 - **`mode.ac` and `mode.battery`:** the EC's own power profiles, `eco`, `comfort`, `sport`
@@ -284,9 +315,14 @@ voltage offset on Intel. That survives updates, does not conflict with kernel
 lockdown, and is the only way on AMD and on many recent Intel CPUs.
 
 Many laptops cannot undervolt at all: since the Plundervolt fix (2019-2020) firmware often
-locks the register, the MSI GF63 Thin 10SC among them. There the same thing, less heat for
-the same work, comes from the power source settings above: `epp` and `turbo` on battery,
-and a learned power limit under long loads.
+locks the register, the MSI GF63 Thin 10SC among them. `zcool dump` shows the lock: the
+overclocking lock bit of MSR 0x194. Firmware sets it at every boot before Linux starts, and
+only a reboot clears it, so no program can get past it. Changing the hidden BIOS setting
+behind it in NVRAM (setup_var and the like) is no flash, but a wrong byte can leave a laptop
+that does not boot; zcool does not do it. There the same thing, less heat for the same work,
+comes from the power source settings above: `epp` and `turbo` on battery, a learned power
+limit under long loads, and the power quiet mode gives up once calibration knows what it
+costs.
 
 `undervolt.core` and `undervolt.cache` set Intel's MSR 0x150, and:
 
@@ -318,6 +354,11 @@ fan and a clock limit, a desktop one with its own fan, the case fan and its powe
 an Intel GPU's power1_max, an idle GPU read rarely enough to sleep, one asleep never
 reached, and NVIDIA's settings given back after `kill -9` of zcool and of both. A NVIDIA
 library that reads only an attached GPU, and one that reads nothing, read through the EC.
+Calibration on a GF63-like laptop with one fan: the fans' carry at each speed, the speed at
+each power and core count, the service stopped and started again, what was learned seeded, and
+everything back after it and after Ctrl-C; refused on battery; a calibration whose fans
+ignored the curve keeping zcool to Cooler Boost, and its quiet floor. `zcool dump` decoding
+the registers and showing the EC.
 For an MSI EC: its fans held part way through zcool's curve for a heat that needs part of
 them, then at full, then Cooler Boost, then power, and the EC's own curve and mode back after
 the heat, SIGTERM and `kill -9`; the EC dropping zcool's curve and getting it back; a fan

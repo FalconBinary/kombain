@@ -11,4 +11,7 @@ test {
     _ = @import("menu.zig");
     _ = @import("guard.zig");
     _ = @import("tcc.zig");
+    _ = @import("dump.zig");
+    _ = @import("text.zig");
+    _ = @import("calibrate.zig");
 }

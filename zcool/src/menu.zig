@@ -50,45 +50,7 @@ pub const Refresh = *const fn (info: *Info) void;
 
 // ---------------------------------------------------------------- text
 
-/// A line built from pieces. std.fmt makes code for every shape of line, and for a menu's
-/// few dozen of them that came to more than the rest of zcool's new code together.
-const Text = struct {
-    buf: []u8,
-    len: usize = 0,
-
-    fn add(self: *Text, s: []const u8) *Text {
-        const n = @min(s.len, self.buf.len - self.len);
-        @memcpy(self.buf[self.len..][0..n], s[0..n]);
-        self.len += n;
-        return self;
-    }
-
-    fn num(self: *Text, v: i64) *Text {
-        var digits: [24]u8 = undefined;
-        var i: usize = digits.len;
-        var x: u64 = @abs(v);
-        while (true) {
-            i -= 1;
-            digits[i] = @intCast('0' + x % 10);
-            x /= 10;
-            if (x == 0) break;
-        }
-        if (v < 0) {
-            i -= 1;
-            digits[i] = '-';
-        }
-        return self.add(digits[i..]);
-    }
-
-    /// Degrees and watts, rounded to whole ones.
-    fn whole(self: *Text, v: f32) *Text {
-        return self.num(@intFromFloat(@round(std.math.clamp(v, -1e6, 1e6))));
-    }
-
-    fn str(self: *const Text) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+const Text = @import("text.zig").Text;
 
 fn joined(buf: []u8, a: []const u8, b: []const u8) []const u8 {
     var t = Text{ .buf = buf };
@@ -809,20 +771,37 @@ fn writeConfig(path: [:0]const u8) bool {
 
 /// The runit service, when it runs: a `t` to its supervisor restarts it with the new config.
 fn restartService() ?bool {
+    return tellService("t");
+}
+
+/// Writes `what` to the supervisor of the zcool service if it runs: `t` restarts it, `d` stops
+/// it, `u` starts it. Null when it does not run.
+pub fn tellService(what: []const u8) ?bool {
     for ([_][]const u8{ "/etc/sv/zcool/supervise", "/var/service/zcool/supervise" }) |dir| {
         var path_buf: [256]u8 = undefined;
         var stat: [16]u8 = undefined;
         const state = sys.readFile(sys.join(&path_buf, &.{ sys.root, dir, "/stat" }), &stat) orelse continue;
-        if (!std.mem.startsWith(u8, state, "run")) return null;
+        if (!std.mem.startsWith(u8, state, "run") and !std.mem.eql(u8, what, "u")) return null;
         const linux = std.os.linux;
         const o: linux.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
         const at_fdcwd: usize = @bitCast(@as(isize, -100));
         const control = sys.join(&path_buf, &.{ sys.root, dir, "/control" });
         const fd = sys.raw(.openat, at_fdcwd, @intFromPtr(control.ptr), @as(u32, @bitCast(o)), 0) orelse return false;
         defer sys.close(@intCast(fd));
-        return sys.write(@intCast(fd), "t");
+        return sys.write(@intCast(fd), what);
     }
     return null;
+}
+
+/// The zcool service runs, as its supervisor says.
+pub fn serviceRunning() bool {
+    for ([_][]const u8{ "/etc/sv/zcool/supervise", "/var/service/zcool/supervise" }) |dir| {
+        var path_buf: [256]u8 = undefined;
+        var stat: [16]u8 = undefined;
+        const state = sys.readFile(sys.join(&path_buf, &.{ sys.root, dir, "/stat" }), &stat) orelse continue;
+        return std.mem.startsWith(u8, state, "run");
+    }
+    return false;
 }
 
 fn save(path: [:0]const u8) void {

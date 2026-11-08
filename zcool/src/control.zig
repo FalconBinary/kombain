@@ -25,6 +25,10 @@ pub const fan_margin: f32 = 2;
 /// gives a CPU its short-term limit back too, and it bursts to that at once, with nothing left
 /// to catch it: on a real laptop from 68 C to over its 70 C limit within a second.
 pub const release_margin: f32 = 3;
+/// And only once it has stayed there this long: a die follows its power at once, so right after
+/// a deep cut it reads cool while the work goes on. On the GF63 54 C five seconds into the load
+/// gave full power back, and a second later it was 64 C and power went again.
+pub const release_hold: f32 = 5;
 /// A chip is never throttled below this level; below that the hardware protects itself.
 pub const min_level: f32 = 0.3;
 /// Fans return to firmware control after this long with nothing to do.
@@ -65,6 +69,9 @@ pub const Thermal = struct {
 pub const FanDrive = struct {
     /// what the steady heat was found to need, on top of the band or under it
     held: f32 = 0,
+    /// what calibration says the fans need for the heat right now, as a demand: while the heat
+    /// is steady the trim goes there at once instead of finding it over minutes
+    need: ?f32 = null,
 
     pub fn update(self: *FanDrive, thermal: *const Thermal, limit: f32, dt: f32) f32 {
         const forecast = thermal.forecast();
@@ -75,6 +82,9 @@ pub const FanDrive = struct {
         } else if (off < -1 and thermal.slope < 0.05) {
             // steady, or the heat going: not while it still climbs
             self.held += (off + 1) * 0.008 * dt;
+        }
+        if (self.need) |n| {
+            if (@abs(thermal.slope) < 0.1 and off < 0.5) self.held += std.math.clamp(n - band - self.held, -0.05 * dt, 0.05 * dt);
         }
         // the trim under the band was for a steady heat: new work that climbs gets the band back,
         // faster than the slow rise the trim itself brings
@@ -112,6 +122,8 @@ pub const Throttle = struct {
     level: f32 = 1,
     /// Where to start when power must first be taken: what the cooler is known to carry.
     start: f32 = 1,
+    /// how long it has been `release_margin` under the limit
+    cool_for: f32 = 0,
 
     /// `no_more_cooling` is true when every fan that serves this chip is at full speed, or it has none.
     pub fn update(self: *Throttle, thermal: *const Thermal, limit: f32, crit: f32, no_more_cooling: bool, dt: f32) void {
@@ -122,6 +134,7 @@ pub const Throttle = struct {
         }
         const over = temp > limit + 2;
         const engage = no_more_cooling and thermal.forecast() > limit - 0.5;
+        self.cool_for = if (temp <= limit - release_margin) self.cool_for + dt else 0;
         // nothing to do yet: stays at full power until cooling is exhausted or the limit is broken
         if (self.level >= 1 and !engage and !over) return;
         if (self.level >= 1 and no_more_cooling and self.start < 1) self.level = @max(self.start, min_level);
@@ -135,8 +148,8 @@ pub const Throttle = struct {
         if (no_more_cooling and temp > limit) rate -= (temp - limit) * 0.03;
         if (over) rate -= (temp - limit) * 0.05;
         self.level = std.math.clamp(self.level + std.math.clamp(rate, -0.5, 0.1) * dt, min_level, 1);
-        // all of it only with room for the burst it lets loose
-        if (self.level >= 1 and no_more_cooling and temp > limit - release_margin) self.level = 0.99;
+        // all of it only with room for the burst it lets loose, and once the work has eased
+        if (self.level >= 1 and no_more_cooling and self.cool_for < release_hold) self.level = 0.99;
     }
 };
 
@@ -151,6 +164,8 @@ pub const quiet_after: f32 = 30;
 pub const quiet_patience: f32 = 5;
 
 pub const Quiet = struct {
+    /// the share of power quiet mode may give up before the fans: calibration may know better
+    floor: f32 = quiet_floor,
     loud: bool = false,
     cool_for: f32 = 0,
     floor_for: f32 = 0,
@@ -158,11 +173,11 @@ pub const Quiet = struct {
     /// True while the fans may go past the firmware's curve for this chip.
     pub fn update(self: *Quiet, on: bool, thermal: *const Thermal, limit: f32, level: f32, emergency: bool, dt: f32) bool {
         if (!on) {
-            self.* = .{};
+            self.* = .{ .floor = self.floor };
             return true;
         }
         // at the floor and still heading for the limit: the power alone is not enough
-        self.floor_for = if (level <= quiet_floor + 0.01 and thermal.forecast() > limit - 1) self.floor_for + dt else 0;
+        self.floor_for = if (level <= self.floor + 0.01 and thermal.forecast() > limit - 1) self.floor_for + dt else 0;
         if (self.floor_for >= quiet_patience or emergency or thermal.temp > limit + 1) self.loud = true;
         self.cool_for = if (thermal.forecast() < limit - fan_band) self.cool_for + dt else 0;
         if (self.cool_for >= quiet_after) self.loud = false;
@@ -171,19 +186,25 @@ pub const Quiet = struct {
 };
 
 /// The firmware's silent fan curve while every chip is this far below its limit, forecast and
-/// all, for `silent_after` seconds; its normal curve again as soon as one comes within
-/// `silent_leave`. The firmware keeps its own protection either way.
+/// all, for `silent_after` seconds; its normal curve again once one has stayed within
+/// `silent_leave` for `silent_patience`, or at once within `silent_urgent`. A desktop's short
+/// bursts lift a die's forecast that far for a second and are gone: on the GF63 they swapped the
+/// curves every half minute while it sat idle. The firmware keeps its own protection either way.
 pub const silent_enter: f32 = 25;
 pub const silent_leave: f32 = 18;
+pub const silent_urgent: f32 = 10;
 pub const silent_after: f32 = 20;
+pub const silent_patience: f32 = 3;
 
 pub const FanMode = struct {
     silent: bool = false,
     calm_for: f32 = 0,
+    near_for: f32 = 0,
 
     /// `margin` is how far the chip nearest its limit is from it.
     pub fn update(self: *FanMode, margin: f32, dt: f32) bool {
-        if (margin < silent_leave) {
+        self.near_for = if (margin < silent_leave) self.near_for + dt else 0;
+        if (margin < silent_urgent or self.near_for >= silent_patience or (!self.silent and margin < silent_leave)) {
             self.* = .{};
             return false;
         }
@@ -503,13 +524,19 @@ test "the silent fan curve while everything is cool, the normal one before it is
     try std.testing.expect(mode.update(30, 1));
     // a little warmer: stays, that is what the gap is for
     try std.testing.expect(mode.update(20, 0.5));
-    // heading for the limit: the normal curve at once
-    try std.testing.expect(!mode.update(17, 0.5));
+    // a burst lifts the forecast for a second: stays
+    try std.testing.expect(mode.update(15, 1));
+    try std.testing.expect(mode.update(30, 0.5));
+    // heading for the limit and staying there: the normal curve
+    try std.testing.expect(mode.update(15, 2));
+    try std.testing.expect(!mode.update(15, 1.5));
     // and the calm has to last again before it goes back
     try std.testing.expect(!mode.update(30, 5));
     try std.testing.expect(!mode.update(22, 30));
     try std.testing.expect(!mode.update(30, 19));
     try std.testing.expect(mode.update(30, 2));
+    // far nearer: at once
+    try std.testing.expect(!mode.update(8, 0.5));
 }
 
 test "power comes back in full only with room for the burst" {
@@ -523,19 +550,27 @@ test "power comes back in full only with room for the burst" {
     i = 0;
     while (i < 200) : (i += 1) throttle.update(&t, 85, 100, false, 0.25);
     try std.testing.expectEqual(@as(f32, 1), throttle.level);
-    // well under it with every fan at full: all of it too
+    // well under it with every fan at full: all of it too, once it has stayed there
     throttle.level = 0.9;
     t.temp = 80;
     i = 0;
+    while (i < 16) : (i += 1) throttle.update(&t, 85, 100, true, 0.25);
+    try std.testing.expect(throttle.level < 1);
     while (i < 100) : (i += 1) throttle.update(&t, 85, 100, true, 0.25);
     try std.testing.expectEqual(@as(f32, 1), throttle.level);
 }
 
 /// Where the fans settle for a heat that needs some of them, and how hard they run there.
-fn settle(plant: *Plant, band_only: bool, seconds: f32) struct { temp: f32, duty: f32, peak: f32 } {
+const Settled = struct { temp: f32, duty: f32, peak: f32 };
+
+fn settle(plant: *Plant, band_only: bool, seconds: f32) Settled {
+    return settleWith(plant, band_only, null, seconds);
+}
+
+fn settleWith(plant: *Plant, band_only: bool, need: ?f32, seconds: f32) Settled {
     var thermal = Thermal{};
     var fan = Fan{ .duty = 60 };
-    var drive = FanDrive{};
+    var drive = FanDrive{ .need = need };
     var peak: f32 = 0;
     const dt: f32 = 0.25;
     var t: f32 = 0;
@@ -604,4 +639,15 @@ test "over the limit with every fan at full, power goes until it is back within 
     }
     try std.testing.expect(over_for < 6);
     try std.testing.expect(thermal.temp > 67 and thermal.temp < 70.5);
+}
+
+test "what calibration knows the fans go to at once, what it does not they find" {
+    // 90 W holds at the fan point with the fans at 87/255 here: a demand of 0.14 over 60
+    var a = Plant{ .power = 90, .g_min = 0.5, .g_max = 4 };
+    const told = settleWith(&a, false, 0.14, 60);
+    var b = Plant{ .power = 90, .g_min = 0.5, .g_max = 4 };
+    const found = settleWith(&b, false, null, 60);
+    try std.testing.expect(@abs(told.duty - 87) < 6);
+    try std.testing.expect(found.duty > told.duty + 5);
+    try std.testing.expect(told.peak <= 85);
 }
