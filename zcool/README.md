@@ -237,8 +237,8 @@ the EC, and `fan.exclude = ec/cooler_boost` from Cooler Boost alone.
   ends and it gives back every limit and fan it set. If both are killed, the GPUs it changed
   are listed in `/run/zcool/nvidia`, and `zcool restore` (the runit `finish` script) puts them back.
 - **A chip is never pushed below 30% of its power.** Below that the hardware's own protection takes over.
-- **A power limit is not trusted:** if the temperature stays over the limit anyway,
-  frequency limits join in.
+- **A power limit is not trusted:** if the package draws well above it while the temperature
+  stays over the limit, the power limits go back and frequency limits hold the chip instead.
 - **A sleeping GPU is not woken** to read its temperature or to give anything back.
 - **Sandboxed:** after setup Landlock confines it to `/sys` (the EC's file included), `/run/zcool` and `/var/lib/zcool`.
   `zcool-nvidia` is confined to reading the system, the NVIDIA device files and `/run/zcool`.
