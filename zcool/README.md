@@ -5,7 +5,10 @@ can: the CPU, every GPU, NVMe. It learns how much power the cooler carries, and 
 goes straight there. On battery it can lower the limits, turn turbo off, make the CPU
 prefer efficient clocks and the fans quiet. A GPU that shows nothing is let sleep when
 idle. On MSI laptops it also drives the embedded controller: Cooler Boost, the battery
-charge limit and the EC's power profiles. `zcool menu` shows every setting on one screen.
+charge limit, the EC's power profiles and its silent fan curve while everything is cool.
+Under work heavier than the machine can do, it keeps the desktop answering: jobs yield the
+CPU to it, and a process about to starve memory is ended before the system stalls.
+`zcool menu` shows every setting on one screen.
 Pure Zig with no libc: a 225 KiB binary that uses under 200 KiB of memory. NVIDIA's own
 driver needs one more, small program, see below.
 
@@ -98,6 +101,26 @@ limits.battery = -10
 
 `zcool menu` has three presets for all of these at once: quiet, balanced and fast.
 
+## Under heavy work
+
+Heat is one way a machine stops answering; a CPU that every job wants at once, and memory
+that runs out, are the others. zcool reads the kernel's pressure figures (`/proc/pressure`)
+once a second, on wakeups it has anyway, and looks at the processes only while there is
+pressure.
+
+- **The CPU.** When tasks waited for it 40% of the last 10 s, the jobs that kept at least half
+  a core busy since the last look yield it: nice 10 and the lowest I/O priority, for their whole
+  process group, so `make -j16` and every compiler it starts later. The compositor, Xwayland,
+  gamescope, the panel and the sound server get nice -5. A program drawing on the GPU, a game,
+  keeps its share; one the user set a nice for is left as it is. All of it goes back when zcool stops.
+- **Memory.** When 4% of it is left and swap is full or absent, or the kernel stalls every task
+  on memory while 10% is left, the process with the highest OOM score is asked to end, and
+  killed 3 s later if it has not. Never the session: mango, the panel, the terminal, the shell,
+  sound, login, sshd, runit. The kernel's own OOM killer comes only after minutes of a frozen
+  machine.
+
+`guard.cpu = no` and `guard.memory = no` turn either off.
+
 ## What it controls
 
 | Chip | Reads | Acts through |
@@ -163,6 +186,11 @@ On many MSI laptops Linux cannot turn the fans: they belong to the EC, and the k
   zcool stops, so that it holds while the laptop is off and plugged in; `battery.max = 100`
   takes it away. Where the kernel has its own setting (`charge_control_end_threshold`:
   ThinkPads, ASUS, Dell and others), that is used instead, on any laptop.
+- **The silent fan curve.** The firmware has a quieter fan curve of its own. zcool takes it while
+  every chip has been 25 C below its limit for 20 s, and gives the normal curve back as soon as
+  one comes within 18 C, before Cooler Boost and before any power. The firmware keeps its own
+  protection on either curve. A curve chosen in MSI's tools (advanced) is left alone, and
+  `fan.silent = no` keeps the normal one.
 - **`mode.ac` and `mode.battery`:** the EC's own power profiles, `eco`, `comfort`, `sport`
   or `turbo`, switched when the power source changes. Left out, the firmware's own stays;
   with one of the two set, the other source gets the firmware's own back.
@@ -247,7 +275,9 @@ profile following the power source, and an unknown or read-only EC never written
 energy preference, turbo and limits following the power source and coming back after
 `kill -9`; quiet mode taking power before Cooler Boost, and no boost at all where a little
 power is enough; the cooler learned, kept on disk and used on the next run; and the menu,
-driven through a terminal, saving what it changed and restarting the service. It proves
+driven through a terminal, saving what it changed and restarting the service. The silent fan
+curve while cool and the normal one back before Cooler Boost; a job yielding under CPU pressure
+while a game and the desktop keep theirs; a memory hog ended and the session spared. It proves
 the logic. It proves nothing about any real driver or NVIDIA's real library, and a real
 chip's numbers will differ.
 

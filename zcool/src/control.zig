@@ -127,6 +127,33 @@ pub const Quiet = struct {
     }
 };
 
+/// The firmware's silent fan curve while every chip is this far below its limit, forecast and
+/// all, for `silent_after` seconds; its normal curve again as soon as one comes within
+/// `silent_leave`. The firmware keeps its own protection either way.
+pub const silent_enter: f32 = 25;
+pub const silent_leave: f32 = 18;
+pub const silent_after: f32 = 20;
+
+pub const FanMode = struct {
+    silent: bool = false,
+    calm_for: f32 = 0,
+
+    /// `margin` is how far the chip nearest its limit is from it.
+    pub fn update(self: *FanMode, margin: f32, dt: f32) bool {
+        if (margin < silent_leave) {
+            self.* = .{};
+            return false;
+        }
+        if (margin >= silent_enter) {
+            self.calm_for += dt;
+        } else if (!self.silent) {
+            self.calm_for = 0;
+        }
+        if (self.calm_for >= silent_after) self.silent = true;
+        return self.silent;
+    }
+};
+
 /// What the cooler carries: the power a chip settles at while it is held at its limit with
 /// every fan at full. Learned while that happens and kept on disk, so that the next time the
 /// heat builds up the power goes straight there instead of feeling its way down.
@@ -421,4 +448,20 @@ fn peakLinear(plant: *Plant, start: f32) f32 {
         peak = @max(peak, plant.temp);
     }
     return peak;
+}
+
+test "the silent fan curve while everything is cool, the normal one before it is not" {
+    var mode = FanMode{};
+    var t: f32 = 0;
+    while (t < 19) : (t += 0.5) try std.testing.expect(!mode.update(30, 0.5));
+    try std.testing.expect(mode.update(30, 1));
+    // a little warmer: stays, that is what the gap is for
+    try std.testing.expect(mode.update(20, 0.5));
+    // heading for the limit: the normal curve at once
+    try std.testing.expect(!mode.update(17, 0.5));
+    // and the calm has to last again before it goes back
+    try std.testing.expect(!mode.update(30, 5));
+    try std.testing.expect(!mode.update(22, 30));
+    try std.testing.expect(!mode.update(30, 19));
+    try std.testing.expect(mode.update(30, 2));
 }

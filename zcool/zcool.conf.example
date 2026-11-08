@@ -38,6 +38,14 @@
 # zcool learns how much power the cooler carries at the limit and starts there next time.
 # learn = no
 
+# An MSI EC's silent fan curve while every chip is far below its limit.
+# fan.silent = no
+
+# Under work heavier than the machine can do: jobs yield the CPU to the desktop, and a
+# process about to starve memory is ended before the system stalls. See the README.
+# guard.cpu = no
+# guard.memory = no
+
 # Undervolting, Intel only, and only with kernel lockdown off: read the README first.
 # In the BIOS is the better place for it, on Intel and on AMD.
 # undervolt.core = -50

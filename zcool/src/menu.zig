@@ -221,6 +221,25 @@ fn buildItems(info: *const Info) void {
             }, "fan.exclude");
         }
     }
+    header("Under heavy work");
+    add(.{
+        .kind = .choice,
+        .label = "Jobs yield to the desktop",
+        .choices = &yes_first,
+        .help = "When the CPU is short, the jobs that took it longest (a build, an encode) get nice 10 and the desktop, sound and games nice -5.",
+    }, "guard.cpu");
+    add(.{
+        .kind = .choice,
+        .label = "End a memory hog in time",
+        .choices = &yes_first,
+        .help = "With memory and swap all but gone, the process holding the most is ended before the system stalls for minutes. Never the session.",
+    }, "guard.memory");
+    if (info.ec) add(.{
+        .kind = .choice,
+        .label = "Silent fan curve when cool",
+        .choices = &yes_first,
+        .help = "The EC's own silent curve while every chip is 25 C below its limit; its normal curve the moment one heads up.",
+    }, "fan.silent");
     header("Other");
     add(.{
         .kind = .choice,

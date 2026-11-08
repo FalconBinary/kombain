@@ -90,11 +90,12 @@ class Ec:
     at 0xa0. Cooler Boost (0x98, bit 7) runs both fans at full; off, the firmware's curve runs them.
     The other bits of 0x98 are the firmware's own and must survive."""
 
-    BOOST, PROFILE, CHARGE, CPU_TEMP, GPU_TEMP = 0x98, 0xf2, 0xef, 0x68, 0x80
+    BOOST, PROFILE, CHARGE, CPU_TEMP, GPU_TEMP, FAN_MODE = 0x98, 0xf2, 0xef, 0x68, 0x80, 0xf4
+    AUTO, SILENT, ADVANCED = 0x0d, 0x1d, 0x8d
 
-    def __init__(self, firmware="16R5EMS1.102", writable=True, boost=0x05, profile=0xc1, charge=0x80, mains=True):
+    def __init__(self, firmware="16R5EMS1.102", writable=True, boost=0x05, profile=0xc1, charge=0x80, mains=True, fan_mode=0x0d):
         self.firmware, self.writable, self.mains = firmware, writable, mains
-        self.initial = {self.BOOST: boost, self.PROFILE: profile, self.CHARGE: charge}
+        self.initial = {self.BOOST: boost, self.PROFILE: profile, self.CHARGE: charge, self.FAN_MODE: fan_mode}
 
 
 class Machine:
@@ -241,6 +242,9 @@ class Machine:
         temp = self.cpu.temp if self.cpu else 40
         if self.nv and self.nv.chip:
             temp = max(temp, self.nv.chip.temp)
+        if self.ec_byte(Ec.FAN_MODE) == Ec.SILENT:
+            # the firmware's silent curve: slower, but it still answers the heat
+            return min(255, max(40, 40 + (temp - 50) * 1.2))
         return min(255, max(70, 70 + (temp - 50) * 1.5))
 
     def nv_status(self, value=None):
@@ -1511,6 +1515,147 @@ def the_menu_changes_settings_and_saves_them(r):
     os.close(fd)
     os.close(control)
     m.close()
+
+
+@scenario
+def the_silent_fan_curve_while_cool_and_the_normal_one_before_boost(r):
+    m = Machine(cpu=Chip(load=40, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config="cpu0.max = 85\n")
+    m.start()
+    m.advance(26, limit_cpu=85)
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.SILENT, f"cool for 20 s: the silent curve, 0xf4 is {m.ec_byte(Ec.FAN_MODE):#x}")
+    r.check("the firmware's silent fan curve" in m.text(), m.text()[-300:])
+    quiet = m.cpu.temp
+    m.cpu.load = 220
+    m.advance(30, limit_cpu=85)
+    log = m.text()
+    r.check("the firmware's normal fan curve again" in log, log[-400:])
+    r.check(log.find("normal fan curve again") < log.find("cooler_boost: on") or "cooler_boost: on" not in log,
+            "the normal curve before Cooler Boost")
+    r.check(m.cpu.peak <= 87, f"peak {m.cpu.peak:.1f}")
+    r.note(f"silent at {quiet:.1f} C under light load; under 220 W peak {m.cpu.peak:.1f} C")
+    m.stop()
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO, f"after stop 0xf4 is {m.ec_byte(Ec.FAN_MODE):#x}")
+    m.close()
+    # a curve the user chose in MSI's tools is theirs
+    m = Machine(cpu=Chip(load=40, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(fan_mode=Ec.ADVANCED), config="cpu0.max = 85\n")
+    m.start()
+    m.advance(24, limit_cpu=85)
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.ADVANCED, f"an advanced curve changed to {m.ec_byte(Ec.FAN_MODE):#x}")
+    m.stop()
+    m.close()
+    # and `fan.silent = no` keeps the normal one
+    m = Machine(cpu=Chip(load=40, g_min=0.8, g_max=3.0), cpu_fan=False, ec=Ec(), config="cpu0.max = 85\nfan.silent = no\n")
+    m.start()
+    m.advance(24, limit_cpu=85)
+    r.check(m.ec_byte(Ec.FAN_MODE) == Ec.AUTO, "fan.silent = no")
+    m.stop()
+    m.close()
+
+
+def fake_proc(m, pid, comm, pgrp, ticks=0, nice=0, rss=1000, ppid=1, oom=None, gpu=False):
+    d = f"{m.root}/proc/{pid}"
+    os.makedirs(f"{d}/fd", exist_ok=True)
+    put(f"{d}/stat", f"{pid} ({comm}) S {ppid} {pgrp} {pgrp} 0 -1 0 0 0 0 0 {ticks} 0 0 0 20 {nice} 1 0 0 0 {rss}")
+    if oom is not None:
+        put(f"{d}/oom_score", oom)
+        put(f"{d}/oom_score_adj", 0)
+    if gpu and not os.path.lexists(f"{d}/fd/5"):
+        os.symlink("/dev/dri/renderD128", f"{d}/fd/5")
+
+
+def sleeper(own_group=True):
+    return subprocess.Popen(["sleep", "120"], preexec_fn=os.setpgrp if own_group else None)
+
+
+@scenario
+def under_cpu_pressure_jobs_yield_and_the_desktop_keeps_its_share(r):
+    m = Machine(cpu=Chip(load=10), config="cpu0.max = 85\n")
+    put(f"{m.root}/proc/pressure/cpu", "some avg10=85.00 avg60=60.00 avg300=20.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0")
+    job, game, desktop = sleeper(), sleeper(), sleeper()
+    procs = [(job, "make", False), (game, "game", True), (desktop, "mango", False)]
+    try:
+        m.start()
+        ticks = 0
+        for _ in range(20):
+            ticks += 50
+            for p, comm, gpu in procs:
+                fake_proc(m, p.pid, comm, os.getpgid(p.pid), ticks=ticks, gpu=gpu)
+            m.advance(0.5)
+        log = m.text()
+        r.check(os.getpriority(os.PRIO_PGRP, job.pid) == 10, f"the job's nice is {os.getpriority(os.PRIO_PGRP, job.pid)}\n{log[-300:]}")
+        r.check("make and its job yield to the desktop" in log, log[-300:])
+        r.check(os.getpriority(os.PRIO_PROCESS, game.pid) == 0, "a game drawing on the GPU keeps its share")
+        r.check(os.getpriority(os.PRIO_PROCESS, desktop.pid) == 0, "nobody may lower a nice: mango stays, without a fuss")
+        r.check(m.proc.poll() is None, "zcool still runs")
+        listed = m.cmd("list").stdout
+        r.check("guard: cpu waited 85%" in listed, listed[-200:])
+        m.stop()
+    finally:
+        for p, _, _ in procs:
+            p.kill()
+            p.wait()
+        m.close()
+    # no pressure: nothing is touched
+    m = Machine(cpu=Chip(load=10), config="cpu0.max = 85\n")
+    put(f"{m.root}/proc/pressure/cpu", "some avg10=5.00 avg60=1.00 avg300=0.00 total=1")
+    job = sleeper()
+    try:
+        m.start()
+        ticks = 0
+        for _ in range(12):
+            ticks += 50
+            fake_proc(m, job.pid, "make", os.getpgid(job.pid), ticks=ticks)
+            m.advance(0.5)
+        r.check(os.getpriority(os.PRIO_PGRP, job.pid) == 0, "without pressure no job yields")
+        m.stop()
+    finally:
+        job.kill()
+        job.wait()
+        m.close()
+
+
+@scenario
+def memory_all_but_gone_ends_the_hog_never_the_session(r):
+    m = Machine(cpu=Chip(load=10), config="cpu0.max = 85\n")
+    put(f"{m.root}/proc/meminfo", "MemTotal: 32000000 kB\nMemAvailable: 900000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB")
+    hog, desktop, small = sleeper(), sleeper(), sleeper()
+    fake_proc(m, hog.pid, "hog", os.getpgid(hog.pid), rss=6000000, oom=800)
+    fake_proc(m, desktop.pid, "mango", os.getpgid(desktop.pid), rss=7000000, oom=900)
+    fake_proc(m, small.pid, "small", os.getpgid(small.pid), rss=1000, oom=10)
+    try:
+        m.start()
+        deadline = time.time() + 6
+        while hog.poll() is None and time.time() < deadline:
+            m.advance(0.2)
+        log = m.text()
+        r.check(hog.poll() == -signal.SIGTERM, f"the hog should be asked to end: {hog.poll()}\n{log[-300:]}")
+        r.check(desktop.poll() is None and small.poll() is None, "only the hog")
+        r.check("ending hog" in log and "MiB) before the system stalls" in log, log[-300:])
+        # memory back: nothing more happens
+        put(f"{m.root}/proc/meminfo", "MemTotal: 32000000 kB\nMemAvailable: 16000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB")
+        m.advance(3)
+        r.check(small.poll() is None and desktop.poll() is None, "no more ends once there is room")
+        m.stop()
+    finally:
+        for p in (hog, desktop, small):
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+        m.close()
+    # guard.memory = no
+    m = Machine(cpu=Chip(load=10), config="cpu0.max = 85\nguard.memory = no\n")
+    put(f"{m.root}/proc/meminfo", "MemTotal: 32000000 kB\nMemAvailable: 900000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB")
+    hog = sleeper()
+    fake_proc(m, hog.pid, "hog", os.getpgid(hog.pid), rss=6000000, oom=800)
+    try:
+        m.start()
+        m.advance(3)
+        r.check(hog.poll() is None, "guard.memory = no ends nothing")
+        m.stop()
+    finally:
+        hog.kill()
+        hog.wait()
+        m.close()
 
 
 def run_one(fn):

@@ -28,6 +28,10 @@ pub const Layout = struct {
     /// the byte for each Profile, in its order
     profiles: [4]u8,
     charge: u8,
+    /// the firmware's fan curves: its normal one and its silent one
+    fan_mode: u8,
+    fan_auto: u8,
+    fan_silent: u8,
     cpu_temp: u8,
     cpu_fan: u8,
     gpu_temp: u8,
@@ -48,6 +52,9 @@ pub const layouts = [_]Layout{
         .profile = 0xf2,
         .profiles = .{ 0xc2, 0xc1, 0xc0, 0xc4 },
         .charge = 0xef,
+        .fan_mode = 0xf4,
+        .fan_auto = 0x0d,
+        .fan_silent = 0x1d,
         .cpu_temp = 0x68,
         .cpu_fan = 0x71,
         .gpu_temp = 0x80,

@@ -19,6 +19,7 @@ const gpus = @import("gpus.zig");
 const nvidia = @import("nvidia.zig");
 const ec = @import("ec.zig");
 const menu = @import("menu.zig");
+const guard = @import("guard.zig");
 
 pub const std_options: std.Options = .{
     .enable_segfault_handler = false,
@@ -1182,7 +1183,64 @@ fn referenceWatts(c: *const Chip) f32 {
     }
 }
 
+// ---------------------------------------------------------------- the EC's fan curves
+
+var fan_mode = control.FanMode{};
+var fan_mode_original: ?u8 = null;
+var fan_mode_refused = false;
+var silent_now = false;
+
+/// The firmware's silent fan curve while every chip is far below its limit, its normal one as
+/// soon as one heads up: before Cooler Boost, before any power is taken.
+fn adaptFanMode(dt: f32) void {
+    if (!cfg.fan_silent or !cfg.use_ec or fan_mode_refused or !ec.writable) return;
+    if (ec.layout == null) return;
+    var margin: f32 = 1000;
+    var busy = false;
+    for (chips[0..nchips]) |*c| {
+        if (!c.controlled() or !c.thermal.ready or c.asleep) continue;
+        margin = @min(margin, c.limit - c.thermal.forecast());
+        if (c.throttle.level < 1 or c.emergency) busy = true;
+    }
+    for (fans[0..nfans]) |*f| {
+        if (f.ec_boost and f.written == 1) busy = true;
+    }
+    const want = fan_mode.update(margin, dt) and !busy;
+    if (want != silent_now) setSilent(want);
+}
+
+fn setSilent(on: bool) void {
+    const l = ec.layout.?;
+    if (on) {
+        const current = ec.read(l.fan_mode) orelse return;
+        if (current != l.fan_auto) {
+            // a curve someone else chose, MSI's advanced one say: it stays theirs
+            fan_mode_refused = true;
+            return;
+        }
+        if (fan_mode_original == null) {
+            if (!dry_run) {
+                var path_buf: [256]u8 = undefined;
+                if (!journal.rememberByte(ec.path(&path_buf), l.fan_mode, null, current)) return;
+            }
+            fan_mode_original = current;
+        }
+        if (!dry_run and (!ec.write(l.fan_mode, l.fan_silent) or ec.read(l.fan_mode) != l.fan_silent)) {
+            _ = ec.write(l.fan_mode, current);
+            fan_mode_refused = true;
+            sys.print("ec: the silent fan curve was refused, the firmware's normal one stays\n");
+            return;
+        }
+        sys.printf("ec: {s}the firmware's silent fan curve, every chip far below its limit\n", .{if (dry_run) "would take " else ""});
+    } else {
+        if (!dry_run) _ = ec.write(l.fan_mode, fan_mode_original orelse l.fan_auto);
+        sys.printf("ec: {s}the firmware's normal fan curve again\n", .{if (dry_run) "would take " else ""});
+    }
+    silent_now = on;
+}
+
 fn step(dt: f32) void {
+    adaptFanMode(dt);
     // quiet mode: whether each chip lets its fans past the firmware's curve yet
     var loud: [max_chips]bool = undefined;
     for (chips[0..nchips], 0..) |*c, index| {
@@ -1575,7 +1633,9 @@ fn applySandbox() sandbox.Status {
     var sys_buf: [256]u8 = undefined;
     var run_buf: [256]u8 = undefined;
     var lib_buf: [256]u8 = undefined;
-    return sandbox.apply(&.{}, &.{
+    var proc_buf: [256]u8 = undefined;
+    // /proc for the guard: the pressure figures and the processes, read only
+    return sandbox.apply(&.{sys.join(&proc_buf, &.{ sys.root, "/proc" })}, &.{
         sys.join(&sys_buf, &.{ sys.root, "/sys" }),
         sys.join(&run_buf, &.{ sys.root, "/run/zcool" }),
         sys.join(&lib_buf, &.{ sys.root, "/var/lib/zcool" }),
@@ -1639,6 +1699,9 @@ fn runDaemon(selftest: bool) u8 {
 
     if (dry_run) sys.print("dry run: nothing will be written\n");
     if (nchips == 0) sys.print("no temperature sensors found, idling\n");
+    guard.cpu_on = cfg.guard_cpu;
+    guard.memory_on = cfg.guard_memory;
+    guard.dry_run = dry_run;
 
     var last = sys.nowMs();
     const started = last;
@@ -1656,6 +1719,7 @@ fn runDaemon(selftest: bool) u8 {
         step(dt);
         followPowerSource(now);
         saveLearned(now, false);
+        guard.tick(now);
         if (undervolted and now - started > 600_000) {
             undervolt.markStable();
             undervolted = false;
@@ -1664,6 +1728,7 @@ fn runDaemon(selftest: bool) u8 {
     }
     if (undervolted) undervolt.markStable();
     saveLearned(sys.nowMs(), true);
+    guard.restore();
     nvidia.stop();
     emergencyRestore();
     return 0;
@@ -1741,6 +1806,8 @@ fn listPower() void {
     }
     if (turboOn()) |on| n = appendf(&line, n, "{s}turbo {s}", .{ if (n > 0) ", " else "", if (on) "on" else "off" });
     if (n > 0) sys.printf("\npower: {s}\n", .{line[0..n]});
+    var guard_buf: [128]u8 = undefined;
+    if (guard.summary(&guard_buf)) |text| sys.printf("guard: {s}\n", .{text});
     loadLearned();
     var first = true;
     for (chips[0..nchips]) |*c| {
