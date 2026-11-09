@@ -70,6 +70,20 @@ pub const Result = struct {
         return @as(f32, @floatFromInt(low)) < @as(f32, @floatFromInt(full)) * 0.85;
     }
 
+    /// What Cooler Boost carries over the curve at full, as a share: 0.02 is 2% more. Null when
+    /// either was not measured.
+    pub fn boostGain(self: *const Result) ?f32 {
+        if (self.carries[0] <= 0 or self.carries[1] <= 0) return null;
+        return self.carries[0] / self.carries[1] - 1;
+    }
+
+    /// Cooler Boost earns its noise: 5% more than full speed or better. On the GF63 it carried
+    /// 2% more, at 7029 rpm against 5901.
+    pub fn boostWorth(self: *const Result) bool {
+        const gain = self.boostGain() orelse return true;
+        return gain >= 0.05;
+    }
+
     /// The duty the fans need to carry `watts` at `temp`, from what each speed carried: null
     /// below what 60% carries, where nothing was measured and the fans find it themselves.
     pub fn fanDuty(self: *const Result, watts: f32, temp: f32) ?f32 {
@@ -304,4 +318,17 @@ test "a reading settles once it stops moving" {
     i = 0;
     while (i < 40) : (i += 1) s.add(31 + @as(f32, @floatFromInt(i % 3)) * 0.1);
     try std.testing.expect(s.steady(0.05));
+}
+
+test "Cooler Boost earns its noise only where it carries clearly more" {
+    var r = Result{ .limit = 70 };
+    // the GF63: 29.6 W against 29.0
+    r.carries = .{ 29.6, 29.0, 27.6, 25.7 };
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0207), r.boostGain().?, 0.001);
+    try std.testing.expect(!r.boostWorth());
+    r.carries[0] = 33;
+    try std.testing.expect(r.boostWorth());
+    // not measured: it stays as it always was
+    r.carries[0] = 0;
+    try std.testing.expect(r.boostWorth());
 }

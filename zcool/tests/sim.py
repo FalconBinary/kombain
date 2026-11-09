@@ -531,7 +531,7 @@ class Machine:
         if step.startswith("cores "):
             share = min(1, int(step.split()[1]) / self.cores)
             self.cpu.load = 5 + (self.cal_full - 5) * share ** 0.8
-        else:
+        elif step.startswith("idle"):
             self.cpu.load = 5
 
     def stop(self, sig=signal.SIGTERM):
@@ -2081,6 +2081,35 @@ def a_burst_limit_holds_the_short_term_power_and_psys_stays_alone(r):
     m.stop()
     r.check(get(m.pl2_path) == "107000000" and get(m.rapl_path) == "45000000", f"back: {get(m.rapl_path)} {get(m.pl2_path)}")
     m.close()
+
+
+@scenario
+def cooler_boost_only_where_it_earns_its_noise(r):
+    cal = ("limit 70\nfans boost {boost} 7029 0\nfans 100% 29.0 5901 0\nfans 80% 27.6 4877 0\nfans 60% 25.7 3621 0\n"
+           "power 15.5 2500\npower 27.0 3260\npower 30.8 3398\n")
+    for boost, worth in ((29.6, False), (34.0, True)):
+        m = gf63()
+        put(f"{m.root}/var/lib/zcool/calibration", cal.format(boost=boost))
+        m.cpu.load = 60
+        m.start()
+        on = 0
+        samples = 0
+        for i in range(60):
+            m.advance(0.5, limit_cpu=70)
+            if i >= 30:
+                samples += 1
+                on += m.boost()
+        log = m.text()
+        if worth:
+            r.check(on == samples, f"Cooler Boost that carries 17% more should run under this heat: {on} of {samples}")
+        else:
+            r.check("calibration found Cooler Boost carries 2% more than full speed" in log, log[-500:])
+            r.check(on == 0, f"Cooler Boost on {on} of {samples} times, the chip held at its limit by power")
+            r.check(m.ec_byte(Ec.CURVES[0][1]) == 100, "the curve at full before any power is taken")
+        r.check(m.cpu.peak <= 72.5, f"peak {m.cpu.peak:.1f}")
+        r.note(f"Cooler Boost {'worth it' if worth else 'not worth it'}: peak {m.cpu.peak:.1f} C, speed {m.cpu.perf * 100:.1f}%")
+        m.stop()
+        m.close()
 
 
 def tcc_machine(config="cpu0.max = 85\n", cpuinfo="GenuineIntel", lockdown="[none] integrity confidentiality"):

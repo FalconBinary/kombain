@@ -123,8 +123,9 @@ measures what it otherwise finds out while the heat comes.
   its EC keeps two curves. If 60% turns them as fast as 100%, the EC ignores the curve, and
   zcool keeps to Cooler Boost from then on.
 
-On the GF63 at 70 C the fan carried 27 W at 60% (3734 rpm) and 32 W with Cooler Boost (6927):
-nearly twice the speed, far louder, for a fifth more heat. Where the firmware bursts far past
+On the GF63 at 70 C the fan carried 25.7 W at 60% (3621 rpm), 29.0 W at full (5901) and
+29.6 W with Cooler Boost (7029): nearly twice the speed, far louder, for an eighth more heat,
+and Cooler Boost 2% over full speed, so zcool keeps it for a chip over its limit. Where the firmware bursts far past
 what the cooler carries, calibration says so, and suggests a `burst` of twice that.
 
 The service stops while it runs and starts again after. Ctrl-C, or any chip 4 C over its limit,
@@ -263,8 +264,10 @@ On many MSI laptops Linux cannot turn the fans: they belong to the EC, and the k
   once the fans have come well down, so it does not switch back and forth. With Cooler Boost
   on, the fans count as at full whatever the curve says, so power is not given back while
   they have nothing left: on the GF63 it was, and the chip went over its limit. With Cooler
-  Boost alone the same holds once it has been on 2 s, time for the fans to spin up. A boost
-  you turned on with the key stays on. `fan.curve = no` leaves only Cooler Boost: the firmware's
+  Boost alone the same holds once it has been on 2 s, time for the fans to spin up. Where
+  calibration found it carries less than 5% more than full speed, it comes only for a chip
+  over its limit and goes once that chip is back under it: on the GF63 it carried 2% more,
+  at 7029 rpm against 5901. A boost you turned on with the key stays on. `fan.curve = no` leaves only Cooler Boost: the firmware's
   curve, or both fans at full.
 - **The GPU's temperature,** when NVIDIA's library reads none.
 - **`battery.max`:** a charge limit, from 10 to 100%. Unlike everything else it stays when
@@ -362,7 +365,8 @@ fan and a clock limit, a desktop one with its own fan, the case fan and its powe
 an Intel GPU's power1_max, an idle GPU read rarely enough to sleep, one asleep never
 reached, and NVIDIA's settings given back after `kill -9` of zcool and of both. A NVIDIA
 library that reads only an attached GPU, and one that reads nothing, read through the EC.
-A burst limit held on mains and on battery, under a cut as well, and given back; psys never
+Cooler Boost only for a chip over its limit where calibration found it adds 2%, and as always
+where it adds 17%. A burst limit held on mains and on battery, under a cut as well, and given back; psys never
 taken for the CPU's. Calibration on a GF63-like laptop with one fan: the fans' carry at each speed, the speed at
 each power and core count, the service stopped and started again, what was learned seeded, and
 everything back after it and after Ctrl-C; refused on battery; a calibration whose fans

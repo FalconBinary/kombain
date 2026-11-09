@@ -1015,7 +1015,8 @@ fn updateCurve(fan: *Fan, dt: f32) void {
         fan.written = percent;
     }
     // past full: Cooler Boost, and off only once the fans have come well down
-    const boost = !boost_barred and (if (fan.ctl.duty >= 254) true else if (fan.ctl.duty < curve_boost_off) false else fan.boost_on);
+    const allowed = !boost_barred and (!boost_useless or boost_rescue);
+    const boost = allowed and (if (fan.ctl.duty >= 254) true else if (fan.ctl.duty < curve_boost_off) false else fan.boost_on);
     if (boost != fan.boost_on) {
         if (!dry_run and !ec.setBoost(boost)) return curveFailed(fan);
         sys.printf("{s}: Cooler Boost {s}\n", .{ fan.name(), if (boost) "on, every fan past full" else "off" });
@@ -1515,6 +1516,16 @@ fn setSilent(on: bool) void {
 
 fn step(dt: f32) void {
     adaptFanMode(dt);
+    if (boost_useless) {
+        var over = false;
+        var near = false;
+        for (chips[0..nchips]) |*c| {
+            if (!c.controlled() or !c.thermal.ready or c.asleep) continue;
+            if (c.emergency or c.thermal.temp > c.limit + 1) over = true;
+            if (c.thermal.temp > c.limit - 1) near = true;
+        }
+        boost_rescue = over or (boost_rescue and near);
+    }
     // quiet mode: whether each chip lets its fans past the firmware's curve yet
     var loud: [max_chips]bool = undefined;
     var wants: [max_chips]f32 = undefined;
@@ -1966,6 +1977,13 @@ fn runDaemon(selftest: bool) u8 {
     for (chips[0..nchips]) |*c| {
         if (c.kind == .cpu and cal.known()) c.quiet.floor = cal.quietFloor() orelse control.quiet_floor;
     }
+    if (cal.known() and !cal.boostWorth()) {
+        for (fans[0..nfans]) |*f| {
+            if (!f.ec_curve) continue;
+            boost_useless = true;
+            sys.printf("{s}: calibration found Cooler Boost carries {d:.0}% more than full speed: only for a chip over its limit\n", .{ f.name(), (cal.boostGain() orelse 0) * 100 });
+        }
+    }
     if (ec.layout != null) {
         var curve = false;
         for (fans[0..nfans]) |*f| curve = curve or f.ec_curve;
@@ -2324,6 +2342,10 @@ fn menuInfo(info: *menu.Info) void {
 var cal = calibrate.Result{};
 /// Calibration holds zcool's curve at full without Cooler Boost for one of its points.
 var boost_barred = false;
+/// Calibration found Cooler Boost carries next to nothing over full speed: it comes only for a
+/// chip over its limit, and stays until that chip is back under it.
+var boost_useless = false;
+var boost_rescue = false;
 
 fn calibrationPath(buf: []u8) [:0]const u8 {
     return sys.join(buf, &.{ sys.root, "/var/lib/zcool/calibration" });
@@ -2673,6 +2695,9 @@ fn describeCalibration() void {
     if (turning > 0) _ = t.add("; ").num(turning).add(if (turning == 1) " fan turns" else " fans turn");
     if (cal.curveFollowed()) |followed| _ = t.add(if (followed) "; they follow zcool's curve" else "; they do not follow zcool's curve: Cooler Boost alone");
     t.line();
+    if (cal.boostGain()) |gain| if (!cal.boostWorth()) {
+        t.add("  Cooler Boost carries ").whole(gain * 100).add("% more than full speed: zcool keeps it for a chip over its limit").line();
+    };
     var first = true;
     for (cal.power) |p| {
         if (p.watts <= 0) continue;
