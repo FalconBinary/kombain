@@ -46,8 +46,12 @@ if [ ! -d "$vp/.git" ]; then
 fi
 git -C "$vp" fetch -q --depth 1 origin "$commit"
 git -C "$vp" checkout -q --detach FETCH_HEAD
-rm -rf "$vp/srcpkgs/$pkg"
-cp -R "$here/srcpkgs/$pkg" "$vp/srcpkgs/$pkg"
+# the template's directory and, as void-packages has them, a symlink to it per subpackage:
+# xbps-src reads a subpackage's template through srcpkgs/<subpackage>/template
+for entry in "$here"/srcpkgs/*; do
+	rm -rf "$vp/srcpkgs/$(basename "$entry")"
+done
+cp -R "$here"/srcpkgs/* "$vp/srcpkgs/"
 # do_install runs files/mv-debug through xargs; a checkout without its executable bit cost one two-hour build.
 chmod +x "$vp/srcpkgs/$pkg/files/mv-debug"
 cd "$vp"
@@ -62,6 +66,10 @@ fi
 echo "== the template"
 xlint "srcpkgs/$pkg/template"
 ./xbps-src show "$pkg"
+# each *_package() in the template is a subpackage; without its symlink the build fails after two hours, this fails now
+for sub in $(sed -n 's/^\([a-z0-9.+_-]*\)_package() {$/\1/p' "srcpkgs/$pkg/template"); do
+	./xbps-src show "$sub" | grep -E '^(pkgname|short_desc):'
+done
 [ "$step" != show ] || exit 0
 
 echo "== xbps-src binary-bootstrap"
