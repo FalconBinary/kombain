@@ -150,6 +150,25 @@ def scenario(fn):
     return fn
 
 
+def busy(m, pid, comm, seconds, cores=1.2, t0=None):
+    """A build process kept busy for `seconds`: its ticks follow the wall clock, so the load it
+    shows is `cores` whatever this script's own sleeps cost on a loaded runner."""
+    t0 = t0 or time.time()
+    end = time.time() + seconds
+    while time.time() < end:
+        m.fake(pid, comm, ticks=int((time.time() - t0) * 100 * cores))
+        time.sleep(0.5)
+    return t0
+
+
+def wait_sched(m, pid, comm, policy, seconds, t0):
+    """Keeps the process busy until ztune gives it `policy`, or `seconds` pass."""
+    end = time.time() + seconds
+    while time.time() < end and os.sched_getscheduler(pid) != policy:
+        m.fake(pid, comm, ticks=int((time.time() - t0) * 120))
+        time.sleep(0.5)
+
+
 def everything_back(r, m, how):
     for rel, value in ORIGINAL.items():
         if rel.startswith("sys/class") or rel.endswith("rotational") or rel.endswith("lru_gen/enabled") or rel == "proc/loadavg":
@@ -209,12 +228,9 @@ def a_build_runs_as_batch_and_the_desktop_comes_back(r):
     m.start()
     time.sleep(4)
     r.check(os.sched_getscheduler(pid) == SCHED_OTHER, "nothing builds yet")
-    # cc1 keeps more than a core busy: 120 ticks a second
-    ticks = 0
-    for _ in range(14):
-        ticks += 60
-        m.fake(pid, "cc1", ticks)
-        time.sleep(0.5)
+    # cc1 keeps more than a core busy; ztune looks every 3 s, so up to two looks may pass
+    t0 = busy(m, pid, "cc1", 7)
+    wait_sched(m, pid, "cc1", SCHED_BATCH, 10, t0)
     log = m.text()
     r.check("now: build on mains, cc1 builds" in log, log[-400:])
     r.check(os.sched_getscheduler(pid) == SCHED_BATCH, f"the compiler should run as SCHED_BATCH, is {os.sched_getscheduler(pid)}")
@@ -237,11 +253,8 @@ def stopped_in_a_build_the_compiler_gets_its_scheduling_back(r):
     m = Machine()
     pid = m.child()
     m.start()
-    ticks = 0
-    for _ in range(14):
-        ticks += 60
-        m.fake(pid, "rustc", ticks)
-        time.sleep(0.5)
+    t0 = busy(m, pid, "rustc", 7)
+    wait_sched(m, pid, "rustc", SCHED_BATCH, 10, t0)
     r.check(os.sched_getscheduler(pid) == SCHED_BATCH, "rustc should run as SCHED_BATCH")
     m.stop()
     r.check(os.sched_getscheduler(pid) == SCHED_OTHER, "back to SCHED_OTHER when ztune stops")
@@ -409,15 +422,24 @@ def main():
         os.setgid(65534)
         os.setuid(65534)
     chosen_ones = [fn for fn in scenarios if not ONLY or ONLY in fn.__name__]
+    # calibration loads every CPU for a minute and would starve the others' timing: it runs alone, last
+    alone = [fn for fn in chosen_ones if fn.__name__.startswith("calibration")]
+    together = [fn for fn in chosen_ones if fn not in alone]
     failed = 0
+
+    def report(name, problems, notes):
+        print(f"{'FAIL' if problems else 'ok  '}  {name}", flush=True)
+        for note in notes:
+            print(f"        {note}", flush=True)
+        for problem in problems:
+            print(f"     !  {problem}"[:300], flush=True)
+        return bool(problems)
+
     with concurrent.futures.ProcessPoolExecutor(max_workers=3) as pool:
-        for name, problems, notes in pool.map(run_one, chosen_ones):
-            print(f"{'FAIL' if problems else 'ok  '}  {name}", flush=True)
-            for note in notes:
-                print(f"        {note}", flush=True)
-            for problem in problems:
-                print(f"     !  {problem}"[:300], flush=True)
-            failed += bool(problems)
+        for name, problems, notes in pool.map(run_one, together):
+            failed += report(name, problems, notes)
+    for fn in alone:
+        failed += report(*run_one(fn))
     print(f"\n{len(chosen_ones) - failed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
 
