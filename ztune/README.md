@@ -27,7 +27,7 @@ And once, whatever the source and the mode:
 | MGLRU `min_ttl_ms` | 1000 | Out of memory, the kernel ends a process instead of grinding its swap for minutes: the working set of the last second is kept. |
 | kswapd watermark | 1.25% | Reclaim starts early, so an allocation rarely waits for it. |
 | Huge page defrag | defer+madvise | Never compacting memory in the path of an allocation. |
-| I/O scheduler | none for NVMe, BFQ for a disk that spins, mq-deadline for a SATA SSD | NVMe queues in hardware; BFQ keeps reads coming to the desktop while something writes. |
+| I/O scheduler | none for NVMe and a VM's disk, BFQ for a disk that spins, mq-deadline for a SATA SSD | NVMe queues in hardware and a host schedules for its VMs; BFQ keeps reads coming to the desktop while something writes. |
 
 What zcool sets, ztune leaves alone. So are USB autosuspend (a mouse that stutters, a disk
 that drops) and the integrated GPU's clocks (the desktop's animations), each a trade nobody

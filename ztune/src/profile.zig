@@ -152,11 +152,13 @@ pub fn offers(text: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The I/O scheduler for a disk: none for NVMe, which queues in hardware; BFQ for one that
-/// spins, so the desktop still reads while something writes; mq-deadline for SATA SSDs.
-/// Null when the one it should have is not offered.
+/// The I/O scheduler for a disk: none for NVMe, which queues in hardware, and for a virtual
+/// disk, whose host schedules (QEMU's virtio disks even say they spin); BFQ for one that spins,
+/// so the desktop still reads while something writes; mq-deadline for SATA SSDs. Null when
+/// the one it should have is not offered.
 pub fn scheduler(name: []const u8, rotational: bool, available: []const u8) ?[]const u8 {
-    const want: []const u8 = if (std.mem.startsWith(u8, name, "nvme"))
+    const virtual = std.mem.startsWith(u8, name, "vd") or std.mem.startsWith(u8, name, "xvd");
+    const want: []const u8 = if (std.mem.startsWith(u8, name, "nvme") or virtual)
         "none"
     else if (rotational and offers(available, "bfq"))
         "bfq"
@@ -219,5 +221,6 @@ test "sysfs choices and I/O schedulers" {
     try std.testing.expectEqualStrings("mq-deadline", scheduler("sda", false, "[mq-deadline] kyber bfq none").?);
     try std.testing.expectEqualStrings("mq-deadline", scheduler("sdb", true, "[mq-deadline] none").?);
     try std.testing.expect(scheduler("sda", false, "[none]") == null);
+    try std.testing.expectEqualStrings("none", scheduler("vda", true, "[mq-deadline] kyber bfq none").?);
     try std.testing.expect(!schedulable("zram0") and !schedulable("dm-0") and schedulable("nvme0n1"));
 }

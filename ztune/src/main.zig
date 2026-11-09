@@ -554,7 +554,7 @@ fn runCheck() u8 {
         var label_buf: [40]u8 = undefined;
         var label = Text{ .buf = &label_buf };
         _ = label.add(disk).add(" scheduler");
-        row(label.str(), profile.chosen(available), if (cfg.disk) choice else profile.chosen(available), if (std.mem.startsWith(u8, disk, "nvme")) "NVMe queues in hardware" else if (rotational) "a spinning disk keeps reads coming" else "an SSD on SATA");
+        row(label.str(), profile.chosen(available), if (cfg.disk) choice else profile.chosen(available), if (std.mem.startsWith(u8, disk, "nvme")) "NVMe queues in hardware" else if (std.mem.eql(u8, choice, "none")) "its host schedules" else if (rotational) "a spinning disk keeps reads coming" else "an SSD on SATA");
     }
     if (mode == .build) sys.print("  a build runs: its processes run as SCHED_BATCH, the desktop first\n");
     var cal_buf: [256]u8 = undefined;
