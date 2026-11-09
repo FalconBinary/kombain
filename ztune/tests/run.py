@@ -336,7 +336,9 @@ def calibration_finds_the_jobs_and_writes_them_for_shells(r):
     r.check(out.returncode == 0, out.stdout + out.stderr)
     jobs = get(m.path("var/lib/ztune/jobs")) if os.path.exists(m.path("var/lib/ztune/jobs")) else ""
     cpus = len(os.sched_getaffinity(0))
-    r.check(jobs.isdigit() and 1 <= int(jobs) <= cpus, f"jobs {jobs!r} on {cpus} CPUs")
+    cores = physical_cores(cpus)
+    r.check(jobs.isdigit() and cores <= int(jobs) <= cpus, f"jobs {jobs!r} on {cpus} CPUs, {cores} cores")
+    r.check(" rounds/s" in out.stdout and "fastest with the fewest jobs" in out.stdout, out.stdout)
     script = get(m.path("etc/profile.d/ztune.sh")) if os.path.exists(m.path("etc/profile.d/ztune.sh")) else ""
     r.check(f': "${{MAKEFLAGS:=-j{jobs}}}"' in script, script)
     # a shell reads it, and a value set before wins
@@ -352,6 +354,19 @@ def calibration_finds_the_jobs_and_writes_them_for_shells(r):
     r.check("builds run 8 jobs" in out, out)
     m2.close()
     m.close()
+
+
+def physical_cores(cpus):
+    """CPUs that head their core's sibling list, as ztune counts them."""
+    cores = 0
+    for i in range(cpus):
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list") as f:
+                head = f.read().replace("-", ",").split(",")[0].strip()
+        except OSError:
+            return max(cpus // 2, 1)
+        cores += int(head) == i
+    return cores or max(cpus // 2, 1)
 
 
 def run_one(fn):

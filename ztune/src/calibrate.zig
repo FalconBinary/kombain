@@ -4,9 +4,16 @@
 //!
 //! A laptop held at its temperature limit may build as fast on fewer jobs as on all: past
 //! a point the jobs only share the same watts, and the heat and the noise go up. So it runs a
-//! load shaped like a compiler's, on 1, a quarter, half, three quarters and all of the CPUs,
-//! and takes the fewest jobs within 3% of the fastest. MAKEFLAGS, CARGO_BUILD_JOBS and
-//! CMAKE_BUILD_PARALLEL_LEVEL get that number, unless a shell sets them itself.
+//! load shaped like a compiler's on all the CPUs, three quarters, half, a quarter and one,
+//! from the top so that every step is measured on a machine as warm as a long build keeps it,
+//! and takes the fewest jobs within 3% of the fastest, never fewer than there are cores.
+//! MAKEFLAGS, CARGO_BUILD_JOBS and CMAKE_BUILD_PARALLEL_LEVEL get that number, unless a
+//! shell sets them itself.
+//!
+//! The first load here walked 4 MiB per job at random: one job fit the GF63's 12 MiB of
+//! cache, three filled it, and from there every job waited on memory and twelve ran no
+//! faster than one. It said 3 jobs, and a shell built three times slower than it could. A
+//! compiler's working set mostly fits a core's own cache; so does this one's now.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -15,27 +22,52 @@ const sys = @import("sys.zig");
 pub const Point = struct { jobs: u16, rate: f32, watts: f32 = 0 };
 pub const max_points = 5;
 
-/// The job counts it tries, smallest first and each once.
+/// The job counts it tries, all the CPUs first and each once.
 pub fn steps(cpus: u16, out: *[max_points]u16) []const u16 {
     var n: usize = 0;
-    const tries = [_]u16{ 1, cpus / 4, cpus / 2, cpus * 3 / 4, cpus };
+    const tries = [_]u16{ cpus, cpus * 3 / 4, cpus / 2, cpus / 4, 1 };
     for (tries) |t| {
         if (t == 0) continue;
-        if (n > 0 and out[n - 1] >= t) continue;
+        if (n > 0 and out[n - 1] <= t) continue;
         out[n] = t;
         n += 1;
     }
     return out[0..n];
 }
 
-/// The fewest jobs within 3% of the fastest.
-pub fn best(points: []const Point) u16 {
+/// The fewest jobs within 3% of the fastest, and never fewer than `floor`: a job per core at
+/// least, whatever a measurement says.
+pub fn best(points: []const Point, floor: u16) u16 {
     var fastest: f32 = 0;
-    for (points) |p| fastest = @max(fastest, p.rate);
+    var most: u16 = 1;
     for (points) |p| {
-        if (p.rate >= fastest * 0.97) return p.jobs;
+        fastest = @max(fastest, p.rate);
+        most = @max(most, p.jobs);
     }
-    return if (points.len > 0) points[points.len - 1].jobs else 1;
+    var fewest = most;
+    for (points) |p| {
+        if (p.rate >= fastest * 0.97) fewest = @min(fewest, p.jobs);
+    }
+    return @min(@max(fewest, floor), most);
+}
+
+/// The cores under the CPUs, from which CPUs are siblings: 6 on a CPU with 12 threads. Read
+/// from the real /sys whatever the root, as the load runs on the real CPUs.
+pub fn physicalCores(cpus: u16) u16 {
+    var cores: u16 = 0;
+    var i: u16 = 0;
+    while (i < cpus) : (i += 1) {
+        var num: [8]u8 = undefined;
+        var path_buf: [128]u8 = undefined;
+        var text: [256]u8 = undefined;
+        const digits = std.fmt.bufPrint(&num, "{d}", .{i}) catch break;
+        const list = sys.readFile(sys.join(&path_buf, &.{ "/sys/devices/system/cpu/cpu", digits, "/topology/thread_siblings_list" }), &text) orelse break;
+        // the first CPU of a core's list is the core
+        var first = std.mem.tokenizeAny(u8, list, ",-\n");
+        const head = std.fmt.parseInt(u16, first.next() orelse break, 10) catch break;
+        if (head == i) cores += 1;
+    }
+    return if (cores > 0) cores else @max(cpus / 2, 1);
 }
 
 /// /etc/profile.d/ztune.sh: what a login shell starts with, unless it says otherwise.
@@ -71,7 +103,13 @@ pub const Load = struct {
         return .{ .counters = @ptrFromInt(addr) };
     }
 
-    pub fn start(self: *Load, n: usize) void {
+    /// Workers up to `n`, or down to it: the counters of those stopped stay where they were.
+    pub fn set(self: *Load, n: usize) void {
+        while (self.n > n) {
+            self.n -= 1;
+            sys.kill(self.pids[self.n], .KILL);
+            _ = sys.reap(self.pids[self.n], 1000);
+        }
         while (self.n < @min(n, max_workers)) {
             self.counters[self.n][0] = 0;
             const parent = linux.getpid();
@@ -95,18 +133,15 @@ pub const Load = struct {
     }
 
     pub fn stop(self: *Load) void {
-        while (self.n > 0) {
-            self.n -= 1;
-            sys.kill(self.pids[self.n], .KILL);
-            _ = sys.reap(self.pids[self.n], 1000);
-        }
+        self.set(0);
     }
 };
 
-/// Shaped like a compiler's work: hashing, branches and scattered reads and writes over a few
-/// MiB, more than a core's own cache holds. It counts rounds of 4096.
+/// Shaped like a compiler's work: hashing, branches and scattered reads and writes over
+/// 192 KiB, within a core's own cache as most of a compiler's working set is, so that the
+/// jobs share the cores and the watts, not the memory bus. It counts rounds of 4096.
 fn work(counter: *volatile u64) noreturn {
-    const size = 1 << 20;
+    const size = 48 * 1024;
     var table: [size]u32 = undefined;
     @memset(&table, 0);
     var x: u32 = 2463534242;
@@ -124,20 +159,25 @@ fn work(counter: *volatile u64) noreturn {
     }
 }
 
-test "the job counts it tries" {
+test "the job counts it tries, from the top" {
     var buf: [max_points]u16 = undefined;
-    try std.testing.expectEqualSlices(u16, &.{ 1, 3, 6, 9, 12 }, steps(12, &buf));
-    try std.testing.expectEqualSlices(u16, &.{ 1, 2 }, steps(2, &buf));
+    try std.testing.expectEqualSlices(u16, &.{ 12, 9, 6, 3, 1 }, steps(12, &buf));
+    try std.testing.expectEqualSlices(u16, &.{ 2, 1 }, steps(2, &buf));
     try std.testing.expectEqualSlices(u16, &.{1}, steps(1, &buf));
-    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 3, 4 }, steps(4, &buf));
+    try std.testing.expectEqualSlices(u16, &.{ 4, 3, 2, 1 }, steps(4, &buf));
 }
 
-test "the fewest jobs within 3% of the fastest" {
+test "the fewest jobs within 3% of the fastest, a job per core at least" {
     // held at its limit, nine jobs build as fast as twelve
-    const points = [_]Point{ .{ .jobs = 1, .rate = 100 }, .{ .jobs = 3, .rate = 280 }, .{ .jobs = 6, .rate = 500 }, .{ .jobs = 9, .rate = 590 }, .{ .jobs = 12, .rate = 600 } };
-    try std.testing.expectEqual(@as(u16, 9), best(&points));
-    const scaling = [_]Point{ .{ .jobs = 1, .rate = 100 }, .{ .jobs = 2, .rate = 200 } };
-    try std.testing.expectEqual(@as(u16, 2), best(&scaling));
+    const points = [_]Point{ .{ .jobs = 12, .rate = 600 }, .{ .jobs = 9, .rate = 590 }, .{ .jobs = 6, .rate = 500 }, .{ .jobs = 3, .rate = 280 }, .{ .jobs = 1, .rate = 100 } };
+    try std.testing.expectEqual(@as(u16, 9), best(&points, 6));
+    const scaling = [_]Point{ .{ .jobs = 2, .rate = 200 }, .{ .jobs = 1, .rate = 100 } };
+    try std.testing.expectEqual(@as(u16, 2), best(&scaling, 1));
+    // what the GF63 measured with the memory-bound load: three said enough, six cores say no
+    const memory_bound = [_]Point{ .{ .jobs = 12, .rate = 90 }, .{ .jobs = 9, .rate = 100 }, .{ .jobs = 6, .rate = 100 }, .{ .jobs = 3, .rate = 140 }, .{ .jobs = 1, .rate = 100 } };
+    try std.testing.expectEqual(@as(u16, 6), best(&memory_bound, 6));
+    // never more than was measured
+    try std.testing.expectEqual(@as(u16, 2), best(&scaling, 8));
 }
 
 test "the profile script leaves a value set before it alone" {

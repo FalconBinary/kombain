@@ -48,11 +48,13 @@ or idle is touched.
 
 ## How many jobs a build should run
 
-`doas ztune calibrate`, plugged in, about a minute: it runs a load shaped like a compiler's
-(hashing, branches, scattered reads over more memory than a core's cache) on one CPU, a
-quarter, half, three quarters and all of them, and takes the fewest jobs within 3% of the
-fastest. A laptop held at its temperature limit may build as fast on nine jobs as on twelve,
-and the last three only add heat and noise. The result goes to `/etc/profile.d/ztune.sh`:
+`doas ztune calibrate`, plugged in, about two minutes: it runs a load shaped like a compiler's
+(hashing, branches, scattered reads over 192 KiB, within a core's own cache as most of a
+compiler's working set is) on all the CPUs, three quarters, half, a quarter and one, from the
+top after a warm-up, so every step is measured on a machine as warm and as power-trimmed as a
+long build keeps it. It takes the fewest jobs within 3% of the fastest, and never fewer than
+there are cores. A laptop held at its temperature limit may build as fast on nine jobs as on
+twelve, and the last three only add heat and noise. The result goes to `/etc/profile.d/ztune.sh`:
 
 ```sh
 : "${MAKEFLAGS:=-j9}"

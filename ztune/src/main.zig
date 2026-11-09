@@ -581,6 +581,7 @@ fn runCalibrate() u8 {
     if (jobs == 0) {
         installSignals();
         const cpus: u16 = @intCast(@min(sys.cpuCount(), calibrate.max_workers));
+        const cores = calibrate.physicalCores(cpus);
         var steps_buf: [calibrate.max_points]u16 = undefined;
         const steps = calibrate.steps(cpus, &steps_buf);
         var points: [calibrate.max_points]calibrate.Point = undefined;
@@ -588,26 +589,38 @@ fn runCalibrate() u8 {
             sys.print("cannot share memory with the workers\n");
             return 1;
         };
-        out.add("calibrating builds on ").num(cpus).add(" CPUs, about ").num(@intCast(steps.len * 11)).add(" s; Ctrl-C stops it and keeps nothing").line();
-        var base: f32 = 0;
+        // a long build keeps the machine warm and its power trimmed: every step is measured so,
+        // after a warm-up on every CPU, each step settling before it counts
+        const warm_ms: i64 = 15_000;
+        const settle_ms: i64 = 5_000;
+        const measure_ms: i64 = 12_000;
+        _ = out.add("calibrating builds on ").num(cpus).add(" CPUs (").num(cores).add(" cores), about ");
+        out.num(@intCast(@divTrunc(warm_ms + @as(i64, @intCast(steps.len)) * (settle_ms + measure_ms), 1000))).add(" s; Ctrl-C stops it and keeps nothing").line();
+        var fastest: f32 = 0;
         for (steps, 0..) |n, i| {
-            load.start(n);
-            sys.sleepMs(3000);
+            load.set(n);
+            sys.sleepMs(if (i == 0) warm_ms else settle_ms);
             const before = load.total();
             const started = sys.nowMs();
-            sys.sleepMs(8000);
+            sys.sleepMs(measure_ms);
             const rate = @as(f32, @floatFromInt(load.total() - before)) * 1000 / @as(f32, @floatFromInt(sys.nowMs() - started));
-            load.stop();
             if (stop_requested) {
+                load.stop();
                 sys.print("calibration stopped: nothing was kept\n");
                 return 1;
             }
             points[i] = .{ .jobs = n, .rate = rate };
-            if (i == 0) base = @max(rate, 1);
-            out.add("  ").num(n).add(if (n == 1) " job:  " else " jobs: ").tenth(rate / base).add("x as fast as one").line();
+            fastest = @max(fastest, rate);
+            out.add("  ").num(n).add(if (n == 1) " job:  " else " jobs: ").num(@intFromFloat(rate)).add(" rounds/s").line();
         }
-        jobs = calibrate.best(points[0..steps.len]);
-        out.add("fastest with the fewest jobs: ").num(jobs).line();
+        load.stop();
+        jobs = calibrate.best(points[0..steps.len], cores);
+        for (points[0..steps.len]) |p| {
+            if (p.jobs != jobs) continue;
+            _ = out.add("fastest with the fewest jobs: ").num(jobs).add(", ").num(@intFromFloat(@round(p.rate * 100 / @max(fastest, 1)))).add("% of the fastest step");
+            if (jobs == cores and p.rate < fastest * 0.97) _ = out.add("; fewer measured as enough, but never fewer than the cores");
+            out.line();
+        }
     } else {
         out.add("jobs = ").num(jobs).add(" in ztune.conf: written as it is").line();
     }
