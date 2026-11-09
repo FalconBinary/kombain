@@ -40,8 +40,11 @@ build and release, after this kernel has booted and has rows.
 
 ## How it is built
 
-[.github/workflows/kernel.yml](../.github/workflows/kernel.yml), started by hand (Actions,
-"kernel", Run workflow). It runs [build.sh](build.sh) in `ghcr.io/void-linux/void-buildroot-glibc`,
+[.github/workflows/kernel.yml](../.github/workflows/kernel.yml) runs when the kernel itself
+changes: a push to a `kernel*` branch that touches the template, `build.sh` or the pinned
+commit, or by hand (Actions, "kernel", Run workflow) once the workflow is on `main`, since
+GitHub dispatches only workflows that exist on the default branch. It runs
+[build.sh](build.sh) in `ghcr.io/void-linux/void-buildroot-glibc`,
 the image that is a bootstrapped xbps-src masterdir (`base-chroot`: the same gcc 14.2 Void's
 kernel is built with): void-packages at the pinned commit, the template copied in, the
 container itself as xbps-src's chroot (`XBPS_CHROOT_CMD=ethereal`, no privileges needed; in that
@@ -57,10 +60,10 @@ unused SDKs first and allows six hours. The results go to a release
 - `config-<release>`: the kernel's final `.config`; `diffconfig-void-to-kombain.txt`: what differs from Void's
 - `BUILD`: the void-packages commit, the kombain commit, the compiler; `SHA256SUMS` over all of it
 
-The `-dbg` package is built (Void's template does) and not published. "Publish" off in the
-dispatch form keeps everything as a workflow artifact instead. The same tag again is refused
-unless "Replace" is on: a new config is a new `revision`, so the rows keep telling the
-kernels apart.
+The `-dbg` package is built (Void's template does) and not published. A push build always
+publishes; "Publish" off in the dispatch form keeps everything as a workflow artifact
+instead. The same tag again is refused unless the dispatch form's "Replace" is on: a new
+config is a new `revision`, so the rows keep telling the kernels apart.
 
 Before any of that, the config can be checked in minutes on any machine with Docker
 (x86_64, or Apple silicon through Rosetta):
