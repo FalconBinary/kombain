@@ -112,8 +112,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPLACE: ${{ inputs.replace }}
         run: |
-          cd "$RUNNER_TEMP/kbuild/out"
-          tag=$(cat TAG)
+          # The build's files belong to root (the container wrote them); the notes go beside them.
+          out=$RUNNER_TEMP/kbuild/out
+          tag=$(cat "$out/TAG")
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             if [ "$REPLACE" = true ]; then
               gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
@@ -128,11 +129,12 @@ jobs:
             echo "selects at boot) and \`-kombain\` in its name. The stock Void kernel stays installed as the fallback."
             echo
             echo '```'
-            cat BUILD
+            cat "$out/BUILD"
             echo '```'
             echo
             echo "Install and check: [kernel/README.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/kernel/README.md)."
             echo "Not measured yet: a kombain-bench row for this kernel says more than this note can."
-          } > notes.md
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md \
+          } > "$RUNNER_TEMP/notes.md"
+          cd "$out"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md" \
             ./*.xbps config-* diffconfig-void-to-kombain.txt BUILD SHA256SUMS
