@@ -48,6 +48,8 @@ git -C "$vp" fetch -q --depth 1 origin "$commit"
 git -C "$vp" checkout -q --detach FETCH_HEAD
 rm -rf "$vp/srcpkgs/$pkg"
 cp -R "$here/srcpkgs/$pkg" "$vp/srcpkgs/$pkg"
+# do_install runs files/mv-debug through xargs; a checkout without its executable bit cost one two-hour build.
+chmod +x "$vp/srcpkgs/$pkg/files/mv-debug"
 cd "$vp"
 
 echo "== xbps-src with this container as its chroot"

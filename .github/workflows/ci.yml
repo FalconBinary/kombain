@@ -105,6 +105,9 @@ jobs:
           cmp "$void/files/x86_64-dotconfig" "$ours/files/x86_64-dotconfig"
           cmp "$void/files/mv-debug" "$ours/files/mv-debug"
           diff -r "$void/patches" "$ours/patches"
+          # git keeps only the executable bit; do_install runs files/mv-debug, so Void's 755 must be ours too
+          diff <(cd "$void" && find files/mv-debug files/x86_64-dotconfig patches -type f -perm -u+x | sort) \
+               <(cd "$ours" && find files/mv-debug files/x86_64-dotconfig patches -type f -perm -u+x | sort)
           test "$(sed -n 's/^version=//p' "$void/template")" = "$(sed -n 's/^version=//p' "$ours/template")"
           diff <(sed -n '/^checksum=/,/^$/p' "$void/template") <(sed -n '/^checksum=/,/^$/p' "$ours/template")
       - name: The template, in void-packages at that commit
