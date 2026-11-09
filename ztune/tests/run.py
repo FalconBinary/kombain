@@ -27,6 +27,15 @@ def put(path, value):
         f.write(f"{value}\n")
 
 
+def put_whole(path, value):
+    """Like put, but the file is never seen half-written: it appears whole, by a rename. For what
+    ztune reads by path at every look (a process's stat, loadavg); not for a file it keeps open."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        f.write(f"{value}\n")
+    os.replace(path + ".tmp", path)
+
+
 def get(path):
     with open(path) as f:
         return f.read().strip()
@@ -88,9 +97,9 @@ class Machine:
         the start time the 22nd. A new process moves the kernel's last pid in /proc/loadavg,
         unless the test wants to see what happens when it did not."""
         fields = ["S"] + ["0"] * 10 + [str(ticks), "0"] + ["0"] * 6 + [str(start)] + ["0"] * 5
-        put(self.path(f"proc/{pid}/stat"), f"{pid} ({comm}) " + " ".join(fields))
+        put_whole(self.path(f"proc/{pid}/stat"), f"{pid} ({comm}) " + " ".join(fields))
         if announce:
-            put(self.path("proc/loadavg"), f"0.10 0.08 0.05 1/412 {pid}")
+            put_whole(self.path("proc/loadavg"), f"0.10 0.08 0.05 1/412 {pid}")
 
     def unfake(self, pid):
         shutil.rmtree(self.path(f"proc/{pid}"), ignore_errors=True)
@@ -233,7 +242,7 @@ def a_build_runs_as_batch_and_the_desktop_comes_back(r):
     wait_sched(m, pid, "cc1", SCHED_BATCH, 10, t0)
     log = m.text()
     r.check("now: build on mains, cc1 builds" in log, log[-400:])
-    r.check(os.sched_getscheduler(pid) == SCHED_BATCH, f"the compiler should run as SCHED_BATCH, is {os.sched_getscheduler(pid)}")
+    r.check(os.sched_getscheduler(pid) == SCHED_BATCH, f"the compiler should run as SCHED_BATCH, is {os.sched_getscheduler(pid)}; ztune said: {log[-300:]!r}")
     r.check(m.value("sys/kernel/mm/transparent_hugepage/enabled") == "always", "huge pages for a build")
     r.check(m.value("proc/sys/vm/dirty_bytes") == str(1024 << 20), "more may wait to be written in a build")
     # the build pauses: it stays a build for 15 s, then the desktop comes back
@@ -255,7 +264,7 @@ def stopped_in_a_build_the_compiler_gets_its_scheduling_back(r):
     m.start()
     t0 = busy(m, pid, "rustc", 7)
     wait_sched(m, pid, "rustc", SCHED_BATCH, 10, t0)
-    r.check(os.sched_getscheduler(pid) == SCHED_BATCH, "rustc should run as SCHED_BATCH")
+    r.check(os.sched_getscheduler(pid) == SCHED_BATCH, f"rustc should run as SCHED_BATCH, is {os.sched_getscheduler(pid)}; ztune said: {m.text()[-300:]!r}")
     m.stop()
     r.check(os.sched_getscheduler(pid) == SCHED_OTHER, "back to SCHED_OTHER when ztune stops")
     everything_back(r, m, "SIGTERM in a build")
@@ -432,7 +441,7 @@ def main():
         for note in notes:
             print(f"        {note}", flush=True)
         for problem in problems:
-            print(f"     !  {problem}"[:300], flush=True)
+            print(f"     !  {problem}"[:700], flush=True)
         return bool(problems)
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=3) as pool:
