@@ -1,0 +1,113 @@
+name: kernel
+
+# Builds linux6.18-kombain (kernel/) in a Void container and publishes it as a release, so the
+# GF63 installs it from there. Started by hand: a kernel takes hours, and every release is a
+# variant kombain-bench will have rows for. The build itself is kernel/build.sh, the same
+# script that checks the config in a local container.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the release kernel-<version>-kombain-r<revision> (off: artifacts only)"
+        type: boolean
+        default: true
+      replace:
+        description: "Replace that release if it already exists"
+        type: boolean
+        default: false
+
+# One kernel at a time: two builds would publish the same tag.
+concurrency:
+  group: kernel
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: linux6.18-kombain for x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Room on the disk
+        # A kernel with Void's config and debug info for BTF needs tens of GB while it builds.
+        # The runner's preinstalled SDKs are never used here.
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules /usr/lib/google-cloud-sdk /usr/lib/jvm
+          docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Build in a Void container
+        # The buildroot image is a bootstrapped masterdir, and the container is xbps-src's chroot
+        # (kernel/build.sh); the checkout and the build tree come in as volumes, so the results
+        # stay on the runner when the container is gone.
+        run: |
+          mkdir -p "$RUNNER_TEMP/kbuild"
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/work:ro" -v "$RUNNER_TEMP/kbuild:/build" -w /build \
+            -e BUILD=/build -e OUT=/build/out -e JOBS=4 -e KOMBAIN_COMMIT="$GITHUB_SHA" \
+            ghcr.io/void-linux/void-buildroot-glibc:latest sh /work/kernel/build.sh pkg
+
+      - name: What came out
+        run: |
+          cd "$RUNNER_TEMP/kbuild/out"
+          ls -l
+          {
+            echo '## linux6.18-kombain'
+            echo
+            echo '```'
+            cat BUILD
+            echo '```'
+            echo
+            echo "The config against Void's:"
+            echo
+            echo '```'
+            cat diffconfig-void-to-kombain.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the results as an artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux6.18-kombain
+          path: ${{ runner.temp }}/kbuild/out/
+          if-no-files-found: ignore
+
+      - name: Release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPLACE: ${{ inputs.replace }}
+        run: |
+          cd "$RUNNER_TEMP/kbuild/out"
+          tag=$(cat TAG)
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$REPLACE" = true ]; then
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            else
+              echo "::error::release $tag exists: bump revision= in kernel/srcpkgs/linux6.18-kombain/template, or run with replace"
+              exit 1
+            fi
+          fi
+          {
+            echo "Linux $(sed -n 's/^kernel release: //p' BUILD) for kombain's GF63: Void's linux6.18 with sched_ext"
+            echo "(\`CONFIG_SCHED_CLASS_EXT=y\`), full preemption as the build default (\`preempt=\` still"
+            echo "selects at boot) and \`-kombain\` in its name. The stock Void kernel stays installed as the fallback."
+            echo
+            echo '```'
+            cat BUILD
+            echo '```'
+            echo
+            echo "Install and check: [kernel/README.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/kernel/README.md)."
+            echo "Not measured yet: a kombain-bench row for this kernel says more than this note can."
+          } > notes.md
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file notes.md \
+            ./*.xbps config-* diffconfig-void-to-kombain.txt BUILD SHA256SUMS

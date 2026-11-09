@@ -253,7 +253,10 @@ for f in $(ls -1 "$BOOT"/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -r
 	fi
 done
 [ -n "$kernels" ] || exit 0
-newest=$(echo $kernels | cut -d' ' -f1)
+# The default entries boot Void's newest kernel. A kernel built from kombain's kernel/ has a dash
+# in its name (6.18.62-kombain_1): it is never the default, and gets both modes by name below.
+newest=$(echo $kernels | tr ' ' '\n' | grep -v -- - | head -1)
+[ -n "$newest" ] || newest=$(echo $kernels | cut -d' ' -f1)
 
 {
 	printf 'timeout: 2\neditor_enabled: no\n\n'
@@ -261,6 +264,7 @@ newest=$(echo $kernels | cut -d' ' -f1)
 	entry "Void Gaming" "$newest" "$GAME_CMD"
 	for v in $kernels; do
 		entry "Void Dev $v" "$v" "$DEV_CMD"
+		case $v in *-*) entry "Void Gaming $v" "$v" "$GAME_CMD" ;; esac
 	done
 } > "$OUT.tmp" || exit 1
 
@@ -789,3 +793,74 @@ kombain-report --after 60
 ```
 
 Отчёт ложится в текущую папку, имя начинается с `kombain-report-`. Отчёт из Gaming останется у `gamer`, в Dev его можно забрать так: `doas cp /home/gamer/kombain-report-*.txt ~`. Прочитайте файлы перед отправкой.
+
+## 15. Ядро kombain: sched_ext
+
+Ядро Void собрано без sched_ext (`CONFIG_SCHED_CLASS_EXT` выключен), поэтому планировщики из пакета `scx` на нём не запускаются. В [`kernel/`](../kernel/) лежит шаблон `linux6.18-kombain`: то же ядро Void, тот же конфиг и те же патчи, с тремя изменениями, каждое с объяснением в `kernel/srcpkgs/linux6.18-kombain/files/kombain.config`: `CONFIG_SCHED_CLASS_EXT=y`, полная вытесняемость по умолчанию (`CONFIG_PREEMPT=y`; `preempt=` в параметрах ядра по-прежнему переключает её на лету при загрузке) и имя `-kombain`. Собирает его GitHub Actions (workflow `kernel`, запуск вручную, несколько часов), результат выкладывается релизом `kernel-<версия>-kombain-r<ревизия>`. Что проверяет CI, как собрать и обновить: [`kernel/README.md`](../kernel/README.md).
+
+Стоковое ядро остаётся установленным и остаётся первым пунктом меню Limine. Новое добавляется рядом и убирается одной командой. Быстрее оно от этого не становится: быстрее то, что показали строки `kombain-bench` (шаг 14 и `bench/README.md`).
+
+**Хук Limine.** Если хук из шага 5 ставился до появления этого раздела, в нём две строки надо обновить: пунктами по умолчанию становится новейшее ядро *без дефиса* в имени, то есть ядро Void, а ядро с дефисом (`6.18.62-kombain_1`) получает свои пункты в обоих режимах. Шаг 5 выше уже такой; на установленной системе:
+
+```bash
+doas sed -i "s/^newest=.*/newest=\$(echo \$kernels | tr ' ' '\\\\n' | grep -v -- - | head -1)\\n[ -n \"\$newest\" ] || &/" /etc/kernel.d/post-install/60-limine
+doas sed -i 's/^\(\t\t\)entry "Void Dev \$v" "\$v" "\$DEV_CMD"$/&\n\1case $v in *-*) entry "Void Gaming $v" "$v" "$GAME_CMD" ;; esac/' /etc/kernel.d/post-install/60-limine
+grep -n -A1 '^newest=' /etc/kernel.d/post-install/60-limine
+```
+
+Должно показать две строки `newest=` и `[ -n "$newest" ] || newest=…`. Если хук правился руками и `sed` ничего не нашёл, внесите обе правки сами по тексту шага 5.
+
+**Установка.** Файлы релиза, их проверка и установка из каталога как из репозитория:
+
+```bash
+mkdir -p ~/kernel && cd ~/kernel
+tag=kernel-6.18.62-kombain-r1
+for f in linux6.18-kombain-6.18.62_1.x86_64.xbps linux6.18-kombain-headers-6.18.62_1.x86_64.xbps SHA256SUMS; do
+  curl -fLO "https://github.com/FalconBinary/kombain/releases/download/$tag/$f"
+done
+sha256sum --ignore-missing -c SHA256SUMS
+xbps-rindex -a ./*.xbps
+doas xbps-install --repository="$PWD" linux6.18-kombain linux6.18-kombain-headers
+```
+
+`xbps-install` спросит про неподписанный репозиторий: это ваш каталог. Дальше хуки `/etc/kernel.d` отрабатывают для версии `6.18.62-kombain_1` так же, как для стокового ядра: `10-dkms` собирает модули NVIDIA под новый пакет `-headers` (оба пакета распаковываются до того, как любой из них настраивается, поэтому порядок в команде не важен), `20-dracut` собирает `initramfs-6.18.62-kombain_1.img` с теми же настройками из шага 4 (только драйверы этой машины, без NVIDIA), `60-limine` пересобирает меню и при Secure Boot подписывает его. В меню появятся `Void Dev 6.18.62-kombain_1` и `Void Gaming 6.18.62-kombain_1` ниже стоковых пунктов; `Void Dev` и `Void Gaming` без версии — стоковое ядро, как и было.
+
+**Проверка**, после загрузки через новый пункт:
+
+```bash
+uname -r                             # 6.18.62-kombain_1
+ls /sys/kernel/sched_ext             # каталог есть: класс планировщиков в ядре
+cat /sys/kernel/sched_ext/state      # disabled: планировщик ещё не загружен
+doas dmesg | grep 'Dynamic Preempt'  # Dynamic Preempt: full
+dkms status                          # nvidia/…, 6.18.62-kombain_1, x86_64: installed
+lsmod | grep '^nvidia'               # nvidia, nvidia_modeset, nvidia_drm
+```
+
+**Измерения.** Те же четыре, что уже есть для стокового ядра; метка строки берётся из `uname -r`, так что ядра в `kombain-bench summary` окажутся рядом:
+
+```bash
+doas kombain-bench boot
+doas kombain-bench idle
+kombain-bench jitter
+kombain-bench build
+kombain-bench summary
+```
+
+Для вывода нужны не меньше десяти загрузок и пяти длинных измерений на каждое ядро, чередуя их; метод в `bench/README.md`.
+
+**Планировщик руками.** Пока `ztune` не переключает планировщики по режиму (это следующий шаг, после строк измерений):
+
+```bash
+doas xbps-install -S scx
+doas scx_lavd                        # работает, пока открыт терминал; Ctrl-C возвращает EEVDF
+cat /sys/kernel/sched_ext/root/ops   # lavd (в другом терминале)
+kombain-bench jitter --label 6.18.62-kombain_1/scx_lavd
+```
+
+**Удаление.**
+
+```bash
+doas xbps-remove linux6.18-kombain linux6.18-kombain-headers
+```
+
+Хуки убирают модули DKMS, initramfs и пункты меню; `vkpurge` этого ядра не касается, пока пакет стоит, и ему нечего убирать после. Стоковое ядро не трогалось.

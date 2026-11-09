@@ -188,6 +188,10 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
   without the simulator, so the test builds it from the kernel's source for the running version and
   boots Dev once without lockdown, which refuses unsigned modules; then it puts everything back and
   checks that the disk is the same size as before.
+- The kernel ([kernel/](kernel/)): `xlint` on the template, Void's config and patches compared byte for byte
+  with void-packages at the pinned commit, the template's metadata read by `xbps-src` there, the workflows
+  through `actionlint` and the scripts through `shellcheck`. The kernel itself is built by the `kernel` workflow
+  on request, hours on four cores, and published as a release.
 - Secure Boot: step 12 as written, in OVMF firmware that starts in Setup Mode. After the reboot
   Secure Boot is on and the kernel reports it, Dev still asks for both passphrases, a copy of Limine
   without the signature, which booted before step 12, is refused, and a kernel changed by one byte
@@ -199,6 +203,8 @@ console, a wired network for the install, a simulated radio, and mango rendering
 Not checked yet:
 
 - **A real machine.** Nothing has booted outside a VM or a container.
+- **The kombain kernel** (`linux6.18-kombain`, sched_ext): built and packaged in CI, booted nowhere yet; its
+  rows in `kombain-bench` do not exist until the GF63 has run it.
 - **mango on a real GPU.**
 - **gamescope and Steam.** The VM has no Vulkan device, so gamescope stops at startup.
   Only that failure is tested: the session reports it and waits instead of restarting.
