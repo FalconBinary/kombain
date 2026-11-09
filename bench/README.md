@@ -14,6 +14,7 @@ doas kombain-bench build            # make -j12 of fdash, 3 runs after a warm-up
                                     # (root reads the joules; make still runs as the tree's owner)
 kombain-bench game ~/mangohud.csv   # frame times of a game: average fps, 1 % low, p50, p99, the worst frame
 kombain-bench battery --minutes 10  # watts from the battery while you use the machine as you mean to measure it
+doas kombain-bench sched            # schedulers in turns, 5 rounds: jitter and build under each (a sched_ext kernel: see below)
 kombain-bench summary               # medians and p95 of every row so far, per label
 ```
 
@@ -49,6 +50,39 @@ Borrowed from UniVoidDistro's rules, which are the honest ones:
 | `build` | `make -j N` of fdash (gcc, a real C program), wall seconds, joules of the CPU package (root), and `zjitter` at 144 Hz beside it: the desktop's frames while every core compiles | the developer's own workload, and whether the desktop stays smooth through it (ztune's SCHED_BATCH, the scheduler, the power limit) |
 | `game` | a MangoHud CSV log (`MANGOHUD_CONFIG=output_folder=DIR`, F2 in the game starts and stops it): average fps, the 1 % low, p50 and p99 frame times, the worst frame | the player's experience: the 1 % low and p99 are what stutter is |
 | `battery` | the battery's watts every 5 s for N minutes, the median and p95, the brightness, the hours left at that rate | the only number that matters on battery |
+| `sched` | `jitter` and `build` under each scheduler in turn, the kernel's own and sched_ext ones, round after round, cooled below 50 C before each | a scheduler is judged where it shows: how late the desktop wakes beside a build, and what the build cost in seconds and joules; the rows are the same jitter and build rows, labelled kernel/variant |
+
+## Schedulers
+
+The kernel's own scheduler (EEVDF) against sched_ext ones, on a kernel that has sched_ext:
+kombain's (`kernel/README.md`; `/sys/kernel/sched_ext` exists on it). The stock Void kernel has
+none, and `sched` says so. Void packages the scx schedulers: `xbps-install -S scx` brings
+`scx_lavd`, `scx_bpfland`, `scx_flash`, `scx_rusty`, `scx_p2dq`, `scx_cosmos` and the others of
+its release, with `scxtop`. UniVoidDistro's `vh-sched` runs the same way, as a command.
+
+```sh
+doas kombain-bench sched                                       # stock, scx_lavd, scx_bpfland, scx_flash: 5 rounds
+doas kombain-bench sched --rounds 3 --with 'stock,scx_lavd,lavd-perf=scx_lavd --performance,vh-sched=vh-sched run'
+```
+
+Every round goes through the variants in turn, starting one variant later each round, so that
+no variant always follows the same one. For each: the scheduler is started (a bare name is a
+program on PATH; `NAME=COMMAND` is any command; it runs as root until SIGTERM, which every
+sched_ext scheduler takes as "unload and leave") and the kernel is asked whether it runs it
+(`/sys/kernel/sched_ext/state` and `root/ops`); the package cools below 50 C (`--cool C`, `off`
+to skip, as a VM has no temperature); `jitter` runs for 30 s with nothing else; `build` makes
+its warm-up and one build (`--runs N` for more); the scheduler is stopped and the kernel is back
+on its own before the next. Everything a variant needs is checked before the first measurement,
+not an hour in. The rows are the ordinary `jitter.csv` and `build.csv` rows, labelled by kernel
+and variant: `6.18.62-kombain_1/stock`, `6.18.62-kombain_1/scx_lavd`; each scheduler's own output
+is kept as `sched-NAME.log` beside them. The summary at the end puts the variants side by side.
+The method's rule decides, and UniVoidDistro's criterion for a scheduler is the honest one: it may
+lose no more than 2 % of the build's time against EEVDF and must win the desktop's p99 under that
+build. Ctrl-C stops the run and the scheduler with it. A scheduler the kernel throws out mid-run
+ends the run and says so, since what was measured after that ran under the kernel's own. Nothing
+is installed: which scheduler runs in which mode is decided after the numbers, not before. Game
+rows come by hand: `doas scx_lavd` in a terminal, the game with MangoHud, then
+`kombain-bench game FILE.csv --label 6.18.62-kombain_1/scx_lavd`, and Ctrl-C in that terminal.
 
 ## Markers
 

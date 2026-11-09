@@ -71,6 +71,41 @@ if [ -x "$zjitter" ]; then
 	wait $pid
 	check "zjitter: SIGTERM ends it with its report" "100,1" "$(cut -d, -f1-2 "$work/jit" | sed 's/\.[0-9]*$//')"
 	check "zjitter: refuses nonsense" "2" "$("$zjitter" --hz 0 >/dev/null 2>&1; echo $?)"
+
+	# sched: the turns, the switching and the stop, against a fake scheduler and a fake /sys/kernel/sched_ext
+	mkdir -p "$work/scx/root" "$work/tree"
+	echo disabled > "$work/scx/state"
+	cat > "$work/fake-sched" <<-'EOF'
+	#!/bin/sh
+	# a sched_ext scheduler in a few lines: tells the kernel's files it runs, leaves on SIGTERM;
+	# with a second argument it dies after that many seconds, as a scheduler the kernel threw out
+	d=$1
+	trap 'echo disabled > "$d/state"; rm -f "$d/root/ops"; exit 0' TERM INT
+	echo fake > "$d/root/ops"; echo enabled > "$d/state"
+	if [ -n "${2:-}" ]; then sleep "$2"; echo disabled > "$d/state"; rm -f "$d/root/ops"; exit 1; fi
+	while :; do sleep 1; done
+	EOF
+	printf 'all:\n\t@sleep 1\nclean:\n\t@true\n' > "$work/tree/Makefile"
+	out=$(KOMBAIN_SCHED_EXT=$work/scx "$bench" sched --with "stock,fake=sh $work/fake-sched $work/scx" --rounds 2 --seconds 1 --cool off --tree "$work/tree" --jobs 2 2>&1); code=$?
+	check "sched: two rounds under stock and a fake scheduler, exit 0" "0" "$code"
+	check "sched: the kernel ran the fake one in each round" "2" "$(printf '%s\n' "$out" | grep -c 'the kernel runs fake')"
+	check "sched: the turns rotate: stock, fake, then fake, stock" "stock fake fake stock" "$(printf '%s\n' "$out" | sed -n 's/^round [0-9]*, \(.*\):$/\1/p' | paste -sd' ' -)"
+	check "sched: a jitter row per variant and round" "2 2" "$(awk -F, -v k="$(uname -r)" 'NR > 1 { n[$1]++ } END { printf "%d %d", n[k "/fake"], n[k "/stock"] }' "$work/results/jitter.csv")"
+	check "sched: a build row per variant and round" "2 2" "$(awk -F, -v k="$(uname -r)" 'NR > 1 { n[$1]++ } END { printf "%d %d", n[k "/fake"], n[k "/stock"] }' "$work/results/build.csv")"
+	check "sched: the scheduler is off at the end" "disabled" "$(cat "$work/scx/state")"
+	check "sched: its log is kept with the results" "yes" "$([ -e "$work/results/sched-fake.log" ] && echo yes || echo no)"
+	check "sched: the summary closes it" "1" "$(printf '%s\n' "$out" | grep -c '^build:')"
+	out=$(KOMBAIN_SCHED_EXT=$work/scx "$bench" sched --with "dies=sh $work/fake-sched $work/scx 2" --rounds 1 --seconds 1 --cool off --tree "$work/tree" 2>&1); code=$?
+	check "sched: a scheduler the kernel threw out ends the run" "1" "$code"
+	check "sched: and says the rows under it are not its" "1" "$(printf '%s\n' "$out" | grep -c 'dies stopped during the run')"
+	echo enabled > "$work/scx/state"; echo other > "$work/scx/root/ops"
+	out=$(KOMBAIN_SCHED_EXT=$work/scx "$bench" sched --with stock --rounds 1 --seconds 1 --cool off --tree "$work/tree" 2>&1); code=$?
+	check "sched: refuses while a scheduler already runs" "1" "$code"
+	check "sched: and names it" "1" "$(printf '%s\n' "$out" | grep -c 'already running (other)')"
+	echo disabled > "$work/scx/state"; rm -f "$work/scx/root/ops"
+	out=$(KOMBAIN_SCHED_EXT=$work/scx "$bench" sched --with stock,scx_nowhere --tree "$work/tree" 2>&1); code=$?
+	check "sched: refuses a scheduler that is not installed, before anything runs" "1" "$code"
+	check "sched: and says which" "1" "$(printf '%s\n' "$out" | grep -c 'scx_nowhere is not installed')"
 else
 	echo "skip  zjitter: $zjitter is not built (zig build in bench/)"
 fi

@@ -11,6 +11,9 @@
 #                                                          (as root it reads the joules and still builds as the tree's owner)
 #   kombain-bench game FILE.csv [--label L]                a MangoHud log: frame times
 #   kombain-bench battery [--minutes N] [--label L]        watts from the battery while you use the machine
+#   kombain-bench sched [--with LIST] [--rounds N] [--seconds N] [--jobs N] [--runs N] [--tree DIR] [--cool C]
+#                                                          schedulers in turns (root): jitter and build under each;
+#                                                          stock, a sched_ext one by name (scx_lavd) or NAME=COMMAND
 #   kombain-bench summary [FILE...]                        medians and p95 of what was measured, per label
 #   kombain-bench mark NAME                                writes a marker (the session does, see README)
 #
@@ -22,7 +25,7 @@ dir=${KOMBAIN_BENCH_DIR:-/var/tmp/kombain-bench}
 zjitter=${ZJITTER:-zjitter}
 
 usage() {
-	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
 	exit "$1"
 }
 
@@ -422,6 +425,199 @@ battery() {
 	row battery.csv "minutes,median_w,p95_w,brightness_pct,hours_left" "$minutes,$med,$p95,$bright,$hours"
 }
 
+# ---------------------------------------------------------------- sched
+
+# The kernel's own account of sched_ext: state (enabled/disabled) and root/ops, the name of the
+# scheduler running. A test points it at a fixture.
+sched_ext=${KOMBAIN_SCHED_EXT:-/sys/kernel/sched_ext}
+
+sched_state() {
+	cat "$sched_ext/state" 2>/dev/null || echo none
+}
+
+sched_ops() {
+	cat "$sched_ext/root/ops" 2>/dev/null || echo -
+}
+
+# The CPU package's temperature in whole degrees: the x86_pkg_temp zone, else the first sensor
+# of coretemp or k10temp; "-" where there is none (a VM, a container).
+pkg_temp_c() {
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ "$(cat "$z/type" 2>/dev/null)" = x86_pkg_temp ] || continue
+		awk -v t="$(cat "$z/temp")" 'BEGIN { printf "%.0f\n", t / 1000 }'
+		return
+	done
+	for h in /sys/class/hwmon/hwmon*; do
+		case $(cat "$h/name" 2>/dev/null) in
+		coretemp|k10temp|zenpower)
+			[ -r "$h/temp1_input" ] || continue
+			awk -v t="$(cat "$h/temp1_input")" 'BEGIN { printf "%.0f\n", t / 1000 }'
+			return ;;
+		esac
+	done
+	echo -
+}
+
+# cool_down C: the method's rule that a build starts with the package below C degrees. Waits up
+# to 10 minutes; "off" or 0 skips it, and so does a machine without a readable temperature.
+cool_down() {
+	[ "$1" != off ] && [ "$1" != 0 ] || return 0
+	t=$(pkg_temp_c)
+	[ "$t" != - ] || { echo "  (no package temperature here: not waiting to cool)"; return 0; }
+	waited=0
+	while [ "$t" != - ] && [ "$t" -gt "$1" ] && [ "$waited" -lt 600 ]; do
+		[ "$waited" -gt 0 ] || printf '  cooling below %s C (now %s C)' "$1" "$t"
+		sleep 5
+		waited=$((waited + 5))
+		t=$(pkg_temp_c)
+	done
+	[ "$waited" -eq 0 ] || echo " ... $t C after $waited s"
+}
+
+# A variant is NAME or NAME=COMMAND. `stock` is the kernel's own scheduler (EEVDF). A bare name
+# is a scheduler on PATH, run as it is (scx_lavd, scx_bpfland); a command runs as root until it
+# gets SIGTERM, which every sched_ext scheduler takes as "unload and leave" (vh-sched=vh-sched run,
+# lavd-perf=scx_lavd --performance). Commands hold no commas: commas separate variants.
+variant_name() {
+	printf '%s\n' "${1%%=*}"
+}
+
+variant_cmd() {
+	case $1 in
+	*=*) printf '%s\n' "${1#*=}" ;;
+	*) printf '%s\n' "$1" ;;
+	esac
+}
+
+sched_pid=
+sched_log=
+
+# sched_start NAME COMMAND: runs the scheduler in the background and waits, up to 30 s, for the
+# kernel to say it runs. Its output goes to sched-NAME.log in the results directory.
+sched_start() {
+	sched_log=$dir/sched-$1.log
+	mkdir -p "$dir" 2>/dev/null
+	[ -w "$dir" ] || sched_log=$(mktemp)
+	sh -c "exec $2" </dev/null >"$sched_log" 2>&1 &
+	sched_pid=$!
+	waited=0
+	while [ "$(sched_state)" != enabled ] && [ "$waited" -lt 30 ]; do
+		kill -0 "$sched_pid" 2>/dev/null || break
+		sleep 1
+		waited=$((waited + 1))
+	done
+	if [ "$(sched_state)" != enabled ]; then
+		echo "  $1 did not take the CPUs over in $waited s; it said:" >&2
+		tail -5 "$sched_log" >&2
+		sched_stop
+		die "cannot run $1"
+	fi
+	echo "  the kernel runs $(sched_ops) ($1); its log: $sched_log"
+	sleep 3
+}
+
+# sched_running NAME: dies when the scheduler we started is gone or the kernel dropped it, since
+# whatever was measured meanwhile ran under the kernel's own scheduler.
+sched_running() {
+	[ -n "$sched_pid" ] || return 0
+	if ! kill -0 "$sched_pid" 2>/dev/null || [ "$(sched_state)" != enabled ]; then
+		echo "  $1 stopped during the run (its log: $sched_log); the rows just written under its label did not run under it: remove them" >&2
+		die "$1 stopped"
+	fi
+}
+
+# sched_stop: ends the scheduler we started and waits for the kernel to be back on its own.
+sched_stop() {
+	[ -n "$sched_pid" ] || return 0
+	kill -TERM "$sched_pid" 2>/dev/null
+	wait "$sched_pid" 2>/dev/null
+	sched_pid=
+	waited=0
+	while [ "$(sched_state)" = enabled ] && [ "$waited" -lt 10 ]; do
+		sleep 1
+		waited=$((waited + 1))
+	done
+	[ "$(sched_state)" != enabled ] || echo "  the kernel still runs $(sched_ops) after 10 s" >&2
+}
+
+sched() {
+	# its own names: jitter and build set seconds, jobs, runs and tree themselves
+	with=stock,scx_lavd,scx_bpfland,scx_flash; s_rounds=5; s_seconds=30; s_runs=1; cool=50
+	s_jobs=$(nproc 2>/dev/null || echo 4); s_tree=${KOMBAIN_SRC:-$HOME/kombain}/fdash
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--with) with=$2; shift ;;
+		--rounds) s_rounds=$2; shift ;;
+		--seconds) s_seconds=$2; shift ;;
+		--jobs) s_jobs=$2; shift ;;
+		--runs) s_runs=$2; shift ;;
+		--tree) s_tree=$2; shift ;;
+		--cool) cool=$2; shift ;;
+		*) usage 2 ;;
+		esac
+		shift
+	done
+	# the variants, split on commas only (a command keeps its spaces)
+	old_ifs=$IFS
+	IFS=,
+	set -f
+	# shellcheck disable=SC2086
+	set -- $with
+	set +f
+	IFS=$old_ifs
+	[ $# -ge 1 ] || usage 2
+	[ -f "$s_tree/Makefile" ] || die "no Makefile in $s_tree: --tree DIR, or KOMBAIN_SRC=/path/to/kombain"
+	command -v "$zjitter" >/dev/null || die "zjitter is not installed (install.sh builds it)"
+	# everything a variant needs is checked before the first measurement, not an hour in
+	names=
+	for v in "$@"; do
+		name=$(variant_name "$v")
+		names="$names${names:+, }$name"
+		[ "$name" != stock ] || continue
+		if [ "$sched_ext" = /sys/kernel/sched_ext ]; then
+			[ "$(id -u)" -eq 0 ] || die "loading a scheduler needs root: doas kombain-bench sched"
+			[ -e "$sched_ext/state" ] || die "this kernel has no sched_ext (no /sys/kernel/sched_ext): the stock Void kernel does not, kombain's does (kernel/README.md)"
+		fi
+		exe=$(variant_cmd "$v" | awk '{ print $1; exit }')
+		command -v "$exe" >/dev/null || die "$name: $exe is not installed (Void: xbps-install scx; or NAME=COMMAND)"
+	done
+	[ "$(sched_state)" != enabled ] || die "a scheduler is already running ($(sched_ops)): stop it first, the comparison starts from the kernel's own"
+	trap 'sched_stop' EXIT
+	trap 'sched_stop; trap - EXIT; exit 130' INT TERM
+	cooling="cool below $cool C"
+	[ "$cool" != off ] && [ "$cool" != 0 ] || cooling="no wait to cool"
+	echo "sched: $s_rounds rounds, each under $names in turn: $cooling, jitter for $s_seconds s, a warm-up build and $s_runs build(s) with make -j$s_jobs"
+	echo "  the label of a row is the kernel and the variant, like $(uname -r)/$(variant_name "$1")"
+	round=1
+	while [ "$round" -le "$s_rounds" ]; do
+		for v in "$@"; do
+			name=$(variant_name "$v")
+			lab=$(uname -r)/$name
+			echo "round $round, $name:"
+			if [ "$name" = stock ]; then
+				[ "$(sched_state)" != enabled ] || die "a scheduler is running ($(sched_ops)) where the kernel's own should"
+				echo "  the kernel's own scheduler"
+			else
+				sched_start "$name" "$(variant_cmd "$v")"
+			fi
+			cool_down "$cool"
+			jitter --label "$lab" --seconds "$s_seconds"
+			sched_running "$name"
+			build --label "$lab" --jobs "$s_jobs" --runs "$s_runs" --tree "$s_tree"
+			sched_running "$name"
+			sched_stop
+		done
+		# the next round starts with the next variant, so that no variant always follows the same one
+		first=$1
+		shift
+		set -- "$@" "$first"
+		round=$((round + 1))
+	done
+	trap - EXIT INT TERM
+	echo
+	summary "$dir/jitter.csv" "$dir/build.csv"
+}
+
 # ---------------------------------------------------------------- summary
 
 summary() {
@@ -469,6 +665,7 @@ jitter) shift; jitter "$@" ;;
 build) shift; build "$@" ;;
 game) shift; game "$@" ;;
 battery) shift; battery "$@" ;;
+sched) shift; sched "$@" ;;
 summary) shift; summary "$@" ;;
 mark) shift; mark "$@" ;;
 -h|--help|help|'') usage 0 ;;
