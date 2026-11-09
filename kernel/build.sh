@@ -93,7 +93,8 @@ fi
 	echo "compiler: $(gcc --version | head -1)"
 	echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ) with -j$jobs on $(nproc) CPUs"
 } > "$out/BUILD"
-echo "kernel-$version-kombain-r$revision" > "$out/TAG"
+# the checksums cover exactly what the release publishes; TAG is for the workflow and comes after them
 (cd "$out" && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS)
+echo "kernel-$version-kombain-r$revision" > "$out/TAG"
 ls -l "$out"
 cat "$out/diffconfig-void-to-kombain.txt"
