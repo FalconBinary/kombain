@@ -1639,22 +1639,26 @@ fn learnOnline(c: *Chip, watts: f32, duty: f32, dt: f32) void {
 }
 
 fn describeModel() void {
-    if (!model.known()) return;
+    if (model.known()) describeModelOf(&model);
+}
+
+/// `m`'s lines: the model in use, or a fit that was not kept, for the record.
+fn describeModelOf(m: *const thermal_model.Model) void {
     const t = &cal_line;
-    _ = t.add("model: the die ").tenth(model.r_die * 100).add(" C above the sink per 10 W, the room ").whole(model.ambient);
-    t.add(" C, the sink ").whole(model.mass).add(" J/C; the cooler carries per degree:").line();
+    _ = t.add("model: the die ").tenth(m.r_die * 10).add(" C above the sink per 10 W, the room ").whole(m.ambient);
+    t.add(" C, the sink ").whole(m.mass).add(" J/C; the cooler carries per degree:").line();
     _ = t.add(" ");
     for (thermal_model.point_names, 0..) |name, i| {
-        if (model.g[i] > 0) _ = t.add(" ").add(name).add(" ").tenth(model.g[i] * 10).add("/10");
+        if (m.g[i] > 0) _ = t.add(" ").add(name).add(" ").hundredth(m.g[i]);
     }
     t.add(" W/C").line();
     for (chips[0..nchips]) |*c| {
         if (c.kind != .cpu or !c.controlled()) continue;
-        _ = t.add("  holds ").whole(model.holds(253, c.limit)).add(" W at ").whole(c.limit).add("C with the fans at full");
+        _ = t.add("  holds ").whole(m.holds(253, c.limit)).add(" W at ").whole(c.limit).add("C with the fans at full");
         if (c.thermal.ready) {
             const watts = chipWatts(c) orelse 0;
-            const sink = if (c.sink.ready) c.sink.sink else model.sink(c.thermal.temp, watts);
-            _ = t.add("; a burst from now may draw ").whole(model.burst(sink, 253, c.limit - 1, burst_seconds)).add(" W");
+            const sink = if (c.sink.ready) c.sink.sink else m.sink(c.thermal.temp, watts);
+            _ = t.add("; a burst from now may draw ").whole(m.burst(sink, 253, c.limit - 1, burst_seconds)).add(" W");
         }
         t.line();
         break;
@@ -2665,6 +2669,35 @@ const Calibration = struct {
         return dt;
     }
 
+    /// A calibration starts cold. The speed phase holds the die at its limit for ten seconds, and
+    /// on a sink still warm from the last load that is power cut, not the CPU's speed: a --long
+    /// run right after the short one on the GF63 read 2500 MHz on six CPUs at 13 W, against
+    /// 3647 MHz at 33 W from cold. So first every fan at full and no load, until the die is 20 C
+    /// under its limit, up to ten minutes. False when calibration has to stop.
+    fn coolDown(self: *Calibration) bool {
+        const c = self.c;
+        const target = @max(c.limit - 20, 40);
+        calibrationStep(0);
+        var t: f32 = 0;
+        var said = false;
+        while (t < 600) {
+            t += self.tick(253, false, false) orelse return false;
+            if (c.thermal.temp <= target) break;
+            if (!said) {
+                said = true;
+                cal_line.add("cooling first: the die is at ").whole(c.thermal.temp).add("C, measuring starts under ").whole(target).add("C").line();
+            }
+        }
+        if (!said) return true;
+        const line = &cal_line;
+        if (c.thermal.temp <= target) {
+            line.add("  ").whole(c.thermal.temp).add("C after ").whole(t).add(" s").line();
+        } else {
+            line.add("  still ").whole(c.thermal.temp).add("C after ten minutes: measuring anyway").line();
+        }
+        return true;
+    }
+
     /// The load on `n` CPUs for 10 s, power held at the limit: what it draws and how fast.
     fn coresPoint(self: *Calibration, i: usize, n: usize) bool {
         calibrationStep(n);
@@ -2811,7 +2844,7 @@ fn runCalibrate(long: bool) u8 {
     var run = Calibration{ .c = c, .cores = cores, .last = sys.nowMs() };
     run.result.limit = c.limit;
     cal_line.add("calibrating ").add(c.name()).add(" at its ").whole(c.limit).add("C limit, ").add(if (long) "up to an hour with the model" else "for 3 to 8 minutes").add("; Ctrl-C stops it and keeps nothing").line();
-    const ok = measure(&run) and (!long or measureLong(&run));
+    const ok = run.coolDown() and measure(&run) and (!long or measureLong(&run));
     run.load.stop();
     calibrationStep(0);
     // power, fans, everything back as it was
@@ -2881,10 +2914,88 @@ fn measure(run: *Calibration) bool {
     return true;
 }
 
+/// One steady state in the making: the die and the power recorded tick by tick with every fan at
+/// one speed, until the trend has stood still (calibrate.Trend) after `min_s` at least, or `max_s`
+/// is up.
+const Hold = struct {
+    raws: [2400]f32 = undefined,
+    times: [2400]f32 = undefined,
+    n: usize = 0,
+    t: f32 = 0,
+    trend: calibrate.Trend = .{},
+    watts: calibrate.Trend = .{},
+    settled: bool = false,
+    over: bool = false,
+
+    /// One tick, recorded. Null when calibration has to stop.
+    fn tick(self: *Hold, calib: *Calibration, duty: f32) ?f32 {
+        const dt = calib.tick(duty, false, false) orelse return null;
+        self.t += dt;
+        self.trend.add(calib.c.raw, dt);
+        self.watts.add(cpuWatts(), dt);
+        if (self.n < self.raws.len) {
+            self.raws[self.n] = calib.c.raw;
+            self.times[self.n] = self.t;
+            self.n += 1;
+        }
+        return dt;
+    }
+
+    /// Ticks on until steady or `max_s`; stops early, `over`, when the die comes within half a
+    /// degree of `limit`. False when calibration has to stop.
+    fn run(self: *Hold, calib: *Calibration, duty: f32, min_s: f32, max_s: f32, limit: ?f32) bool {
+        while (self.t < max_s) {
+            _ = self.tick(calib, duty) orelse return false;
+            if (limit) |l| if (calib.c.raw > l - 0.5) {
+                self.over = true;
+                return true;
+            };
+            if (self.t >= min_s and self.trend.steady(0.3)) {
+                self.settled = true;
+                return true;
+            }
+        }
+        return true;
+    }
+
+    /// Where the die settled: its mean over the last window.
+    fn final(self: *const Hold) f32 {
+        return self.trend.mean();
+    }
+
+    fn meanWatts(self: *const Hold) f32 {
+        return self.watts.mean();
+    }
+
+    /// How long the die took to cover 63% of the way from a second in (its own jump is over by
+    /// then) to where it settled: the sink's time at this fan speed. 0 when it never got there.
+    fn tau(self: *const Hold) f32 {
+        const target_final = self.final();
+        var start_i: usize = 0;
+        while (start_i < self.n and self.times[start_i] < 1) start_i += 1;
+        if (start_i >= self.n) return 0;
+        const from = self.raws[start_i];
+        const target = from + 0.63 * (target_final - from);
+        var k = start_i + 1;
+        while (k < self.n) : (k += 1) {
+            const passed = if (target_final > from) self.raws[k] >= target else self.raws[k] <= target;
+            if (!passed) continue;
+            // between the two readings around the crossing
+            const span = self.raws[k] - self.raws[k - 1];
+            const part = if (@abs(span) > 1e-3) std.math.clamp((target - self.raws[k - 1]) / span, 0, 1) else 1;
+            return self.times[k - 1] + (self.times[k] - self.times[k - 1]) * part - self.times[start_i];
+        }
+        return 0;
+    }
+};
+
+var hold: Hold = .{};
+
 /// `--long`: the machine's heat as a model (model.zig). The die's jump per watt from steps of
-/// power with every fan at full; the steady state of each fan speed at two powers under what it
-/// carries, each until it settles; the room with the load off. It takes as long as it takes, up
-/// to about 40 minutes on a laptop; nothing is kept unless the fit holds together.
+/// power with every fan at full; the sink's own time from the climb after the last step; the
+/// steady state of each fan speed at two powers under what it carries, each held for four times
+/// that; the room with the load off. Up to an hour on a laptop; nothing is kept unless the fit
+/// holds together and agrees with what the fans were measured carrying.
 fn measureLong(run: *Calibration) bool {
     const c = run.c;
     const carries_full = if (run.result.carries[1] > 0) run.result.carries[1] else run.result.carries[0];
@@ -2897,10 +3008,12 @@ fn measureLong(run: *Calibration) bool {
 
     // 1. the die's jump per watt: from a low power to the most the cooler carries, three times,
     // every fan at full. Two ticks after the step, the linear part of the sink's rise cancels.
+    // The climb after the last step runs on until it settles: that is the sink's own time.
     var jumps: [8]f32 = undefined;
     var njumps: usize = 0;
     const low_w = 0.2 * base;
     const high_w = @min(0.95 * carries_full, 0.999 * base);
+    var sink_tau: f32 = 0;
     sys.print("  the die's jump when the power jumps, three times\n");
     var round: usize = 0;
     while (round < 3) : (round += 1) {
@@ -2915,9 +3028,10 @@ fn measureLong(run: *Calibration) bool {
         }
         const raw0 = c.raw;
         if (!holdPower(high_w / base)) return false;
-        _ = run.tick(253, false, false) orelse return false;
+        hold = .{};
+        _ = hold.tick(run, 253) orelse return false;
         const d1 = c.raw - raw0;
-        _ = run.tick(253, false, false) orelse return false;
+        _ = hold.tick(run, 253) orelse return false;
         const d2 = c.raw - raw0;
         const jump = (2 * d1 - d2) / (high_w - low_w);
         const line = &cal_line;
@@ -2927,99 +3041,86 @@ fn measureLong(run: *Calibration) bool {
             njumps += 1;
             line.line();
         } else line.add(": not a jump a die makes, left out").line();
-        // the rest of this step: the sink warms toward the high power, useful nowhere here
+        if (round < 2) continue;
+        if (!hold.run(run, 253, 60, 600, c.limit)) return false;
+        sink_tau = hold.tau();
+        _ = line.add("    the climb after it ");
+        if (hold.over) {
+            _ = line.add("reached the limit");
+        } else if (hold.settled) {
+            _ = line.add("settled at ").tenth(hold.final()).add(" C after ").whole(hold.t).add(" s");
+        } else _ = line.add("still moved after ").whole(hold.t).add(" s");
+        if (sink_tau > 0) _ = line.add(": the sink takes ").whole(sink_tau).add(" s to cover 63%");
+        line.line();
     }
+    // four of the sink's times for a steady state (2% of the way left), a minute at least; ten
+    // to give up waiting
+    const hold_min = std.math.clamp(4 * sink_tau, 60, 480);
+    const hold_max = std.math.clamp(10 * sink_tau, 240, 600);
 
-    // 2. each fan speed at two powers under what it carries, until the die settles
+    // 2. each fan speed at two powers under what it carries, each held for the sink's time
     var steadies: [8]thermal_model.Steady = undefined;
     var nsteadies: usize = 0;
-    var raws: [1400]f32 = undefined;
-    var times: [1400]f32 = undefined;
-    sys.print("  each fan speed at two powers, each until it settles\n");
+    cal_line.add("  each fan speed at two powers, each held ").whole(hold_min).add(" to ").whole(hold_max).add(" s").line();
     for ([_]usize{ 1, 2, 3 }) |p| {
         const carries = run.result.carries[p];
         if (carries <= 0) continue;
-        for ([_]f32{ 0.55, 0.9 }) |share| {
+        // 55% then 90% of what the speed carries, the other way round at the next speed, so that
+        // every hold starts a small step from the one before
+        const shares: [2]f32 = if (p % 2 == 1) [2]f32{ 0.55, 0.9 } else [2]f32{ 0.9, 0.55 };
+        for (shares, 0..) |share, k| {
             const w = carries * share;
             calibrationStep(run.cores);
             if (!holdPower(w / base)) return false;
-            var settle = calibrate.Settle{};
-            // the power over the same window: one sample of it is a tenth off on a fast counter
-            var watts_settle = calibrate.Settle{};
-            var n: usize = 0;
-            var t: f32 = 0;
-            var over = false;
-            while (t < 300 and n < raws.len) {
-                t += run.tick(thermal_model.point_duty[p], false, false) orelse return false;
-                raws[n] = c.raw;
-                times[n] = t;
-                n += 1;
-                settle.add(c.raw);
-                watts_settle.add(cpuWatts());
-                if (c.raw > c.limit - 0.5) {
-                    over = true;
-                    break;
-                }
-                if (t >= 20 and settle.steady(0.005)) break;
-            }
+            hold = .{};
+            if (!hold.run(run, thermal_model.point_duty[p], hold_min, hold_max, c.limit)) return false;
             const line = &cal_line;
-            if (over or n < 40) {
-                line.add("    ").add(thermal_model.point_names[p]).add(" at ").whole(w).add(" W: the die reached the limit, left out").line();
+            _ = line.add("    ").add(thermal_model.point_names[p]).add(" at ").tenth(hold.meanWatts()).add(" W: ");
+            if (hold.over or hold.n < 40) {
+                line.add("the die reached the limit, left out").line();
                 continue;
             }
-            const final = settle.mean();
-            // the sink's approach, from a second in (the die's own jump is over by then), and only
-            // on the second power at a point: on the first the fan is still coming down from the
-            // point before, which cools faster than this one does
-            var tau: f32 = 0;
-            if (share > 0.7) {
-                var start_i: usize = 0;
-                while (start_i < n and times[start_i] < 1) start_i += 1;
-                if (start_i < n) {
-                    const from = raws[start_i];
-                    const target = from + 0.63 * (final - from);
-                    var k = start_i + 1;
-                    while (k < n) : (k += 1) {
-                        const passed = if (final > from) raws[k] >= target else raws[k] <= target;
-                        if (!passed) continue;
-                        // between the two readings around the crossing
-                        const span = raws[k] - raws[k - 1];
-                        const part = if (@abs(span) > 1e-3) std.math.clamp((target - raws[k - 1]) / span, 0, 1) else 1;
-                        tau = times[k - 1] + (times[k] - times[k - 1]) * part - times[start_i];
-                        break;
-                    }
-                }
-            }
-            const watts = watts_settle.mean();
-            steadies[nsteadies] = .{ .point = p, .watts = watts, .die = final, .tau = tau };
-            nsteadies += 1;
-            _ = line.add("    ").add(thermal_model.point_names[p]).add(" at ").tenth(watts).add(" W: ").tenth(final).add(" C after ").whole(t).add(" s");
+            const final = hold.final();
+            _ = line.tenth(final).add(" C after ").whole(hold.t).add(" s");
+            if (!hold.settled) _ = line.add(" (still moving)");
+            // the sink's approach, on the second power at a speed only: on the first the fan is
+            // still coming down from the speed before, which cools faster than this one does
+            const tau = if (k == 1) hold.tau() else 0;
             if (tau > 0) _ = line.add(", the sink takes ").whole(tau).add(" s to cover 63%");
             line.line();
+            steadies[nsteadies] = .{ .point = p, .watts = hold.meanWatts(), .die = final, .tau = tau };
+            nsteadies += 1;
         }
     }
 
-    // 3. the room: the load off and every fan at full, until the die settles
+    // 3. the room: the load off and every fan at full, held as long as a steady state
     sys.print("  the room: the load off, every fan at full\n");
     calibrationStep(0);
     if (sys.root.len == 0) run.load.stop();
     if (!holdPower(0.999)) return false;
-    var settle = calibrate.Settle{};
-    var watts_settle = calibrate.Settle{};
-    var t: f32 = 0;
-    while (t < 180) {
-        t += run.tick(253, false, false) orelse return false;
-        settle.add(c.raw);
-        watts_settle.add(cpuWatts());
-        if (t >= 30 and settle.steady(0.005)) break;
-    }
-    const die_idle = settle.mean();
-    const watts_idle = watts_settle.mean();
+    hold = .{};
+    if (!hold.run(run, 253, hold_min, hold_max, null)) return false;
     const first = thermal_model.fit(steadies[0..nsteadies], jumps[0..njumps], null);
-    const ambient: ?f32 = if (first.known()) die_idle - watts_idle * (1 / first.conductance(253) + first.r_die) else null;
+    var ambient: ?f32 = null;
+    if (first.known()) {
+        const read = hold.final() - hold.meanWatts() * (1 / first.conductance(253) + first.r_die);
+        const line = &cal_line;
+        if (read > first.ambient + 2) {
+            // the GF63's first long calibration read 38 C off a sink still warm; its lines met at 32
+            line.add("    the idle die puts the room at ").whole(read).add(" C, the lines through the steady states meet at ").whole(first.ambient).add(" C: the sink was still warm, the lines win").line();
+        } else {
+            ambient = read;
+            line.add("    the room: ").whole(read).add(" C, the die idling at ").tenth(hold.final()).add(" C on ").tenth(hold.meanWatts()).add(" W").line();
+        }
+    }
     const fitted = thermal_model.fit(steadies[0..nsteadies], jumps[0..njumps], ambient);
     if (!fitted.known()) {
         sys.print("  too little settled for a model: nothing kept\n");
+        return true;
+    }
+    if (fitted.complaint(carries_full, c.limit)) |why| {
+        cal_line.add("  ").add(why).add(": nothing kept; what it found, for the record:").line();
+        describeModelOf(&fitted);
         return true;
     }
     var buf: [512]u8 = undefined;

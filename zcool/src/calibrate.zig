@@ -161,6 +161,56 @@ pub const Settle = struct {
     }
 };
 
+/// Whether a slow sink has settled, read through a sensor that counts whole degrees. Ten seconds
+/// of one reading say nothing about a sink that takes minutes: on the GF63 the die sat on one
+/// degree for half a minute while its sink still climbed, and the first long calibration took
+/// that for steady; at the edge of a degree the same die toggles between two readings for minutes
+/// while nothing moves. So: the mean of the last `window` seconds against the mean of the
+/// `window` before them, within `tolerance`. Toggling averages out, a drift pulls the means apart.
+pub const Trend = struct {
+    pub const window: f32 = 45;
+    /// two windows at four readings a second, with room for a slow tick
+    values: [512]f32 = undefined,
+    times: [512]f32 = undefined,
+    n: usize = 0,
+    at: usize = 0,
+    now: f32 = 0,
+
+    pub fn add(self: *Trend, value: f32, dt: f32) void {
+        self.now += dt;
+        self.values[self.at] = value;
+        self.times[self.at] = self.now;
+        self.at = (self.at + 1) % self.values.len;
+        self.n = @min(self.n + 1, self.values.len);
+    }
+
+    /// The mean of the readings taken between `from` and `to` seconds ago; null when there are none.
+    fn meanBetween(self: *const Trend, from: f32, to: f32) ?f32 {
+        var sum: f32 = 0;
+        var count: f32 = 0;
+        for (self.values[0..self.n], self.times[0..self.n]) |v, t| {
+            const ago = self.now - t;
+            if (ago < from or ago >= to) continue;
+            sum += v;
+            count += 1;
+        }
+        return if (count > 0) sum / count else null;
+    }
+
+    pub fn steady(self: *const Trend, tolerance: f32) bool {
+        const recent = self.meanBetween(0, window) orelse return false;
+        const before = self.meanBetween(window, 2 * window) orelse return false;
+        // both windows whole: the older one reaches back two windows
+        if (self.n == 0 or self.now - self.times[if (self.n < self.values.len) 0 else self.at] < 2 * window - 1) return false;
+        return @abs(recent - before) <= tolerance;
+    }
+
+    /// The mean of the last window.
+    pub fn mean(self: *const Trend) f32 {
+        return self.meanBetween(0, window) orelse 0;
+    }
+};
+
 // ---------------------------------------------------------------- on disk
 
 /// `limit 70`, then `fans boost 31.2 4500 0`, `power 13.5 1600`, `cores 1 21.0 4300` lines.
@@ -318,6 +368,29 @@ test "a reading settles once it stops moving" {
     i = 0;
     while (i < 40) : (i += 1) s.add(31 + @as(f32, @floatFromInt(i % 3)) * 0.1);
     try std.testing.expect(s.steady(0.05));
+}
+
+test "a trend is steady when two windows agree, whatever a whole-degree sensor does within them" {
+    var t = Trend{};
+    // a sink creeping up a degree a minute, read in whole degrees: the reading sits still for
+    // most of a minute, which is no steady state
+    var seconds: f32 = 0;
+    while (seconds < 100) : (seconds += 0.25) t.add(@floor(50 + seconds / 60), 0.25);
+    try std.testing.expect(!t.steady(0.3));
+    // settled at the edge of a degree, the reading toggles: steady all the same
+    t = Trend{};
+    var i: usize = 0;
+    while (i < 400) : (i += 1) t.add(if (i % 3 == 0) 55 else 54, 0.25);
+    try std.testing.expect(t.steady(0.3));
+    try std.testing.expectApproxEqAbs(@as(f32, 54.33), t.mean(), 0.05);
+    // and too little history is not steady either
+    t = Trend{};
+    i = 0;
+    while (i < 200) : (i += 1) t.add(54, 0.25);
+    try std.testing.expect(!t.steady(0.3));
+    i = 0;
+    while (i < 160) : (i += 1) t.add(54, 0.25);
+    try std.testing.expect(t.steady(0.3));
 }
 
 test "Cooler Boost earns its noise only where it carries clearly more" {

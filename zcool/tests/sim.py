@@ -7,6 +7,7 @@ the control logic and the safety paths. It proves nothing about any real driver.
 """
 import concurrent.futures
 import os
+import re
 import shutil
 import signal
 import struct
@@ -36,12 +37,15 @@ class Chip:
     """One chip with a heat load, a thermal mass and a conductance that depends on its fan,
     and for a GPU in a case a little on the case fan too."""
 
-    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0, r_die=0.0):
+    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0, r_die=0.0, whole_degrees=False):
         self.load, self.g_min, self.g_max, self.mass, self.g_case = load, g_min, g_max, mass, g_case
         self.temp, self.ambient = temp, ambient
         # a laptop CPU's die sits above its heat sink by what flows through it: its sensor jumps
         # with the power at once, while the sink takes its time
         self.r_die = r_die
+        # coretemp reports whole degrees (how the DTS rounds within one is not documented: the
+        # nearest here): a reading can sit still for a minute while the sink moves
+        self.whole_degrees = whole_degrees
         self.reading = temp
         self.now_perf = 1.0
         self.work = 0.0
@@ -375,8 +379,9 @@ class Machine:
                 os.pwrite(fd, struct.pack(">H", period), Ec.FAN_RPM[i])
                 os.close(fd)
         if self.cpu:
-            self._write_temp(f"{self.cpu_dir}/temp1_input", self.cpu.reading)
-            self._write_temp(f"{self.cpu_dir}/temp2_input", self.cpu.reading + 1)
+            reading = round(self.cpu.reading) if self.cpu.whole_degrees else self.cpu.reading
+            self._write_temp(f"{self.cpu_dir}/temp1_input", reading)
+            self._write_temp(f"{self.cpu_dir}/temp2_input", reading + 1)
             if self.freq:
                 # the clocks a CPU-bound load runs at: what its power allows of the 5 GHz top
                 khz = int(5000000 * max(0.16, min(1, self.cpu.now_perf))) if self.cpu.load > 5 else 800000
@@ -573,6 +578,12 @@ scenarios = []
 
 def scenario(fn):
     scenarios.append(fn)
+    return fn
+
+
+def long(fn):
+    """A scenario of many minutes: it starts first, so that the suite's wall time is not it plus the rest."""
+    fn.long = True
     return fn
 
 
@@ -1950,6 +1961,7 @@ def calibrate(m, seconds=600):
 
 
 @scenario
+@long
 def calibration_learns_the_fans_and_the_power_and_gives_everything_back(r):
     m = gf63()
     m.service()
@@ -1988,6 +2000,31 @@ def calibration_learns_the_fans_and_the_power_and_gives_everything_back(r):
     r.check(m.cpu.peak <= 74, f"peak {m.cpu.peak:.1f}")
     out = m.cmd("list").stdout
     r.check("calibrated at 70C" in out and "quiet mode may give up" in out, out[-800:])
+    m.close()
+
+
+@scenario
+@long
+def a_calibration_cools_the_machine_first(r):
+    # right after a long load the sink is warm, and the speed phase, which holds the die at its
+    # limit, would measure power cut instead of the CPU's speed: the GF63 read 2500 MHz on six
+    # CPUs at 13 W that way. Every fan at full and no load first, until the die is 20 C under.
+    m = gf63()
+    m.cpu.temp = m.cpu.reading = 66
+    m.service()
+    code = calibrate(m)
+    log = m.text()
+    r.check(code == 0, f"exit {code}:\n" + log[-1200:])
+    r.check("cooling first: the die is at 6" in log and "measuring starts under 50C" in log, log[:600])
+    cooled = re.search(r"\n  (4\d|50)C after (\d+) s\n", log)
+    r.check(cooled is not None, "the cooling should end under 50 C:\n" + log[:600])
+    path = f"{m.root}/var/lib/zcool/calibration"
+    cores = [l.split() for l in get(path).splitlines() if l.startswith("cores 1 ")] if os.path.exists(path) else []
+    # one CPU's 33 W never reaches the limit from cold: the CPU's own 5000 MHz, on all of its power
+    r.check(cores and float(cores[0][2]) >= 30 and float(cores[0][3]) >= 4900,
+            f"one CPU from cold should run at full speed on its 33 W: {cores}")
+    r.check(m.told == b"du", f"the service should stop and start again: {m.told!r}")
+    r.note(f"cooled in {cooled.group(2) if cooled else '?'} s; one CPU {cores[0][3] if cores else '?'} MHz at {cores[0][2] if cores else '?'} W")
     m.close()
 
 
@@ -2136,14 +2173,19 @@ def model_file(m):
 
 
 @scenario
+@long
 def the_long_calibration_fits_the_machines_heat(r):
-    # a sink light enough to settle in half a minute: the real GF63's takes two to three
-    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=6, r_die=0.12), cpu_fan=False, ec=Ec(one_fan=True),
+    # as the GF63 reads: a die that counts whole degrees, 0.2 C/W over a sink that takes its time.
+    # 15 J/C against 1.2 W/C at full is 13 s; the laptop's takes minutes. The calibration measures
+    # that time off the climb after a power step and holds each steady state for four of it, so
+    # this runs about a quarter of an hour where the laptop takes up to an hour. Whole degrees
+    # put each steady state up to half a degree off, two of them 11 C apart: a tenth on g.
+    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=15, r_die=0.2, whole_degrees=True), cpu_fan=False, ec=Ec(one_fan=True),
                 rapl_window=True, config="cpu0.max = 70\n", cal_full=90, pl1_watts=45, pl2_watts=107, psys=True)
     m.service()
     started = time.time()
     m.start("--long", command="calibrate")
-    end = time.time() + 1500
+    end = time.time() + 1700
     while m.proc.poll() is None and time.time() < end:
         m.advance(1, limit_cpu=70)
     code = m.proc.poll()
@@ -2154,15 +2196,17 @@ def the_long_calibration_fits_the_machines_heat(r):
     log = m.text()
     r.check(code == 0, f"exit {code}:\n" + log[-1500:])
     mdl = model_file(m)
-    r.check(bool(mdl), "no model written:\n" + log[-800:])
+    r.check(bool(mdl), "no model written:\n" + log[-1500:])
     if mdl:
-        r.check(0.09 <= mdl.get("r_die", 0) <= 0.15, f"r_die {mdl.get('r_die')}, the chip's is 0.12")
-        r.check(27 <= mdl.get("ambient", 0) <= 33, f"ambient {mdl.get('ambient')}, the room is 30")
-        r.check(3 <= mdl.get("mass", 0) <= 9, f"mass {mdl.get('mass')}, the sink's is 6")
-        r.check(abs(mdl.get("g 60%", 0) - 0.92) <= 0.14, f"g 60% {mdl.get('g 60%')}, the chip's is 0.92")
-        r.check(abs(mdl.get("g 100%", 0) - 1.19) <= 0.18, f"g 100% {mdl.get('g 100%')}, the chip's is 1.19")
+        r.check(0.15 <= mdl.get("r_die", 0) <= 0.26, f"r_die {mdl.get('r_die')}, the chip's is 0.2")
+        r.check(28 <= mdl.get("ambient", 0) <= 32, f"ambient {mdl.get('ambient')}, the room is 30")
+        r.check(11 <= mdl.get("mass", 0) <= 19, f"mass {mdl.get('mass')}, the sink's is 15")
+        for name, duty in (("100%", 253), ("80%", 204), ("60%", 153)):
+            truth = 0.5 + 0.7 * duty / 255
+            r.check(abs(mdl.get(f"g {name}", 0) - truth) <= 0.14, f"g {name} {mdl.get(f'g {name}')}, the chip's is {truth:.2f}")
         r.note("model: " + " ".join(f"{k}={v}" for k, v in mdl.items()) + f"; took {took:.0f} s")
-    r.check("model: the die" in log, log[-600:])
+    r.check("the sink takes" in log and "each held" in log, log[-1500:])
+    r.check("model: the die" in log and "nothing kept" not in log, log[-800:])
     r.check(m.cpu.peak <= 71, f"peak {m.cpu.peak:.1f}")
     r.check(get(m.rapl_path) == "45000000" and get(m.pl2_path) == "107000000", "limits not given back")
     m.close()
@@ -2357,6 +2401,7 @@ def main():
         os.setgid(65534)
         os.setuid(65534)
     chosen = [fn for fn in scenarios if not ONLY or ONLY in fn.__name__]
+    chosen.sort(key=lambda fn: not getattr(fn, "long", False))
     failed = 0
     with concurrent.futures.ProcessPoolExecutor(max_workers=3) as pool:
         for name, problems, notes in pool.map(run_one, chosen):

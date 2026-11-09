@@ -120,6 +120,26 @@ pub const Model = struct {
         return @max((limit - self.ambient) / (1 / g + self.r_die), 0);
     }
 
+    /// Why this is no model of the machine, or null when it may be one. Two things a fit has to
+    /// agree with: a faster fan carries more per degree than a slower one (a tenth of noise
+    /// allowed), and what it says the fans at full hold at the limit is within 15% of what the
+    /// calibration measured them holding minutes before. The GF63's first long calibration failed
+    /// both: steady states taken too early put 80% over 100%, and a room read off a sink still
+    /// warm put 24 W against the 30 measured.
+    pub fn complaint(self: *const Model, carries_full: f32, limit: f32) ?[]const u8 {
+        var faster: f32 = 0;
+        for (self.g) |v| {
+            if (v <= 0) continue;
+            if (faster > 0 and v > faster * 1.1) return "a slower fan carries more per degree than a faster one: the steady states were not steady";
+            faster = v;
+        }
+        if (carries_full > 0) {
+            const held = self.holds(253, limit);
+            if (@abs(held - carries_full) > 0.15 * carries_full) return "what it holds at the limit with the fans at full is not what they carried";
+        }
+        return null;
+    }
+
     /// The die moved by `d_die` as the power moved by `d_watts` within a moment: that is r_die,
     /// learned slowly, from steps big enough for a sensor that counts whole degrees.
     pub fn learnJump(self: *const Model, d_die: f32, d_watts: f32) ?f32 {
@@ -385,6 +405,23 @@ test "the fit recovers the plant from its steady states and jumps" {
     try std.testing.expectApproxEqAbs(truth.g[1], m.conductance(255), 0.03);
     // too little: no fit
     try std.testing.expect(!fit(steadies[0..1], &.{}, null).known());
+}
+
+test "a fit that disagrees with the machine is no model" {
+    var m = gf63();
+    // the simulator's chip holds 42 W at 70 C with the fans at full: the fit agrees with 40
+    try std.testing.expect(m.complaint(40, 70) == null);
+    try std.testing.expect(m.complaint(0, 70) == null);
+    // the GF63's first long calibration: 80% over 100%
+    m.g = .{ 0, 0.89, 1.44, 1.16 };
+    try std.testing.expect(std.mem.indexOf(u8, m.complaint(30, 70).?, "slower fan") != null);
+    // and a room of 38 C that put "holds" at 24 W against 30 measured
+    m.g = .{ 0, 0.89, 0.85, 0.8 };
+    m.ambient = 38;
+    m.r_die = 0.2;
+    try std.testing.expect(std.mem.indexOf(u8, m.complaint(30.2, 70).?, "not what they carried") != null);
+    m.ambient = 32;
+    try std.testing.expect(m.complaint(30.2, 70) == null);
 }
 
 test "learning on the way: a jump teaches r_die slowly, a steady state the cooler" {

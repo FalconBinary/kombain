@@ -106,7 +106,11 @@ as the cooler would carry it. `learn = no` turns it off.
 ## Calibration
 
 `doas zcool calibrate`, once, plugged in, in 3 to 8 minutes: zcool loads the CPU itself and
-measures what it otherwise finds out while the heat comes.
+measures what it otherwise finds out while the heat comes. It starts cold: every fan at full and
+no load until the die is 20 C under its limit, up to ten minutes, since the first phase holds the
+die at the limit and on a sink still warm from the last load that measures power cut, not the
+CPU's speed (a run right after another on the GF63 read 2500 MHz on six CPUs at 13 W, against
+3647 MHz at 33 W from cold).
 
 - **How fast it runs** on one CPU, on half of them and on all, held at its limit: the clocks of
   the CPUs it loads, not of the idle ones.
@@ -134,16 +138,31 @@ stops it: nothing is kept and everything is put back. It goes to `/var/lib/zcool
 
 ## A model of the machine's heat
 
-`doas zcool calibrate --long`, plugged in, as long as it takes (up to about 40 minutes on a
-laptop, after the short calibration's own minutes): zcool measures three things and keeps them
-in `/var/lib/zcool/model`:
+`doas zcool calibrate --long`, plugged in, as long as it takes (up to an hour on a laptop, after
+the short calibration's own minutes): zcool measures four things and keeps them in
+`/var/lib/zcool/model`:
 
 - how far the die sits above its heat sink per watt, from the jump a sensor shows the moment
   power steps up (three steps, every fan at full);
+- the sink's own time, from the climb after the last of those steps: how long the die takes to
+  cover 63% of the way to where it settles;
 - what the cooler carries per degree over the room at each fan speed, from the steady state of
-  each speed at two powers under what it carries, each held until the temperature settles; the
-  sink's thermal mass comes from how long each settling took;
-- the room's temperature, read with the load off and every fan at full.
+  each speed at two powers under what it carries, each held for four of the sink's times (a
+  minute at least, ten of them at most) and until the mean of the last 45 s agrees with the mean
+  of the 45 s before within 0.3 C; the sink's thermal mass comes from how long each settling took;
+- the room's temperature, read with the load off and every fan at full, held as long as a steady
+  state; when it comes out warmer than the room the lines through the steady states meet at, the
+  sink was still warm, and the lines win.
+
+The fit is kept only when it holds together: a faster fan carries more per degree than a slower
+one, and what the model says the fans at full hold at the limit is within 15% of what the short
+calibration measured them holding minutes before. Otherwise zcool says which it was, prints the
+fit for the record, and keeps nothing: run it again from cold, with nothing else running. The
+first long calibration on the GF63 taught all of this: a reading that stood still for ten seconds
+had passed for a steady state while the sink, which takes minutes, still climbed (coretemp counts
+whole degrees, so a die can sit on one for half a minute), and the fit had the cooler carrying
+more at 80% than at full, the room at 38 C off a sink still warm, and the fans at full holding
+24 W where they had just carried 30.
 
 With the model zcool knows where the temperature goes, instead of extrapolating where it was
 going. It follows the sink's temperature by the model's own account, corrected by the reading:

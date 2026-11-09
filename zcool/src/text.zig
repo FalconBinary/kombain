@@ -49,6 +49,16 @@ pub const Text = struct {
         return self.num(@intCast(@abs(@rem(tenths, 10))));
     }
 
+    /// With two decimals: 0.89.
+    pub noinline fn hundredth(self: *Text, v: f32) *Text {
+        const hundredths: i64 = @intFromFloat(@round(std.math.clamp(v, -1e6, 1e6) * 100));
+        if (hundredths < 0 and hundredths > -100) _ = self.add("-");
+        _ = self.num(@divTrunc(hundredths, 100)).add(".");
+        const rest: u64 = @abs(@rem(hundredths, 100));
+        if (rest < 10) _ = self.add("0");
+        return self.num(@intCast(rest));
+    }
+
     /// Two hex digits: 0x9e is "9e".
     pub noinline fn hex(self: *Text, b: u8) *Text {
         const digits = "0123456789abcdef";
@@ -71,5 +81,6 @@ test "numbers as pieces of a line" {
     var buf: [64]u8 = undefined;
     var t = Text{ .buf = &buf };
     _ = t.num(-42).add(" ").whole(31.6).add(" ").tenth(31.54).add(" ").tenth(-0.4).add(" ").hex(0x9e);
-    try std.testing.expectEqualStrings("-42 32 31.5 -0.4 9e", t.str());
+    _ = t.add(" ").hundredth(0.89).add(" ").hundredth(1.4).add(" ").hundredth(-0.05);
+    try std.testing.expectEqualStrings("-42 32 31.5 -0.4 9e 0.89 1.40 -0.05", t.str());
 }
