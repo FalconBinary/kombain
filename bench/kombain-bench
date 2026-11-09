@@ -8,6 +8,7 @@
 #   kombain-bench jitter [--seconds N] [--hz N] [--label L]  how late a 144 Hz task wakes, nothing else running
 #   kombain-bench build [--jobs N] [--runs N] [--tree DIR] [--label L]
 #                                                          a C build: seconds, joules, the desktop's jitter under it
+#                                                          (as root it reads the joules and still builds as the tree's owner)
 #   kombain-bench game FILE.csv [--label L]                a MangoHud log: frame times
 #   kombain-bench battery [--minutes N] [--label L]        watts from the battery while you use the machine
 #   kombain-bench summary [FILE...]                        medians and p95 of what was measured, per label
@@ -58,11 +59,32 @@ set_label() {
 	[ -n "$label" ] || label="$(uname -r)/$(init_name)"
 }
 
-# row FILE HEADER VALUES: appends one row, the header first when the file is new.
+own_dir=${XDG_DATA_HOME:-$HOME/.local/share}/kombain-bench
+moved=
+
+# row FILE HEADER VALUES: appends one row, the header first when the file is new. Root makes the
+# directory everyone's, as /tmp is, and its files writable by all; a user who still cannot write
+# there (the directory or the file is root's from before) writes in their own and says so.
 row() {
-	mkdir -p "$dir" 2>/dev/null || die "cannot create $dir"
 	f=$dir/$1
-	[ -e "$f" ] || echo "label,utc,kernel,init,mode,source,$2" > "$f"
+	if ! mkdir -p "$dir" 2>/dev/null || ! [ -w "$dir" ] || { [ -e "$f" ] && ! [ -w "$f" ]; }; then
+		dir=$own_dir
+		mkdir -p "$dir" 2>/dev/null || die "cannot create $dir"
+		f=$dir/$1
+		[ -n "$moved" ] || echo "  (${KOMBAIN_BENCH_DIR:-/var/tmp/kombain-bench} is root's: rows go to $dir; summary reads both)"
+		moved=1
+	fi
+	[ "$(id -u)" -ne 0 ] || chmod 1777 "$dir" 2>/dev/null
+	header="label,utc,kernel,init,mode,source,$2"
+	if [ -e "$f" ] && [ "$(head -1 "$f")" != "$header" ]; then
+		# older rows with other columns stay readable beside the new file
+		mv "$f" "$f.old-$(date -u +%Y%m%d%H%M%S)"
+		echo "  (the columns of $(basename "$f") changed: the old rows were moved aside)"
+	fi
+	if [ ! -e "$f" ]; then
+		echo "$header" > "$f"
+		[ "$(id -u)" -ne 0 ] || chmod 666 "$f" 2>/dev/null
+	fi
 	echo "$label,$(date -u +%Y-%m-%dT%H:%M:%SZ),$(uname -r),$(init_name),$(mode),$(power_source),$3" >> "$f"
 	echo "  -> $f"
 }
@@ -120,27 +142,50 @@ boot() {
 	fi
 	s1_start=$(cat "$markers/stage1-start" 2>/dev/null || echo -)
 	s1_end=$(cat "$markers/stage1-end" 2>/dev/null || echo -)
+	login=$(login_at "$from")
 	sess=$(cat "$session" 2>/dev/null || echo -)
 	desk=$(cat "$desktop" 2>/dev/null || echo -)
-	[ "$desk" = - ] && desk=$sess
+	up=$desk
+	[ "$up" = - ] && up=$sess
 	initrd_s=$(num "$s1_start" "$kernel_s" -)
 	stage1_s=$(num "$s1_end" "$s1_start" -)
-	services_s=$(num "$desk" "$s1_end" -)
+	login_s=$(num "$login" "$s1_end" -)
+	session_s=$(num "$sess" "$login" -)
+	panel_s=$(num "$desk" "$sess" -)
 	echo "boot ($label):"
 	echo "  firmware (ACPI FPDT, reset to the loader)   $firmware_s s"
 	echo "  kernel, until it ran the initramfs          $kernel_s s"
 	echo "  initramfs, LUKS and your passphrase          $initrd_s s   (includes the typing: compare with care)"
 	echo "  stage 1 (runit core-services)                $stage1_s s"
-	echo "  services to the desktop                      $services_s s"
-	echo "  uptime when the desktop was up               $desk s"
+	echo "  stage 2 until the login on tty1              $login_s s"
+	echo "  login until the session started              $session_s s"
+	echo "  the session until the panel was up           $panel_s s"
+	echo "  uptime when the desktop was up               $up s"
 	[ -z "$dmesg_note" ] || echo "  $dmesg_note"
 	if [ "$s1_start" = - ]; then
 		echo "  no stage 1 markers of this boot: they come with the next boot (install.sh put them in /etc/runit/core-services)"
 	fi
-	if [ "$desk" = - ]; then
-		echo "  no session marker: see bench/README.md, 'markers' (the session writes it at login and when the panel is up)"
+	[ "$login" != - ] || echo "  no tty login in utmp: a display manager, or utmpdump is missing"
+	if [ "$sess" = - ] || [ "$desk" = - ]; then
+		echo "  no session marker: see bench/README.md, 'markers' (the session writes one at login and one when the panel is up)"
 	fi
-	row boot.csv "firmware_s,kernel_s,initrd_luks_s,stage1_s,services_desktop_s,uptime_at_desktop_s" "$firmware_s,$kernel_s,$initrd_s,$stage1_s,$services_s,$desk"
+	row boot.csv "firmware_s,kernel_s,initrd_luks_s,stage1_s,services_login_s,login_session_s,session_desktop_s,uptime_at_desktop_s" "$firmware_s,$kernel_s,$initrd_s,$stage1_s,$login_s,$session_s,$panel_s,$up"
+}
+
+# The uptime at the first login on a console, from utmp: when the getty had let the user in. Its
+# stamp is wall-clock time with microseconds; the boot's wall-clock time is now minus the uptime,
+# so this is good to about a second.
+login_at() {
+	if [ -n "$1" ]; then
+		cat "$1/markers/login" 2>/dev/null || echo -
+		return
+	fi
+	command -v utmpdump >/dev/null 2>&1 || { echo -; return; }
+	stamp=$(utmpdump /var/run/utmp 2>/dev/null | awk -F'[][]' '$2 == "7" && $6 ~ /^tty[0-9]+ *$/ { if (s == "") s = $16 } END { print s }')
+	[ -n "$stamp" ] || { echo -; return; }
+	epoch=$(date -d "$(echo "$stamp" | sed 's/,[0-9]*//')" +%s 2>/dev/null)
+	[ -n "$epoch" ] || { echo -; return; }
+	awk -v e="$epoch" -v now="$(date +%s)" -v up="$(uptime_s)" 'BEGIN { printf "%.2f\n", e - (now - up) }'
 }
 
 # ---------------------------------------------------------------- idle
@@ -180,7 +225,8 @@ battery_w() {
 
 pss_mib() {
 	[ "$(id -u)" -eq 0 ] || { echo -; return; }
-	awk '/^Pss:/ { s += $2 } END { printf "%.0f\n", s / 1024 }' /proc/[0-9]*/smaps_rollup 2>/dev/null
+	# one process at a time: a process gone between the glob and the read must not end the sum
+	for f in /proc/[0-9]*/smaps_rollup; do cat "$f" 2>/dev/null; done | awk '/^Pss:/ { s += $2 } END { printf "%.0f\n", s / 1024 }'
 }
 
 idle() {
@@ -206,7 +252,8 @@ idle() {
 	i1=$(stat_field intr 1); c1=$(stat_field ctxt 1); b1=$(cpu_busy_jiffies); a1=$(cpu_all_jiffies); e1=$(rapl_uj)
 	wakeups=$(awk -v a="$i1" -v b="$i0" -v s="$seconds" 'BEGIN { printf "%.0f\n", (a - b) / s }')
 	ctxt=$(awk -v a="$c1" -v b="$c0" -v s="$seconds" 'BEGIN { printf "%.0f\n", (a - b) / s }')
-	busy=$(awk -v b0="$b0" -v b1="$b1" -v a0="$a0" -v a1="$a1" 'BEGIN { d = a1 - a0; printf "%.1f\n", d > 0 ? 100 * (b1 - b0) / d : 0 }')
+	# the parentheses matter: a bare > in a printf list is awk's output redirection
+	busy=$(awk -v b0="$b0" -v b1="$b1" -v a0="$a0" -v a1="$a1" 'BEGIN { d = a1 - a0; printf "%.1f\n", (d > 0 ? 100 * (b1 - b0) / d : 0) }')
 	rapl=-
 	[ "$e0" != - ] && [ "$e1" != - ] && rapl=$(awk -v a="$e1" -v b="$e0" -v s="$seconds" 'BEGIN { printf "%.2f\n", (a - b) / 1e6 / s }')
 	bat=$(grep -v '^-$' "$bat_samples" | rank 0.5)
@@ -261,16 +308,26 @@ build() {
 	set_label
 	[ -f "$tree/Makefile" ] || die "no Makefile in $tree: --tree DIR, or KOMBAIN_SRC=/path/to/kombain"
 	command -v "$zjitter" >/dev/null || die "zjitter is not installed (install.sh builds it)"
+	# as root (doas kombain-bench build) the package's joules are readable, and make runs as the
+	# tree's owner, so that no root-owned object lands in a checkout
+	owner=$(stat -c %u "$tree")
+	as_owner=
+	if [ "$(id -u)" -eq 0 ] && [ "$owner" -ne 0 ]; then
+		as_owner="setpriv --reuid=$owner --regid=$(stat -c %g "$tree") --init-groups env HOME=$(getent passwd "$owner" | cut -d: -f6)"
+		[ "$(rapl_uj)" != - ] || echo "  (no RAPL here: joules stay unknown)"
+	elif [ "$(rapl_uj)" = - ]; then
+		echo "  (as a user the package's joules are not readable: doas kombain-bench build reads them and still builds as you)"
+	fi
 	echo "build ($label): make -j$jobs in $tree, $runs runs after a warm-up; zjitter at 144 Hz beside it"
 	r=0
 	while [ "$r" -le "$runs" ]; do
-		make -C "$tree" clean >/dev/null 2>&1
+		$as_owner make -C "$tree" clean >/dev/null 2>&1
 		jit=$(mktemp)
 		"$zjitter" --hz 144 --seconds 3600 --csv > "$jit" &
 		jpid=$!
 		e0=$(rapl_uj)
 		t0=$(date +%s.%N)
-		if ! CCACHE_DISABLE=1 make -C "$tree" -j"$jobs" >/dev/null 2>&1; then
+		if ! $as_owner env CCACHE_DISABLE=1 make -C "$tree" -j"$jobs" >/dev/null 2>&1; then
 			kill -TERM "$jpid" 2>/dev/null; wait "$jpid" 2>/dev/null; rm -f "$jit"
 			die "the build failed in $tree"
 		fi
@@ -286,12 +343,12 @@ build() {
 		if [ "$r" -eq 0 ]; then
 			echo "  warm-up: $seconds s (discarded)"
 		else
-			echo "  run $r: $seconds s, $joules J$([ "$joules" = - ] && echo ' (root reads RAPL)'), desktop jitter: $misses frames missed, p99 $p99 us, max $max us"
+			echo "  run $r: $seconds s, $joules J, desktop jitter: $misses frames missed, p99 $p99 us, max $max us"
 			row build.csv "jobs,run,seconds,joules,jitter_misses,jitter_p99_us,jitter_max_us" "$jobs,$r,$seconds,$joules,$misses,$p99,$max"
 		fi
 		r=$((r + 1))
 	done
-	make -C "$tree" clean >/dev/null 2>&1
+	$as_owner make -C "$tree" clean >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------- game
@@ -370,6 +427,7 @@ battery() {
 summary() {
 	if [ $# -eq 0 ]; then
 		set -- "$dir"/*.csv
+		[ "$own_dir" = "$dir" ] || [ ! -d "$own_dir" ] || set -- "$@" "$own_dir"/*.csv
 	fi
 	for f in "$@"; do
 		[ -r "$f" ] || continue

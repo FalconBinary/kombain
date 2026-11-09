@@ -10,14 +10,18 @@ is compared against the rows before it.
 doas kombain-bench boot             # this boot's stages: firmware, kernel, initramfs and LUKS, stage 1, services to the desktop
 doas kombain-bench idle             # 60 s at rest: interrupts and context switches per second, CPU busy, memory, PSS, package watts, battery watts
 kombain-bench jitter                # 30 s: how late a 144 Hz task wakes with nothing else running
-kombain-bench build                 # make -j12 of fdash, 3 runs after a warm-up: seconds, joules, and the desktop's jitter under it
+doas kombain-bench build            # make -j12 of fdash, 3 runs after a warm-up: seconds, joules, and the desktop's jitter under it
+                                    # (root reads the joules; make still runs as the tree's owner)
 kombain-bench game ~/mangohud.csv   # frame times of a game: average fps, 1 % low, p50, p99, the worst frame
 kombain-bench battery --minutes 10  # watts from the battery while you use the machine as you mean to measure it
 kombain-bench summary               # medians and p95 of every row so far, per label
 ```
 
-The rows go to `/var/tmp/kombain-bench/*.csv` (`KOMBAIN_BENCH_DIR` moves them). `--label NAME`
-names a variant yourself: `stock`, `vh-kernel`, `scx_lavd`.
+The rows go to `/var/tmp/kombain-bench/*.csv` (`KOMBAIN_BENCH_DIR` moves them): root makes the
+directory everyone's, as `/tmp` is, and its files writable by all; a user who still cannot write
+there writes to `~/.local/share/kombain-bench`, and `summary` reads both. `--label NAME` names a
+variant yourself: `stock`, `vh-kernel`, `scx_lavd`. When a measurement's columns change, the old
+file is moved aside, never mixed.
 
 ## The method
 
@@ -39,7 +43,7 @@ Borrowed from UniVoidDistro's rules, which are the honest ones:
 
 | Measurement | What is read | Why it is the real thing |
 |---|---|---|
-| `boot` | the ACPI FPDT (firmware time), `dmesg` ("Run /sbin/init": the kernel until the initramfs), stage 1 markers that `/etc/runit/core-services` write, a marker the session writes at login and when the panel is up | the time from the power button to a usable desktop, by stage: a faster init shows in stage 1 and services, a smaller kernel in the kernel's own time. The initramfs stage includes typing the LUKS passphrase: compare it with care |
+| `boot` | the ACPI FPDT (firmware time), `dmesg` ("Run /init as init process": the kernel until the initramfs), stage 1 markers that `/etc/runit/core-services` write, the tty login from utmp (`utmpdump`), a marker the session writes at login and one when the panel is up | the time from the power button to a usable desktop, by stage: a faster init shows in stage 1 and in stage 2 until the login, a smaller kernel in the kernel's own time, the session's own cost between the login and the panel. The initramfs stage includes typing the LUKS passphrase: compare it with care. On the GF63 the first boot measured 10.4 s of firmware, 3.4 s of kernel, 2.3 s of stage 1 and 19 s from stage 1 to the desktop: the last is where a boot is won, not in PID 1 |
 | `idle` | `/proc/stat` interrupts and context switches per second, CPU busy %, `MemAvailable`, the PSS of every process (root), the CPU package's RAPL watts (root), the battery's watts when discharging | what the system costs while doing nothing: the daemons' wakeups, the memory they hold, the watts |
 | `jitter` | `zjitter`: a task that wants to wake 144 times a second, how late each wake came (p50, p99, the worst), and how many came a whole frame late | a game's frame loop, the compositor and audio live on this; a scheduler is judged by it under load, not on throughput alone |
 | `build` | `make -j N` of fdash (gcc, a real C program), wall seconds, joules of the CPU package (root), and `zjitter` at 144 Hz beside it: the desktop's frames while every core compiles | the developer's own workload, and whether the desktop stays smooth through it (ztune's SCHED_BATCH, the scheduler, the power limit) |
