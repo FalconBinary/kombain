@@ -57,7 +57,7 @@ add the two lines there yourself). `boot` reads them from `/run/user/UID/`.
 
 ## zjitter
 
-A Zig program without libc (`bench/src/jitter.zig`): it sleeps on the monotonic clock with
+A 16 KiB Zig program without libc (`bench/src/jitter.zig`): it sleeps on the monotonic clock with
 absolute deadlines (`clock_nanosleep`), so its own work never shifts the schedule, records how
 late every wake came in microseconds, and reports p50, p99, the worst, and how many wakes came
 a whole frame or more late (every skipped deadline counts). SIGTERM ends it with its report.

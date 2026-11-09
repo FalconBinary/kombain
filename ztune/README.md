@@ -6,7 +6,10 @@ memory is reclaimed, when the disk is written, and how a build shares the CPU wi
 desktop, on mains and on battery, while a game or a build runs. It finds games and builds by
 their processes, and every value it changes goes back when it stops, however it stops.
 
-Pure Zig with no libc: a 55 KiB binary that wakes every 3 s and reads `/proc` once then.
+Pure Zig with no libc: a 57 KiB binary that wakes every 3 s. Then it reads `/proc/loadavg`,
+one line, and looks at every process only when the kernel has handed out a pid since the last
+look (no new process, no new game or build) or 30 s have passed; a build or a game is watched at
+every tick. At rest with 150 processes that is 0.3 wakeups and about 0.1 ms of CPU a second.
 
 ## What it sets
 

@@ -248,6 +248,41 @@ pub fn parseStat(text: []const u8) ?struct { comm: []const u8, ticks: u64, start
 }
 
 var scan_pids: [max_tracked]ProcTicks = undefined;
+var last_pid_seen: ?u32 = null;
+var since_full_scan: f32 = 0;
+var last_scan = Scan{};
+
+/// The last field of /proc/loadavg: the pid the kernel gave out last. While it stands, no
+/// process has started since the last look.
+pub fn lastPid(loadavg: []const u8) ?u32 {
+    var fields = std.mem.tokenizeAny(u8, loadavg, " \n");
+    var last: ?[]const u8 = null;
+    while (fields.next()) |f| last = f;
+    return std.fmt.parseInt(u32, last orelse return null, 10) catch null;
+}
+
+/// The look at every process costs a read of each one's stat, 1.2 ms of CPU every 3 s with 150
+/// of them (measured): with no game and no build process in sight it is skipped while the
+/// kernel has started no process since the last look, and taken anyway every 30 s. A process
+/// that was seen, a compiler idle so far, is watched at every tick: it changes what it uses
+/// without starting anything.
+fn scanMaybe(dt: f32, mode: profile.Mode) Scan {
+    since_full_scan += dt;
+    var path_buf: [64]u8 = undefined;
+    var buf: [128]u8 = undefined;
+    const loadavg = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/proc/loadavg" }), &buf);
+    const pid = if (loadavg) |text| lastPid(text) else null;
+    const nothing_to_watch = mode == .desktop and last_scan.game == null and last_scan.build_name == null;
+    const quiet = nothing_to_watch and pid != null and last_pid_seen != null and pid.? == last_pid_seen.? and since_full_scan < 30;
+    if (quiet) {
+        last_scan.build_cores = 0;
+        return last_scan;
+    }
+    last_pid_seen = pid;
+    since_full_scan = 0;
+    last_scan = scan(dt);
+    return last_scan;
+}
 
 /// One look at every process: whether a game runs, and how busy a build keeps the CPU.
 fn scan(dt: f32) Scan {
@@ -458,7 +493,7 @@ fn runDaemon() u8 {
         const dt = @as(f32, @floatFromInt(now - last)) / 1000;
         last = now;
         const src = source();
-        const s = scan(dt);
+        const s = scanMaybe(dt, detector.mode);
         const mode = detector.update(cfg.game and s.game != null, if (cfg.build) s.build_cores else 0, dt);
         if (mode != last_mode or src != last_source) {
             _ = out.add("now: ").add(@tagName(mode)).add(" on ").add(@tagName(src));
@@ -698,4 +733,9 @@ test "a process's name and times from /proc/PID/stat" {
     try std.testing.expectEqual(@as(u64, 150), s.ticks);
     try std.testing.expectEqual(@as(u64, 98765), s.start);
     try std.testing.expect(parseStat("garbage") == null);
+}
+
+test "the last pid of /proc/loadavg" {
+    try std.testing.expectEqual(@as(u32, 449), lastPid("0.10 0.08 0.05 1/412 449\n").?);
+    try std.testing.expect(lastPid("garbage") == null);
 }

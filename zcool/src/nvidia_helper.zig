@@ -19,6 +19,24 @@ const std = @import("std");
 const sys = @import("sys.zig");
 const sandbox = @import("sandbox.zig");
 
+/// The default panic handler symbolises a stack trace and brings most of std.debug with it:
+/// 180 KiB of this program's 324, measured. One line says what went wrong, and zcool puts the
+/// GPU back when the pipe closes.
+pub const std_options: std.Options = .{
+    .enable_segfault_handler = false,
+    .signal_stack_size = null,
+};
+
+pub const panic = std.debug.FullPanic(onPanic);
+
+fn onPanic(msg: []const u8, _: ?usize) noreturn {
+    @branchHint(.cold);
+    sys.eprint("zcool-nvidia: internal error: ");
+    sys.eprint(msg);
+    sys.eprint("\n");
+    sys.exit(134);
+}
+
 const Device = ?*anyopaque;
 const Temperature = extern struct { version: c_uint, sensor: c_int, temperature: c_int };
 const Utilization = extern struct { gpu: c_uint, memory: c_uint };

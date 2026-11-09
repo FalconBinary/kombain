@@ -1904,12 +1904,20 @@ fn saveLearned(now: i64, force: bool) void {
     _ = sys.replaceFile(learnedPath(&path_buf), buf[0..n]);
 }
 
+/// How often to look: four times a second while a fan is held or a chip is near its limit, twice
+/// while one is within 20 C of it, once a second while every chip is further away still. A
+/// laptop at rest sits 30 C under its limit for hours: two wakeups a second there were the
+/// daemon's whole cost (0.17 ms of CPU a second, measured), and the CPU's own throttle and the
+/// burst limit stand behind a second's delay as behind a half's.
 fn tickMs() i64 {
+    var nearest: f32 = 1000;
     for (fans[0..nfans]) |*f| if (f.managed) return 250;
     for (chips[0..nchips]) |*c| {
-        if (c.controlled() and (c.thermal.forecast() > c.limit - control.fan_band or c.throttle.level < 1)) return 250;
+        if (!c.controlled() or !c.thermal.ready or c.asleep) continue;
+        if (c.thermal.forecast() > c.limit - control.fan_band or c.throttle.level < 1) return 250;
+        nearest = @min(nearest, c.limit - c.thermal.forecast());
     }
-    return 500;
+    return if (nearest >= control.rest_margin) 1000 else 500;
 }
 
 fn onStop(_: std.os.linux.SIG) callconv(.c) void {

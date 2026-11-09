@@ -13,6 +13,23 @@
 const std = @import("std");
 const linux = std.os.linux;
 
+/// The default panic handler prints a symbolised stack trace and brings most of std.debug with
+/// it: a third of zcool's size, measured. A bench tool reports its panic in one line.
+pub const std_options: std.Options = .{
+    .enable_segfault_handler = false,
+    .signal_stack_size = null,
+};
+
+pub const panic = std.debug.FullPanic(onPanic);
+
+fn onPanic(msg: []const u8, _: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = linux.write(2, "zjitter: internal error: ".ptr, 25);
+    _ = linux.write(2, msg.ptr, msg.len);
+    _ = linux.write(2, "\n".ptr, 1);
+    linux.exit_group(134);
+}
+
 /// ten minutes at 144 Hz, in .bss
 const max_samples = 144 * 600;
 var samples: [max_samples]u32 = undefined;
@@ -38,9 +55,49 @@ fn print(text: []const u8) void {
     }
 }
 
-fn printf(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    print(std.fmt.bufPrint(&buf, fmt, args) catch return);
+/// Decimal digits of `v` appended to `buf` at `n`: std.fmt would be most of this program.
+fn num(buf: []u8, n: usize, v: u64) usize {
+    var digits: [20]u8 = undefined;
+    var i: usize = digits.len;
+    var x = v;
+    while (true) {
+        i -= 1;
+        digits[i] = @intCast('0' + x % 10);
+        x /= 10;
+        if (x == 0) break;
+    }
+    const len = digits.len - i;
+    @memcpy(buf[n..][0..len], digits[i..]);
+    return n + len;
+}
+
+fn str(buf: []u8, n: usize, s: []const u8) usize {
+    @memcpy(buf[n..][0..s.len], s);
+    return n + s.len;
+}
+
+/// Microseconds sorted by their bytes, four passes of a counting sort: no comparison sort's
+/// generic code, and 86 400 samples take a millisecond.
+fn sortU32(a: []u32) void {
+    var tmp: [max_samples]u32 = undefined;
+    var src = a;
+    var dst: []u32 = tmp[0..a.len];
+    var shift: u5 = 0;
+    while (true) : (shift += 8) {
+        var counts: [257]usize = @splat(0);
+        for (src) |v| counts[((v >> shift) & 0xff) + 1] += 1;
+        for (1..257) |i| counts[i] += counts[i - 1];
+        for (src) |v| {
+            const b = (v >> shift) & 0xff;
+            dst[counts[b]] = v;
+            counts[b] += 1;
+        }
+        const t = src;
+        src = dst;
+        dst = t;
+        if (shift == 24) break;
+    }
+    // four passes: the result is back in `a`
 }
 
 /// The value at rank ceil(p * n) of the sorted samples, 1-based: p99 of 200 is the 198th.
@@ -103,16 +160,46 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     const elapsed = nowNs() - start;
     const sorted = samples[0..count];
-    std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
+    sortU32(sorted);
     const p50 = percentile(sorted, 0.50);
     const p99 = percentile(sorted, 0.99);
     const max = if (count > 0) sorted[count - 1] else 0;
     const tenths = elapsed / 100_000_000;
+    var line: [256]u8 = undefined;
+    var n: usize = 0;
     if (csv) {
-        printf("{d},{d}.{d},{d},{d},{d},{d},{d}\n", .{ hz, tenths / 10, tenths % 10, count, misses, p50, p99, max });
+        n = num(&line, n, hz);
+        n = str(&line, n, ",");
+        n = num(&line, n, tenths / 10);
+        n = str(&line, n, ".");
+        n = num(&line, n, tenths % 10);
+        for ([_]u64{ count, misses, p50, p99, max }) |v| {
+            n = str(&line, n, ",");
+            n = num(&line, n, v);
+        }
     } else {
-        printf("zjitter: {d} Hz for {d}.{d} s: {d} wakes, late {d} us at p50, {d} us at p99, {d} us at most; {d} missed a frame (late by {d} us or more)\n", .{ hz, tenths / 10, tenths % 10, count, p50, p99, max, misses, period / 1000 });
+        n = str(&line, n, "zjitter: ");
+        n = num(&line, n, hz);
+        n = str(&line, n, " Hz for ");
+        n = num(&line, n, tenths / 10);
+        n = str(&line, n, ".");
+        n = num(&line, n, tenths % 10);
+        n = str(&line, n, " s: ");
+        n = num(&line, n, count);
+        n = str(&line, n, " wakes, late ");
+        n = num(&line, n, p50);
+        n = str(&line, n, " us at p50, ");
+        n = num(&line, n, p99);
+        n = str(&line, n, " us at p99, ");
+        n = num(&line, n, max);
+        n = str(&line, n, " us at most; ");
+        n = num(&line, n, misses);
+        n = str(&line, n, " missed a frame (late by ");
+        n = num(&line, n, period / 1000);
+        n = str(&line, n, " us or more)");
     }
+    n = str(&line, n, "\n");
+    print(line[0..n]);
     return 0;
 }
 
@@ -123,4 +210,14 @@ test "percentiles by rank" {
     try std.testing.expectEqual(@as(u32, 10), percentile(&s, 0.95));
     try std.testing.expectEqual(@as(u32, 1), percentile(&s, 0.0));
     try std.testing.expectEqual(@as(u32, 0), percentile(&.{}, 0.5));
+}
+
+test "the counting sort sorts" {
+    var a = [_]u32{ 300000, 5, 70000, 0, 256, 255, 70000, 1 << 31, 42 };
+    sortU32(&a);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 5, 42, 255, 256, 70000, 70000, 300000, 1 << 31 }, &a);
+    var line: [32]u8 = undefined;
+    const n = num(&line, 0, 1234567890123);
+    try std.testing.expectEqualStrings("1234567890123", line[0..n]);
+    try std.testing.expectEqualStrings("0", line[0..num(&line, 0, 0)]);
 }

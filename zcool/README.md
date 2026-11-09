@@ -10,8 +10,8 @@ silent fan curve while everything is cool.
 Under work heavier than the machine can do, it keeps the desktop answering: jobs yield the
 CPU to it, and a process about to starve memory is ended before the system stalls.
 `zcool menu` shows every setting on one screen.
-Pure Zig with no libc: a 296 KiB binary (x86_64) that uses under 200 KiB of memory. NVIDIA's own
-driver needs one more, small program, see below.
+Pure Zig with no libc: a 299 KiB binary (x86_64) with 360 KiB of resident memory. NVIDIA's own
+driver needs one more program of 136 KiB, see below.
 
 It runs on an MSI GF63 Thin 10SC, whose logs found the burst and the slow trim described
 below. Everything else was checked against a thermal simulator. Start with `--dry-run`,
@@ -393,5 +393,10 @@ while a game and the desktop keep theirs; a memory hog ended and the session spa
 the logic. It proves nothing about any real driver or NVIDIA's real library, and a real
 chip's numbers will differ.
 
-On arm64 with a fake `/sys`: 188 KiB of memory. Real sensors are slower to read than
-files, so expect more CPU time than the simulator shows.
+What it costs at rest, against a fake `/sys` on arm64, 60 s: one wakeup a second, less than
+0.1 ms of CPU a second, 360 KiB resident. It reads four times a second while a fan is held or
+a chip is within 8 C of its limit, twice while one is within 20 C, once a second further away;
+a sudden 300 W load from rest in the simulator peaks at 86.6 C for an 85 C limit, against 86.2
+when it read twice a second at rest, and the CPU's own throttle and the burst limit stand
+behind that second. Real sensors are slower to read than files, so expect more CPU time than
+the simulator shows.

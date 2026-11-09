@@ -33,6 +33,8 @@ pub const release_hold: f32 = 5;
 pub const min_level: f32 = 0.3;
 /// Fans return to firmware control after this long with nothing to do.
 pub const release_after: f32 = 20;
+/// Every chip at least this far under its limit is a machine at rest: read once a second.
+pub const rest_margin: f32 = 20;
 
 pub const Thermal = struct {
     temp: f32 = 0,

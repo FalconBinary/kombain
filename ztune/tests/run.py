@@ -60,6 +60,8 @@ ORIGINAL = {
     "sys/block/zram0/queue/rotational": "0",
     "sys/class/power_supply/ADP1/type": "Mains",
     "sys/class/net/wlan0/ifindex": "3",
+    # the kernel's last pid: ztune looks at every process only when it moved
+    "proc/loadavg": "0.10 0.08 0.05 1/412 449",
 }
 
 
@@ -81,11 +83,14 @@ class Machine:
     def value(self, rel):
         return chosen(get(self.path(rel)))
 
-    def fake(self, pid, comm, ticks=0, start=1000):
+    def fake(self, pid, comm, ticks=0, start=1000, announce=True):
         """A process as /proc/PID/stat shows it: utime and stime are the 14th and 15th fields,
-        the start time the 22nd."""
+        the start time the 22nd. A new process moves the kernel's last pid in /proc/loadavg,
+        unless the test wants to see what happens when it did not."""
         fields = ["S"] + ["0"] * 10 + [str(ticks), "0"] + ["0"] * 6 + [str(start)] + ["0"] * 5
         put(self.path(f"proc/{pid}/stat"), f"{pid} ({comm}) " + " ".join(fields))
+        if announce:
+            put(self.path("proc/loadavg"), f"0.10 0.08 0.05 1/412 {pid}")
 
     def unfake(self, pid):
         shutil.rmtree(self.path(f"proc/{pid}"), ignore_errors=True)
@@ -147,7 +152,7 @@ def scenario(fn):
 
 def everything_back(r, m, how):
     for rel, value in ORIGINAL.items():
-        if rel.startswith("sys/class") or rel.endswith("rotational") or rel.endswith("lru_gen/enabled"):
+        if rel.startswith("sys/class") or rel.endswith("rotational") or rel.endswith("lru_gen/enabled") or rel == "proc/loadavg":
             continue
         # dirty_bytes is the kernel's to zero when dirty_ratio is written back
         if rel.endswith("dirty_bytes") or rel.endswith("dirty_background_bytes"):
@@ -261,6 +266,27 @@ def a_game_gets_links_awake_on_battery_too(r):
     m.unfake(4001)
     time.sleep(4)
     r.check(m.value("sys/module/pcie_aspm/parameters/policy") == "powersupersave", "the game is over")
+    m.stop()
+    m.close()
+
+
+@scenario
+def processes_are_looked_at_only_when_a_pid_was_handed_out(r):
+    m = Machine(mains=False)
+    m.start()
+    time.sleep(4)
+    # a game appears without the kernel's last pid moving: ztune has no reason to look yet
+    m.fake(4000, "gamescope", announce=False)
+    time.sleep(7)
+    r.check("now: game" not in m.text(), "no new pid, no look at the processes")
+    # the pid moves: the next look finds it
+    put(m.path("proc/loadavg"), "0.10 0.08 0.05 1/412 4000")
+    time.sleep(4)
+    r.check("now: game on battery, gamescope runs" in m.text(), m.text()[-300:])
+    # in a game nothing new has to start for ztune to notice its end
+    m.unfake(4000)
+    time.sleep(4)
+    r.check("now: desktop on battery" in m.text().split("now: game")[-1], m.text()[-300:])
     m.stop()
     m.close()
 
