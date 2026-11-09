@@ -79,6 +79,50 @@ jobs:
       - name: gconv cache
         run: sh tests/gconv-cache.sh
 
+  kernel:
+    name: Kernel template, build script, workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      # the image kernel/build.sh runs in: a bootstrapped xbps-src masterdir
+      image: ghcr.io/void-linux/void-buildroot-glibc:latest
+    steps:
+      - name: Install the tools
+        run: |
+          xbps-install -Syu xbps
+          xbps-install -Syu
+          xbps-install -y git curl tar shellcheck
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Void's files are Void's, at the pinned commit
+        run: |
+          commit=$(cat kernel/void-packages.commit)
+          git init -q /tmp/void-packages
+          git -C /tmp/void-packages remote add origin https://github.com/void-linux/void-packages.git
+          git -C /tmp/void-packages fetch -q --depth 1 origin "$commit"
+          git -C /tmp/void-packages checkout -q --detach FETCH_HEAD
+          void=/tmp/void-packages/srcpkgs/linux6.18
+          ours=kernel/srcpkgs/linux6.18-kombain
+          cmp "$void/files/x86_64-dotconfig" "$ours/files/x86_64-dotconfig"
+          cmp "$void/files/mv-debug" "$ours/files/mv-debug"
+          diff -r "$void/patches" "$ours/patches"
+          test "$(sed -n 's/^version=//p' "$void/template")" = "$(sed -n 's/^version=//p' "$ours/template")"
+          diff <(sed -n '/^checksum=/,/^$/p' "$void/template") <(sed -n '/^checksum=/,/^$/p' "$ours/template")
+      - name: The template, in void-packages at that commit
+        # the same script the kernel workflow runs, up to xlint and the template's metadata
+        run: BUILD=/tmp sh kernel/build.sh show
+      - name: The workflows
+        # actionlint runs shellcheck over every run step; warnings and errors count, style notes
+        # (a `!` on purpose, single quotes passed on to su) do not
+        env:
+          SHELLCHECK_OPTS: -S warning
+        run: |
+          curl -fsSL -o /tmp/actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint -color
+      - name: The scripts
+        run: shellcheck kernel/build.sh kernel/refresh.sh
+
   install:
     name: install.sh on a clean system
     runs-on: ubuntu-24.04
