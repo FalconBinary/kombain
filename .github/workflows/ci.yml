@@ -56,6 +56,14 @@ jobs:
           zig build fake-nvml
           chmod -R a+rX .
           python3 tests/sim.py zig-out/bin/zcool
+      - name: ztune
+        working-directory: ztune
+        run: |
+          zig fmt --check src build.zig
+          zig test src/all_tests.zig
+          zig build -Doptimize=ReleaseSafe
+          chmod -R a+rX .
+          python3 tests/run.py zig-out/bin/ztune
       - name: Firewall, with real traffic between network namespaces
         run: sh tests/firewall.sh
       - name: setup.sh, its logic and dry runs
@@ -82,15 +90,17 @@ jobs:
           ./install.sh --user dev
       - name: What it should have left
         run: |
-          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool zcool-nvidia kombain-report mango foot swaylock nft; do
+          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool zcool-nvidia ztune kombain-report mango foot swaylock nft; do
             command -v "$c"
           done
           su dev -s /usr/local/bin/fdash -c 'echo "fdash runs as $USER"'
           su dev -s /bin/sh -c 'mango -p'
           zcool list
+          ztune check
           kombain-report --seconds 2 --out /tmp/report.txt
           ! grep 'kombain-report: [0-9]*:' /tmp/report.txt
           test ! -e /etc/runit/runsvdir/default/zcool
+          test ! -e /etc/runit/runsvdir/default/ztune
           test -s /etc/nftables.conf
           test -s /etc/sysctl.d/90-local.conf
           test -z "$(git status --short)"

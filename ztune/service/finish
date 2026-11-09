@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs after any exit, also kill -9 or the OOM killer: what ztune set goes back.
+/usr/local/bin/ztune restore

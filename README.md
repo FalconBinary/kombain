@@ -25,6 +25,7 @@ mango, dependencies included, from the Void x86_64 index in November 2026.
 | Screen lock | swaylock | 0.1 MiB | |
 | Firewall | nftables, loaded before the network | 25.4 MiB | |
 | Temperatures | [zcool](zcool/): a limit per chip, CPU and every GPU, fans first and no faster than the heat needs, then a little power; learns what the cooler carries; an MSI EC's fans at any speed through a curve of its own; `zcool calibrate` measures what each fan speed carries and what each watt buys; `zcool dump` shows the CPU's registers, clocks, GPUs and EC; turbo, energy preference, quiet fans and lower limits on battery; the EC's silent fan curve when cool; the CPU's short-term power limit and its own throttle just above the limit; jobs yield the CPU to the desktop and a memory hog is ended before a freeze; `zcool menu` for every setting; a GPU that shows nothing sleeps when idle | 0.3 MiB, 0.2 MiB more with NVIDIA's driver | |
+| System | [ztune](ztune/): the rest tuned to what the machine does, on mains and on battery: PCIe link power, Wi-Fi power saving, writeback, dirty memory, huge pages, MGLRU's working set, kswapd's watermark, I/O schedulers, the NMI watchdog; games and builds found by their processes, a build's processes as SCHED_BATCH so the desktop stays smooth; `ztune calibrate` finds the jobs builds run fastest with | 0.1 MiB | tuned, TLP, auto-cpufreq |
 | Search | ripgrep, fd, fzf, jq | 15.3 MiB | |
 | Multiplexer | tmux | 1.6 MiB | zellij (49.3 MiB) |
 | Files | nnn | 0.4 MiB | yazi (41.2 MiB) |

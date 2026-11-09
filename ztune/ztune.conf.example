@@ -1,0 +1,29 @@
+# /etc/ztune.conf: what ztune leaves alone, and what it should know. See ztune/README.md.
+# Everything is on unless it says no here.
+
+# PCIe link power: deep sleep on battery, the firmware's own on mains, awake in a game.
+# aspm = no
+
+# Wi-Fi power saving: on on battery, off on mains and in a game.
+# wifi = no
+
+# MGLRU keeps a second's working set, kswapd reclaims early, huge pages for builds.
+# memory = no
+
+# Writeback once a minute on battery; a little dirty memory on the desktop, more in a build;
+# the I/O scheduler each disk is best with.
+# disk = no
+
+# The NMI watchdog off: a perf counter and wakeups nobody uses.
+# nmi_watchdog = no
+
+# Builds and games found by their processes, and what they get.
+# build = no
+# game = no
+
+# One more name that means a game runs, or a build (as /proc shows it, 15 characters).
+# game.add = mygame
+# build.add = tsc
+
+# The jobs builds run, instead of what `ztune calibrate` measures.
+# jobs = 8

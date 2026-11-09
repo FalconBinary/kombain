@@ -859,7 +859,7 @@ Done. In the boot menu, Void Dev asks for two passphrases and Void Gaming for on
   ${disk}${suffix}2  LUKS UUID $root_uuid  the system and games
   ${disk}${suffix}3  LUKS UUID $dev_uuid  your files
 
-After the first boot, see step 11 of the guide for Steam and for zcool, and step 12 for
+After the first boot, see step 11 of the guide for Steam, zcool and ztune, and step 12 for
 Secure Boot: until then, someone with access to the machine could replace the kernel on /boot.
 EOF
 	ask "Remove the installation stick and press Enter to reboot: " >/dev/null
@@ -907,7 +907,7 @@ main() {
 	fi
 	ask_network
 	echo
-	ask_yes "Install the desktop and tools (mango, netline, fdash, zcool)?" y || desktop=0
+	ask_yes "Install the desktop and tools (mango, netline, fdash, zcool, ztune)?" y || desktop=0
 
 	prepare_steps
 	[ "$dry_run" -eq 1 ] || confirm_erase

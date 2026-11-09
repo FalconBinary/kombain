@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs the kombain stack on Void Linux (glibc). Run as root from the repository:
 #
-#   ./install.sh --user NAME [--no-gui] [--no-netline] [--no-zcool] [--extras]
+#   ./install.sh --user NAME [--no-gui] [--no-netline] [--no-zcool] [--no-ztune] [--extras]
 #
 # Safe to run again. /bin/sh stays plain dash, existing dotfiles are never overwritten.
 set -eu
@@ -17,6 +17,7 @@ user=
 gui=1
 netline=1
 zcool=1
+ztune=1
 extras=0
 
 usage() {
@@ -30,6 +31,7 @@ while [ $# -gt 0 ]; do
 	--no-gui) gui=0 ;;
 	--no-netline) netline=0 ;;
 	--no-zcool) zcool=0 ;;
+	--no-ztune) ztune=0 ;;
 	--extras) extras=1 ;;
 	-h|--help) usage 0 ;;
 	*) echo "unknown option: $1" >&2; usage 2 ;;
@@ -134,7 +136,7 @@ if [ "$gui" -eq 1 ]; then
 	[ -e /etc/security/limits.d/90-audio.conf ] || install -m 644 "$here/config/audio-limits.conf" /etc/security/limits.d/90-audio.conf
 fi
 
-if [ "$zcool" -eq 1 ] || { [ "$gui" -eq 1 ] && [ "$netline" -eq 1 ]; }; then
+if [ "$zcool" -eq 1 ] || [ "$ztune" -eq 1 ] || { [ "$gui" -eq 1 ] && [ "$netline" -eq 1 ]; }; then
 	echo "==> zig"
 	# Void's zig is too old for these, so a checksummed release is used for the build only
 	case $(uname -m) in
@@ -186,6 +188,28 @@ if [ "$zcool" -eq 1 ]; then
 		echo "created /etc/zcool.conf"
 	fi
 	echo "zcool is installed but not running. Start with: zcool list, then zcool run --dry-run (see zcool/README.md)"
+fi
+
+if [ "$ztune" -eq 1 ]; then
+	echo "==> ztune"
+	tar -C "$here" --exclude='ztune/.zig-cache' --exclude='ztune/zig-out' -cf - ztune | tar -C "$work" -xf -
+	chown -R nobody:"$(id -g nobody)" "$work/ztune"
+	(
+		cd "$work/ztune"
+		unprivileged env ZIG_LOCAL_CACHE_DIR="$work/cache" ZIG_GLOBAL_CACHE_DIR="$work/global-cache" \
+			"$zig" build -Doptimize=ReleaseSafe --prefix "$work/out-ztune"
+	)
+	install -m 755 "$work/out-ztune/bin/ztune" /usr/local/bin/ztune
+	install -d /etc/sv/ztune/log
+	install -m 755 "$here/ztune/service/run" "$here/ztune/service/finish" /etc/sv/ztune/
+	install -m 755 "$here/ztune/service/log/run" /etc/sv/ztune/log/
+	if [ -e /etc/ztune.conf ]; then
+		echo "kept /etc/ztune.conf"
+	else
+		install -m 644 "$here/ztune/ztune.conf.example" /etc/ztune.conf
+		echo "created /etc/ztune.conf"
+	fi
+	echo "ztune is installed but not running. Start with: ztune check, then ztune run --dry-run (see ztune/README.md)"
 fi
 
 # what a real machine says about itself: the guide's step 14

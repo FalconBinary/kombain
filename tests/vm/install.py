@@ -939,6 +939,12 @@ class Run:
         dry = self.out("timeout 5 zcool run --dry-run; true")
         print(dry, flush=True)
         self.expect("zcool: dry run on the real kernel, Landlock active", "sandbox: active" in dry, dry[:200])
+        check = self.out("ztune check")
+        print(check, flush=True)
+        self.expect("ztune: check reads the real kernel", "huge pages" in check and "writeback every" in check, check[:300])
+        dry = self.out("timeout 8 ztune run --dry-run; true")
+        print(dry, flush=True)
+        self.expect("ztune: dry run on the real kernel, Landlock active", "sandbox: active" in dry and "now: " in dry, dry[:300])
 
     def check_mango(self):
         """mango on a real DRM device (virtio-gpu with software rendering) through the guide's own login."""
