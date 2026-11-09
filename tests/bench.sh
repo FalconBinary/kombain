@@ -33,6 +33,16 @@ check "boot: the CSV row carries the label and the kernel" "test,yes" "$(tail -1
 check "boot: the CSV values" "8.50,2.345678,11.85,0.90,4.20,19.30" "$(tail -1 "$work/results/boot.csv" | cut -d, -f7-)"
 check "boot: the header once" "1" "$(grep -c '^label,' "$work/results/boot.csv")"
 
+mkdir -p "$work/initrd/markers" && printf '[    0.000000] Linux version 6.18.62_1\n[    1.500000] Run /init as init process\n' > "$work/initrd/dmesg.txt"
+out=$("$bench" boot --from "$work/initrd" --label test 2>&1)
+check "boot: the kernel's time with an initramfs (Run /init)" "1.500000 s" "$(printf '%s\n' "$out" | sed -n 's/.*ran the initramfs *\([0-9.]* s\).*/\1/p')"
+
+mkdir -p "$work/nolog/markers"
+out=$("$bench" boot --from "$work/nolog" --label test 2>&1); code=$?
+check "boot: without a kernel log it still reports and exits 0" "0" "$code"
+check "boot: says the kernel log is missing" "1" "$(printf '%s\n' "$out" | grep -c 'no kernel log')"
+check "boot: and that the markers come with the next boot" "1" "$(printf '%s\n' "$out" | grep -c 'next boot')"
+
 out=$("$bench" game "$repo/tests/bench/mangohud.csv" --label test 2>&1)
 check "game: frames, fps, 1% low, p50, p99, max" "200,96.2,20.0,10.00,10.00,50.00" "$(printf '%s\n' "$out" | sed -n 's/.*max_ms = //p')"
 

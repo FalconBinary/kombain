@@ -89,20 +89,30 @@ boot() {
 		shift
 	done
 	set_label
+	dmesg_note=
 	if [ -n "$from" ]; then
-		dmesg_text=$(cat "$from/dmesg.txt" 2>/dev/null)
+		dmesg_text=$(cat "$from/dmesg.txt" 2>/dev/null) || dmesg_note="no kernel log in $from"
 		fpdt=$from/fpdt
 		markers=$from/markers
 		session=$from/markers/session-start
 		desktop=$from/markers/desktop-ready
 	else
-		dmesg_text=$(dmesg -k 2>/dev/null) || die "dmesg is root's here (kernel.dmesg_restrict): doas kombain-bench boot"
+		dmesg_note=
+		if ! dmesg_text=$(dmesg -k 2>/dev/null); then
+			dmesg_text=
+			if [ "$(id -u)" -ne 0 ]; then
+				dmesg_note="the kernel log is root's here (kernel.dmesg_restrict): doas kombain-bench boot reads it"
+			else
+				dmesg_note="the kernel log cannot be read here (a container?)"
+			fi
+		fi
 		fpdt=/sys/firmware/acpi/fpdt/boot
 		markers=/run/kombain-bench
 		session=$(ls /run/user/*/kombain-session-start 2>/dev/null | head -1)
 		desktop=$(ls /run/user/*/kombain-desktop-ready 2>/dev/null | head -1)
 	fi
-	kernel_s=$(printf '%s\n' "$dmesg_text" | sed -n 's/^\[ *\([0-9.]*\)\] Run \/sbin\/init as init process.*/\1/p' | head -1)
+	# "Run /init as init process" with an initramfs, "/sbin/init" without one
+	kernel_s=$(printf '%s\n' "$dmesg_text" | sed -n 's/^\[ *\([0-9.]*\)\] Run [^ ]* as init process.*/\1/p' | head -1)
 	[ -n "$kernel_s" ] || kernel_s=-
 	firmware_s=-
 	if [ -r "$fpdt/firmware_start_ns" ] && [ -r "$fpdt/exitbootservice_end_ns" ]; then
@@ -123,6 +133,7 @@ boot() {
 	echo "  stage 1 (runit core-services)                $stage1_s s"
 	echo "  services to the desktop                      $services_s s"
 	echo "  uptime when the desktop was up               $desk s"
+	[ -z "$dmesg_note" ] || echo "  $dmesg_note"
 	if [ "$s1_start" = - ]; then
 		echo "  no stage 1 markers of this boot: they come with the next boot (install.sh put them in /etc/runit/core-services)"
 	fi

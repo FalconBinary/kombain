@@ -947,7 +947,10 @@ class Run:
         self.expect("ztune: dry run on the real kernel, Landlock active", "sandbox: active" in dry and "now: " in dry, dry[:300])
         boot = self.out("kombain-bench boot; true")
         print(boot, flush=True)
-        self.expect("kombain-bench: boot reads the real kernel's dmesg", "ran the initramfs" in boot and "next boot" in boot, boot[:300])
+        # installed by install.sh in the chroot (setup.sh) the markers are there at this boot; after a boot (the guide) they come with the next
+        kernel_line = [l for l in boot.splitlines() if "ran the initramfs" in l]
+        self.expect("kombain-bench: boot reads the real kernel's dmesg", bool(kernel_line) and " s" in kernel_line[0] and "- s" not in kernel_line[0], boot[:400])
+        self.expect("kombain-bench: stage 1 measured or announced for the next boot", "stage 1 (runit core-services)" in boot and ("next boot" in boot or "stage 1 (runit core-services)                - s" not in boot), boot[:400])
 
     def check_mango(self):
         """mango on a real DRM device (virtio-gpu with software rendering) through the guide's own login."""
