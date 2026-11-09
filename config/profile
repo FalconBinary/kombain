@@ -1,5 +1,7 @@
 # Starts the session on the first console. Every shell reads this at login.
 export EDITOR=nvi
 if [ "$(tty)" = /dev/tty1 ]; then
+	# when the session began, for `kombain-bench boot`
+	command -v kombain-bench >/dev/null && kombain-bench mark session-start
 	exec dbus-run-session mango
 fi

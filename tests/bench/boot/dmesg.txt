@@ -1,0 +1,5 @@
+[    0.000000] Linux version 6.18.59_1 (void@void) (gcc) #1 SMP PREEMPT_DYNAMIC
+[    0.412345] ACPI: FPDT 0x000000005E7A3000 000044 (v01 MSI    MEGABOOK 00000001 MSFT 00000001)
+[    2.345678] Run /sbin/init as init process
+[    2.345700]   with arguments:
+[    9.100000] EXT4-fs (dm-0): mounted

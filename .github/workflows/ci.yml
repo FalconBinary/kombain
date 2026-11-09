@@ -64,6 +64,14 @@ jobs:
           zig build -Doptimize=ReleaseSafe
           chmod -R a+rX .
           python3 tests/run.py zig-out/bin/ztune
+      - name: kombain-bench
+        working-directory: bench
+        run: |
+          zig fmt --check src build.zig
+          zig build test
+          zig build -Doptimize=ReleaseSafe
+          chmod -R a+rX .
+          sh ../tests/bench.sh zig-out/bin/zjitter
       - name: Firewall, with real traffic between network namespaces
         run: sh tests/firewall.sh
       - name: setup.sh, its logic and dry runs
@@ -90,13 +98,15 @@ jobs:
           ./install.sh --user dev
       - name: What it should have left
         run: |
-          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool zcool-nvidia ztune kombain-report mango foot swaylock nft; do
+          for c in fdash netline zrun zwifi zbt zbg zwall zpower zcal zcool zcool-nvidia ztune kombain-bench zjitter kombain-report mango foot swaylock nft; do
             command -v "$c"
           done
           su dev -s /usr/local/bin/fdash -c 'echo "fdash runs as $USER"'
           su dev -s /bin/sh -c 'mango -p'
           zcool list
           ztune check
+          kombain-bench boot | grep -E 'stage 1|next boot'
+          test -s /etc/runit/core-services/01-kombain-bench.sh
           kombain-report --seconds 2 --out /tmp/report.txt
           ! grep 'kombain-report: [0-9]*:' /tmp/report.txt
           test ! -e /etc/runit/runsvdir/default/zcool

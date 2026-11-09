@@ -1,0 +1,407 @@
+#!/bin/sh
+# kombain-bench: real measurements of this machine, before and after a change, so that
+# "faster", "lighter" and "quieter" are numbers. Every run appends a row to a CSV in the
+# results directory; `summary` prints medians and p95 per label. The method: bench/README.md.
+#
+#   kombain-bench boot [--label L] [--from DIR]            this boot's stages, firmware to desktop (root)
+#   kombain-bench idle [--seconds N] [--label L]           wakeups, memory, power at rest (more as root)
+#   kombain-bench jitter [--seconds N] [--hz N] [--label L]  how late a 144 Hz task wakes, nothing else running
+#   kombain-bench build [--jobs N] [--runs N] [--tree DIR] [--label L]
+#                                                          a C build: seconds, joules, the desktop's jitter under it
+#   kombain-bench game FILE.csv [--label L]                a MangoHud log: frame times
+#   kombain-bench battery [--minutes N] [--label L]        watts from the battery while you use the machine
+#   kombain-bench summary [FILE...]                        medians and p95 of what was measured, per label
+#   kombain-bench mark NAME                                writes a marker (the session does, see README)
+#
+# Results go to $KOMBAIN_BENCH_DIR, by default /var/tmp/kombain-bench. The label of a row is
+# what you compare: by default the kernel and PID 1, like 6.18.59_1/runit.
+set -u
+
+dir=${KOMBAIN_BENCH_DIR:-/var/tmp/kombain-bench}
+zjitter=${ZJITTER:-zjitter}
+
+usage() {
+	sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+	exit "$1"
+}
+
+die() {
+	echo "kombain-bench: $*" >&2
+	exit 1
+}
+
+uptime_s() {
+	cut -d' ' -f1 /proc/uptime
+}
+
+init_name() {
+	cat /proc/1/comm 2>/dev/null || echo '?'
+}
+
+mode() {
+	if grep -qw gaming /proc/cmdline 2>/dev/null; then echo gaming; else echo dev; fi
+}
+
+power_source() {
+	for s in /sys/class/power_supply/*; do
+		[ -e "$s/type" ] || continue
+		if [ "$(cat "$s/type")" = Mains ]; then
+			if [ "$(cat "$s/online" 2>/dev/null)" = 1 ]; then echo mains; else echo battery; fi
+			return
+		fi
+	done
+	echo mains
+}
+
+label=
+set_label() {
+	[ -n "$label" ] || label="$(uname -r)/$(init_name)"
+}
+
+# row FILE HEADER VALUES: appends one row, the header first when the file is new.
+row() {
+	mkdir -p "$dir" 2>/dev/null || die "cannot create $dir"
+	f=$dir/$1
+	[ -e "$f" ] || echo "label,utc,kernel,init,mode,source,$2" > "$f"
+	echo "$label,$(date -u +%Y-%m-%dT%H:%M:%SZ),$(uname -r),$(init_name),$(mode),$(power_source),$3" >> "$f"
+	echo "  -> $f"
+}
+
+# The value at rank ceil(p*n) of sorted numbers on stdin; "-" when there are none.
+rank() {
+	sort -n | awk -v p="$1" '{ v[NR] = $1 } END { if (NR == 0) { print "-"; exit } r = int(p * NR + 0.999999); if (r < 1) r = 1; print v[r] }'
+}
+
+num() {
+	awk -v a="$1" -v b="$2" -v op="$3" 'BEGIN { if (a == "-" || b == "-") { print "-"; exit } if (op == "-") printf "%.2f\n", a - b; else if (op == "/") printf "%.2f\n", (b == 0 ? 0 : a / b); else printf "%.2f\n", a + b }'
+}
+
+# ---------------------------------------------------------------- boot
+
+boot() {
+	from=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--label) label=$2; shift ;;
+		--from) from=$2; shift ;;
+		*) usage 2 ;;
+		esac
+		shift
+	done
+	set_label
+	if [ -n "$from" ]; then
+		dmesg_text=$(cat "$from/dmesg.txt" 2>/dev/null)
+		fpdt=$from/fpdt
+		markers=$from/markers
+		session=$from/markers/session-start
+		desktop=$from/markers/desktop-ready
+	else
+		dmesg_text=$(dmesg -k 2>/dev/null) || die "dmesg is root's here (kernel.dmesg_restrict): doas kombain-bench boot"
+		fpdt=/sys/firmware/acpi/fpdt/boot
+		markers=/run/kombain-bench
+		session=$(ls /run/user/*/kombain-session-start 2>/dev/null | head -1)
+		desktop=$(ls /run/user/*/kombain-desktop-ready 2>/dev/null | head -1)
+	fi
+	kernel_s=$(printf '%s\n' "$dmesg_text" | sed -n 's/^\[ *\([0-9.]*\)\] Run \/sbin\/init as init process.*/\1/p' | head -1)
+	[ -n "$kernel_s" ] || kernel_s=-
+	firmware_s=-
+	if [ -r "$fpdt/firmware_start_ns" ] && [ -r "$fpdt/exitbootservice_end_ns" ]; then
+		firmware_s=$(awk -v a="$(cat "$fpdt/exitbootservice_end_ns")" -v b="$(cat "$fpdt/firmware_start_ns")" 'BEGIN { printf "%.2f\n", (a - b) / 1e9 }')
+	fi
+	s1_start=$(cat "$markers/stage1-start" 2>/dev/null || echo -)
+	s1_end=$(cat "$markers/stage1-end" 2>/dev/null || echo -)
+	sess=$(cat "$session" 2>/dev/null || echo -)
+	desk=$(cat "$desktop" 2>/dev/null || echo -)
+	[ "$desk" = - ] && desk=$sess
+	initrd_s=$(num "$s1_start" "$kernel_s" -)
+	stage1_s=$(num "$s1_end" "$s1_start" -)
+	services_s=$(num "$desk" "$s1_end" -)
+	echo "boot ($label):"
+	echo "  firmware (ACPI FPDT, reset to the loader)   $firmware_s s"
+	echo "  kernel, until it ran the initramfs          $kernel_s s"
+	echo "  initramfs, LUKS and your passphrase          $initrd_s s   (includes the typing: compare with care)"
+	echo "  stage 1 (runit core-services)                $stage1_s s"
+	echo "  services to the desktop                      $services_s s"
+	echo "  uptime when the desktop was up               $desk s"
+	if [ "$s1_start" = - ]; then
+		echo "  no stage 1 markers of this boot: they come with the next boot (install.sh put them in /etc/runit/core-services)"
+	fi
+	if [ "$desk" = - ]; then
+		echo "  no session marker: see bench/README.md, 'markers' (the session writes it at login and when the panel is up)"
+	fi
+	row boot.csv "firmware_s,kernel_s,initrd_luks_s,stage1_s,services_desktop_s,uptime_at_desktop_s" "$firmware_s,$kernel_s,$initrd_s,$stage1_s,$services_s,$desk"
+}
+
+# ---------------------------------------------------------------- idle
+
+stat_field() {
+	# stat_field NAME INDEX: a field of /proc/stat's line NAME
+	awk -v name="$1" -v i="$2" '$1 == name { print $(i + 1); exit }' /proc/stat
+}
+
+cpu_busy_jiffies() {
+	awk '$1 == "cpu" { print $2 + $3 + $4 + $7 + $8; exit }' /proc/stat
+}
+
+cpu_all_jiffies() {
+	awk '$1 == "cpu" { s = 0; for (i = 2; i <= NF; i++) s += $i; print s; exit }' /proc/stat
+}
+
+rapl_uj() {
+	cat /sys/class/powercap/intel-rapl:0/energy_uj 2>/dev/null || echo -
+}
+
+battery_w() {
+	for b in /sys/class/power_supply/*; do
+		[ "$(cat "$b/type" 2>/dev/null)" = Battery ] || continue
+		[ "$(cat "$b/status" 2>/dev/null)" = Discharging ] || { echo -; return; }
+		if [ -r "$b/power_now" ]; then
+			awk -v p="$(cat "$b/power_now")" 'BEGIN { printf "%.2f\n", p / 1e6 }'
+		elif [ -r "$b/current_now" ] && [ -r "$b/voltage_now" ]; then
+			awk -v c="$(cat "$b/current_now")" -v v="$(cat "$b/voltage_now")" 'BEGIN { printf "%.2f\n", c * v / 1e12 }'
+		else
+			echo -
+		fi
+		return
+	done
+	echo -
+}
+
+pss_mib() {
+	[ "$(id -u)" -eq 0 ] || { echo -; return; }
+	awk '/^Pss:/ { s += $2 } END { printf "%.0f\n", s / 1024 }' /proc/[0-9]*/smaps_rollup 2>/dev/null
+}
+
+idle() {
+	seconds=60
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--seconds) seconds=$2; shift ;;
+		--label) label=$2; shift ;;
+		*) usage 2 ;;
+		esac
+		shift
+	done
+	set_label
+	echo "idle ($label): $seconds s, leave the machine alone"
+	i0=$(stat_field intr 1); c0=$(stat_field ctxt 1); b0=$(cpu_busy_jiffies); a0=$(cpu_all_jiffies); e0=$(rapl_uj)
+	bat_samples=$(mktemp)
+	t=0
+	while [ "$t" -lt "$seconds" ]; do
+		sleep 5
+		t=$((t + 5))
+		battery_w >> "$bat_samples"
+	done
+	i1=$(stat_field intr 1); c1=$(stat_field ctxt 1); b1=$(cpu_busy_jiffies); a1=$(cpu_all_jiffies); e1=$(rapl_uj)
+	wakeups=$(awk -v a="$i1" -v b="$i0" -v s="$seconds" 'BEGIN { printf "%.0f\n", (a - b) / s }')
+	ctxt=$(awk -v a="$c1" -v b="$c0" -v s="$seconds" 'BEGIN { printf "%.0f\n", (a - b) / s }')
+	busy=$(awk -v b0="$b0" -v b1="$b1" -v a0="$a0" -v a1="$a1" 'BEGIN { d = a1 - a0; printf "%.1f\n", d > 0 ? 100 * (b1 - b0) / d : 0 }')
+	rapl=-
+	[ "$e0" != - ] && [ "$e1" != - ] && rapl=$(awk -v a="$e1" -v b="$e0" -v s="$seconds" 'BEGIN { printf "%.2f\n", (a - b) / 1e6 / s }')
+	bat=$(grep -v '^-$' "$bat_samples" | rank 0.5)
+	rm -f "$bat_samples"
+	mem=$(awk '/^MemAvailable:/ { printf "%.0f\n", $2 / 1024 }' /proc/meminfo)
+	pss=$(pss_mib)
+	echo "  interrupts per second     $wakeups"
+	echo "  context switches per s    $ctxt"
+	echo "  CPU busy                  $busy %"
+	echo "  memory available          $mem MiB"
+	echo "  memory in use (PSS)       $pss MiB$([ "$pss" = - ] && echo '   (root sees it: doas kombain-bench idle)')"
+	echo "  CPU package power (RAPL)  $rapl W$([ "$rapl" = - ] && echo '   (root reads it)')"
+	echo "  battery power             $bat W$([ "$bat" = - ] && echo '   (on mains, or no battery)')"
+	row idle.csv "seconds,wakeups_per_s,ctxt_per_s,cpu_busy_pct,mem_available_mib,pss_mib,rapl_w,battery_w" "$seconds,$wakeups,$ctxt,$busy,$mem,$pss,$rapl,$bat"
+}
+
+# ---------------------------------------------------------------- jitter
+
+jitter() {
+	seconds=30; hz=144
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--seconds) seconds=$2; shift ;;
+		--hz) hz=$2; shift ;;
+		--label) label=$2; shift ;;
+		*) usage 2 ;;
+		esac
+		shift
+	done
+	set_label
+	command -v "$zjitter" >/dev/null || die "zjitter is not installed (install.sh builds it)"
+	echo "jitter ($label): $hz Hz for $seconds s, nothing else running"
+	line=$("$zjitter" --hz "$hz" --seconds "$seconds" --csv) || die "zjitter failed"
+	echo "  hz,seconds,wakes,misses,p50_us,p99_us,max_us = $line"
+	row jitter.csv "hz,seconds,wakes,misses,p50_us,p99_us,max_us,load" "$line,none"
+}
+
+# ---------------------------------------------------------------- build
+
+build() {
+	jobs=$(nproc 2>/dev/null || echo 4); runs=3; tree=${KOMBAIN_SRC:-$HOME/kombain}/fdash
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--jobs) jobs=$2; shift ;;
+		--runs) runs=$2; shift ;;
+		--tree) tree=$2; shift ;;
+		--label) label=$2; shift ;;
+		*) usage 2 ;;
+		esac
+		shift
+	done
+	set_label
+	[ -f "$tree/Makefile" ] || die "no Makefile in $tree: --tree DIR, or KOMBAIN_SRC=/path/to/kombain"
+	command -v "$zjitter" >/dev/null || die "zjitter is not installed (install.sh builds it)"
+	echo "build ($label): make -j$jobs in $tree, $runs runs after a warm-up; zjitter at 144 Hz beside it"
+	r=0
+	while [ "$r" -le "$runs" ]; do
+		make -C "$tree" clean >/dev/null 2>&1
+		jit=$(mktemp)
+		"$zjitter" --hz 144 --seconds 3600 --csv > "$jit" &
+		jpid=$!
+		e0=$(rapl_uj)
+		t0=$(date +%s.%N)
+		if ! CCACHE_DISABLE=1 make -C "$tree" -j"$jobs" >/dev/null 2>&1; then
+			kill -TERM "$jpid" 2>/dev/null; wait "$jpid" 2>/dev/null; rm -f "$jit"
+			die "the build failed in $tree"
+		fi
+		t1=$(date +%s.%N)
+		e1=$(rapl_uj)
+		kill -TERM "$jpid" 2>/dev/null
+		wait "$jpid" 2>/dev/null
+		seconds=$(awk -v a="$t1" -v b="$t0" 'BEGIN { printf "%.1f\n", a - b }')
+		joules=-
+		[ "$e0" != - ] && [ "$e1" != - ] && joules=$(awk -v a="$e1" -v b="$e0" 'BEGIN { printf "%.0f\n", (a - b) / 1e6 }')
+		jl=$(cat "$jit"); rm -f "$jit"
+		misses=$(echo "$jl" | cut -d, -f4); p99=$(echo "$jl" | cut -d, -f6); max=$(echo "$jl" | cut -d, -f7)
+		if [ "$r" -eq 0 ]; then
+			echo "  warm-up: $seconds s (discarded)"
+		else
+			echo "  run $r: $seconds s, $joules J$([ "$joules" = - ] && echo ' (root reads RAPL)'), desktop jitter: $misses frames missed, p99 $p99 us, max $max us"
+			row build.csv "jobs,run,seconds,joules,jitter_misses,jitter_p99_us,jitter_max_us" "$jobs,$r,$seconds,$joules,$misses,$p99,$max"
+		fi
+		r=$((r + 1))
+	done
+	make -C "$tree" clean >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- game
+
+game() {
+	file=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--label) label=$2; shift ;;
+		-*) usage 2 ;;
+		*) file=$1 ;;
+		esac
+		shift
+	done
+	[ -n "$file" ] && [ -r "$file" ] || die "game FILE.csv: a MangoHud log (MANGOHUD_CONFIG=output_folder=DIR, F2 in the game)"
+	set_label
+	# MangoHud: some lines of system facts, then a header with "frametime" and the rows
+	frametimes=$(awk -F, 'col == 0 { for (i = 1; i <= NF; i++) if ($i == "frametime") col = i; next } col > 0 && $col ~ /^[0-9.]+$/ { print $col }' "$file")
+	n=$(printf '%s\n' "$frametimes" | grep -c .)
+	[ "$n" -gt 0 ] || die "$file: no frametime column"
+	stats=$(printf '%s\n' "$frametimes" | sort -n | awk '{ v[NR] = $1; s += $1 } END {
+		r50 = int(0.50 * NR + 0.999999); r99 = int(0.99 * NR + 0.999999); if (r50 < 1) r50 = 1; if (r99 < 1) r99 = 1
+		worst = int(0.01 * NR + 0.999999); if (worst < 1) worst = 1
+		ws = 0; for (i = NR - worst + 1; i <= NR; i++) ws += v[i]
+		printf "%d,%.1f,%.1f,%.2f,%.2f,%.2f\n", NR, 1000 * NR / s, 1000 * worst / ws, v[r50], v[r99], v[NR] }')
+	echo "game ($label): $file"
+	echo "  frames,avg_fps,low1_fps,p50_ms,p99_ms,max_ms = $stats"
+	row game.csv "file,frames,avg_fps,low1_fps,p50_ms,p99_ms,max_ms" "$(basename "$file"),$stats"
+}
+
+# ---------------------------------------------------------------- battery
+
+battery() {
+	minutes=10
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--minutes) minutes=$2; shift ;;
+		--label) label=$2; shift ;;
+		*) usage 2 ;;
+		esac
+		shift
+	done
+	set_label
+	[ "$(battery_w)" != - ] || die "not discharging: unplug the charger first"
+	echo "battery ($label): $minutes min, use the machine as you mean to measure it"
+	samples=$(mktemp)
+	t=0
+	while [ "$t" -lt $((minutes * 60)) ]; do
+		sleep 5
+		t=$((t + 5))
+		battery_w >> "$samples"
+	done
+	med=$(grep -v '^-$' "$samples" | rank 0.5)
+	p95=$(grep -v '^-$' "$samples" | rank 0.95)
+	rm -f "$samples"
+	bright=-
+	for b in /sys/class/backlight/*; do
+		[ -r "$b/brightness" ] && bright=$(awk -v a="$(cat "$b/brightness")" -v m="$(cat "$b/max_brightness")" 'BEGIN { printf "%.0f\n", 100 * a / m }') && break
+	done
+	hours=-
+	for b in /sys/class/power_supply/*; do
+		[ "$(cat "$b/type" 2>/dev/null)" = Battery ] || continue
+		if [ -r "$b/energy_now" ] && [ "$med" != - ]; then
+			hours=$(awk -v e="$(cat "$b/energy_now")" -v w="$med" 'BEGIN { printf "%.1f\n", w > 0 ? e / 1e6 / w : 0 }')
+		fi
+		break
+	done
+	echo "  battery power    $med W (median), $p95 W (p95)"
+	echo "  brightness       $bright %"
+	echo "  at this rate     $hours h left"
+	row battery.csv "minutes,median_w,p95_w,brightness_pct,hours_left" "$minutes,$med,$p95,$bright,$hours"
+}
+
+# ---------------------------------------------------------------- summary
+
+summary() {
+	if [ $# -eq 0 ]; then
+		set -- "$dir"/*.csv
+	fi
+	for f in "$@"; do
+		[ -r "$f" ] || continue
+		echo "$(basename "$f" .csv):"
+		awk -F, '
+		NR == 1 { for (i = 1; i <= NF; i++) name[i] = $i; cols = NF; next }
+		{
+			n[$1]++
+			for (i = 7; i <= cols; i++) if ($i ~ /^-?[0-9.]+$/) { k = $1 SUBSEP i; v[k, ++c[k]] = $i + 0 }
+		}
+		END {
+			for (l in n) {
+				printf "  %s  (%d rows)\n", l, n[l]
+				for (i = 7; i <= cols; i++) {
+					k = l SUBSEP i; m = c[k]
+					if (m == 0) continue
+					for (a = 1; a <= m; a++) x[a] = v[k, a]
+					for (a = 2; a <= m; a++) { t = x[a]; b = a - 1; while (b >= 1 && x[b] > t) { x[b + 1] = x[b]; b-- } x[b + 1] = t }
+					r50 = int(0.50 * m + 0.999999); r95 = int(0.95 * m + 0.999999)
+					printf "    %-22s median %-10s p95 %-10s n %d\n", name[i], x[r50], x[r95], m
+				}
+			}
+		}' "$f"
+	done
+}
+
+# ---------------------------------------------------------------- markers
+
+mark() {
+	[ $# -eq 1 ] || usage 2
+	d=${XDG_RUNTIME_DIR:-/tmp}
+	uptime_s > "$d/kombain-$1" 2>/dev/null
+}
+
+case ${1:-} in
+boot) shift; boot "$@" ;;
+idle) shift; idle "$@" ;;
+jitter) shift; jitter "$@" ;;
+build) shift; build "$@" ;;
+game) shift; game "$@" ;;
+battery) shift; battery "$@" ;;
+summary) shift; summary "$@" ;;
+mark) shift; mark "$@" ;;
+-h|--help|help|'') usage 0 ;;
+*) usage 2 ;;
+esac

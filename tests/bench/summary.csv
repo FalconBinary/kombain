@@ -1,0 +1,7 @@
+label,utc,kernel,init,mode,source,seconds,joules
+A,t,k,i,dev,mains,1,10
+A,t,k,i,dev,mains,2,20
+A,t,k,i,dev,mains,3,30
+A,t,k,i,dev,mains,4,40
+A,t,k,i,dev,mains,5,50
+B,t,k,i,dev,mains,7,-

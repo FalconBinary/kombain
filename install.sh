@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs the kombain stack on Void Linux (glibc). Run as root from the repository:
 #
-#   ./install.sh --user NAME [--no-gui] [--no-netline] [--no-zcool] [--no-ztune] [--extras]
+#   ./install.sh --user NAME [--no-gui] [--no-netline] [--no-zcool] [--no-ztune] [--no-bench] [--extras]
 #
 # Safe to run again. /bin/sh stays plain dash, existing dotfiles are never overwritten.
 set -eu
@@ -18,6 +18,7 @@ gui=1
 netline=1
 zcool=1
 ztune=1
+bench=1
 extras=0
 
 usage() {
@@ -32,6 +33,7 @@ while [ $# -gt 0 ]; do
 	--no-netline) netline=0 ;;
 	--no-zcool) zcool=0 ;;
 	--no-ztune) ztune=0 ;;
+	--no-bench) bench=0 ;;
 	--extras) extras=1 ;;
 	-h|--help) usage 0 ;;
 	*) echo "unknown option: $1" >&2; usage 2 ;;
@@ -136,7 +138,7 @@ if [ "$gui" -eq 1 ]; then
 	[ -e /etc/security/limits.d/90-audio.conf ] || install -m 644 "$here/config/audio-limits.conf" /etc/security/limits.d/90-audio.conf
 fi
 
-if [ "$zcool" -eq 1 ] || [ "$ztune" -eq 1 ] || { [ "$gui" -eq 1 ] && [ "$netline" -eq 1 ]; }; then
+if [ "$zcool" -eq 1 ] || [ "$ztune" -eq 1 ] || [ "$bench" -eq 1 ] || { [ "$gui" -eq 1 ] && [ "$netline" -eq 1 ]; }; then
 	echo "==> zig"
 	# Void's zig is too old for these, so a checksummed release is used for the build only
 	case $(uname -m) in
@@ -210,6 +212,23 @@ if [ "$ztune" -eq 1 ]; then
 		echo "created /etc/ztune.conf"
 	fi
 	echo "ztune is installed but not running. Start with: ztune check, then ztune run --dry-run (see ztune/README.md)"
+fi
+
+if [ "$bench" -eq 1 ]; then
+	echo "==> kombain-bench"
+	tar -C "$here" --exclude='bench/.zig-cache' --exclude='bench/zig-out' -cf - bench | tar -C "$work" -xf -
+	chown -R nobody:"$(id -g nobody)" "$work/bench"
+	(
+		cd "$work/bench"
+		unprivileged env ZIG_LOCAL_CACHE_DIR="$work/cache" ZIG_GLOBAL_CACHE_DIR="$work/global-cache" \
+			"$zig" build -Doptimize=ReleaseSafe --prefix "$work/out-bench"
+	)
+	install -m 755 "$work/out-bench/bin/zjitter" /usr/local/bin/zjitter
+	install -m 755 "$here/bench/kombain-bench" /usr/local/bin/kombain-bench
+	# the stage 1 markers `kombain-bench boot` reads; they take effect at the next boot
+	install -m 644 "$here/config/bench-stage1-start.sh" /etc/runit/core-services/01-kombain-bench.sh
+	install -m 644 "$here/config/bench-stage1-end.sh" /etc/runit/core-services/99-zz-kombain-bench.sh
+	echo "kombain-bench is installed: doas kombain-bench boot after the next boot, kombain-bench build (see bench/README.md)"
 fi
 
 # what a real machine says about itself: the guide's step 14

@@ -945,6 +945,9 @@ class Run:
         dry = self.out("timeout 8 ztune run --dry-run; true")
         print(dry, flush=True)
         self.expect("ztune: dry run on the real kernel, Landlock active", "sandbox: active" in dry and "now: " in dry, dry[:300])
+        boot = self.out("kombain-bench boot; true")
+        print(boot, flush=True)
+        self.expect("kombain-bench: boot reads the real kernel's dmesg", "ran the initramfs" in boot and "next boot" in boot, boot[:300])
 
     def check_mango(self):
         """mango on a real DRM device (virtio-gpu with software rendering) through the guide's own login."""
