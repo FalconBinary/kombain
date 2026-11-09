@@ -40,6 +40,9 @@ pub const Thermal = struct {
     temp: f32 = 0,
     slope: f32 = 0,
     ready: bool = false,
+    /// where the machine's model says the die will be two seconds on, when there is one: the
+    /// time a fan takes to spin up, which is all the model's forecast needs to run ahead
+    model_forecast: ?f32 = null,
 
     pub fn update(self: *Thermal, raw: f32, dt: f32) void {
         if (!self.ready) {
@@ -54,7 +57,9 @@ pub const Thermal = struct {
     }
 
     /// Only a rising temperature moves the forecast: a falling one must not relax anything early.
+    /// With a model of the machine its word stands, hedged by a little of the slope's.
     pub fn forecast(self: *const Thermal) f32 {
+        if (self.model_forecast) |m| return @max(m, self.temp + std.math.clamp(self.slope * horizon, 0, 3));
         return self.temp + std.math.clamp(self.slope * horizon, 0, max_lead);
     }
 };

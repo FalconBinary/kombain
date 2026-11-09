@@ -132,6 +132,42 @@ The service stops while it runs and starts again after. Ctrl-C, or any chip 4 C 
 stops it: nothing is kept and everything is put back. It goes to `/var/lib/zcool/calibration`;
 `zcool list` shows it. Calibrate again after cleaning the fans or a new paste.
 
+## A model of the machine's heat
+
+`doas zcool calibrate --long`, plugged in, as long as it takes (up to about 40 minutes on a
+laptop, after the short calibration's own minutes): zcool measures three things and keeps them
+in `/var/lib/zcool/model`:
+
+- how far the die sits above its heat sink per watt, from the jump a sensor shows the moment
+  power steps up (three steps, every fan at full);
+- what the cooler carries per degree over the room at each fan speed, from the steady state of
+  each speed at two powers under what it carries, each held until the temperature settles; the
+  sink's thermal mass comes from how long each settling took;
+- the room's temperature, read with the load off and every fan at full.
+
+With the model zcool knows where the temperature goes, instead of extrapolating where it was
+going. It follows the sink's temperature by the model's own account, corrected by the reading:
+the die's reading jumps the moment power does, while the power reading is an average over the
+last half second, so taken at face value the two would put the sink ten degrees off at every
+step. The forecast that moves the fans is the model's, two seconds ahead, the time a fan takes
+to spin up: it knows a load's curve bends toward where that power settles. And the CPU's
+short-term power limit follows the sink: a burst from a cold machine runs at the firmware's full
+limit, because the die has 30 C to spend before the limit, while the same burst from a warm sink
+is held to what the sink can absorb in the next three seconds, a degree under the limit. So a
+short load is told apart from a long one by where the temperature will be, not by guessing how
+long it lasts: a burst of a few seconds from rest costs nothing, a sustained load is met at the
+power the cooler holds. `burst.ac` stays the ceiling.
+
+The model keeps learning as zcool runs. A power step of 25 W or more shows on the die within a
+tick; its jump, less half a tick of the sink's climb, against the power read a moment later when a
+whole sample of the new power is in, teaches the die's offset. Every 15 s of the die holding
+level at one fan speed teaches what the cooler carries there, from the power averaged over that
+time (it may hunt meanwhile); the other speeds move by the same factor, since dust slows one
+cooler at every speed alike, so a cooler that dust has slowed is learned down at every speed.
+What moved goes to disk once a minute. In the simulator a model that started wrong by half found
+the die's offset and the cooler within a few bursts and one long load. `zcool list` shows the
+model, what the cooler holds at the limit, and the burst it would allow this moment.
+
 ## What follows the power source
 
 Each of these takes `.ac` or `.battery` after its name. Left out, the firmware's own stays,
@@ -365,8 +401,13 @@ fan and a clock limit, a desktop one with its own fan, the case fan and its powe
 an Intel GPU's power1_max, an idle GPU read rarely enough to sleep, one asleep never
 reached, and NVIDIA's settings given back after `kill -9` of zcool and of both. A NVIDIA
 library that reads only an attached GPU, and one that reads nothing, read through the EC.
-Cooler Boost only for a chip over its limit where calibration found it adds 2%, and as always
-where it adds 17%. A burst limit held on mains and on battery, under a cut as well, and given back; psys never
+The long calibration fitting the simulator's own chip (its die offset, the room, the sink's mass
+and the cooler at three speeds) from its step responses; a cold burst running at the firmware's
+full short-term limit with no power taken and a warm one held under what the sink can absorb;
+a model that started wrong learning the die's offset and the cooler as zcool runs; seven load
+patterns (bursts of 2, 5 and 15 s, pulses, a ramp, a sustained load, two loads with a rest) all
+under the limit, the short ones without a watt taken. Cooler Boost only for a chip over its
+limit where calibration found it adds 2%, and as always where it adds 17%. A burst limit held on mains and on battery, under a cut as well, and given back; psys never
 taken for the CPU's. Calibration on a GF63-like laptop with one fan: the fans' carry at each speed, the speed at
 each power and core count, the service stopped and started again, what was learned seeded, and
 everything back after it and after Ctrl-C; refused on battery; a calibration whose fans

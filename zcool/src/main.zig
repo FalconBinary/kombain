@@ -22,6 +22,7 @@ const menu = @import("menu.zig");
 const guard = @import("guard.zig");
 const dump = @import("dump.zig");
 const calibrate = @import("calibrate.zig");
+const thermal_model = @import("model.zig");
 const Text = @import("text.zig").Text;
 const tcc = @import("tcc.zig");
 
@@ -127,6 +128,18 @@ const Chip = struct {
     no_actuator: bool = false,
     asleep: bool = false,
     blind_logged: bool = false,
+    /// the last raw reading, the model's view of the sink, and what the model is learning: a jump
+    /// of the die under way, and how long the chip has stood steady
+    raw: f32 = 0,
+    sink: thermal_model.Observer = .{},
+    last_raw: f32 = 0,
+    last_watts: f32 = -1,
+    jump: thermal_model.Jump = .{},
+    watts_ema: f32 = -1,
+    die_ema: f32 = 0,
+    die_dev: f32 = 0,
+    duty_ema: f32 = 0,
+    steady_for: f32 = 0,
     // the GPU power cap and runtime power state
     cap_path: [160]u8 = undefined,
     cap_len: u8 = 0,
@@ -220,6 +233,8 @@ const CpuPower = struct {
     rapl_energy_fd: [max_packages]i32 = undefined,
     rapl_energy: [max_packages]i64 = undefined,
     rapl_watts: [max_packages]f32 = undefined,
+    /// the last half second's reading itself, for the model: the average above lags a jump
+    rapl_watts_raw: [max_packages]f32 = undefined,
     rapl_reference: [max_packages]f32 = undefined,
     rapl_sampled_ms: i64 = 0,
     rapl_saved: bool = false,
@@ -227,6 +242,9 @@ const CpuPower = struct {
     pl2: [max_packages]bool = @splat(false),
     pl2_original: [max_packages]i64 = @splat(0),
     /// the most it may be: the firmware's, or the power source's `burst`
+    pl2_setting: [max_packages]i64 = @splat(0),
+    /// what it is held to now: the setting, or less while the machine's model says the sink
+    /// cannot take more
     pl2_cap: [max_packages]i64 = @splat(0),
     pl2_saved: [max_packages]bool = @splat(false),
     freq_saved: bool = false,
@@ -494,6 +512,7 @@ fn discoverCpuPower() void {
         cpu_power.rapl_energy_fd[n] = sys.openRead(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/energy_uj" })) orelse -1;
         cpu_power.rapl_energy[n] = -1;
         cpu_power.rapl_watts[n] = 0;
+        cpu_power.rapl_watts_raw[n] = 0;
         cpu_power.rapl_reference[n] = @floatFromInt(base);
         var name_buf: [32]u8 = undefined;
         const name = sys.readFile(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_1_name" }), &name_buf) orelse "";
@@ -501,6 +520,7 @@ fn discoverCpuPower() void {
             const pl2 = sys.readInt(sys.join(&path_buf, &.{ sys.root, "/sys/class/powercap/intel-rapl:", digits, "/constraint_1_power_limit_uw" })) orelse 0;
             cpu_power.pl2[n] = pl2 > 0 and pl2 < 1_000_000_000;
             cpu_power.pl2_original[n] = pl2;
+            cpu_power.pl2_setting[n] = pl2;
             cpu_power.pl2_cap[n] = pl2;
         }
         cpu_power.rapl_count += 1;
@@ -1077,6 +1097,7 @@ fn sampleCpuPower(now: i64) void {
             const uj: f32 = @floatFromInt(energy - cpu_power.rapl_energy[i]);
             const ms: f32 = @floatFromInt(elapsed);
             const watts = uj / ms; // microjoules per millisecond is milliwatts
+            cpu_power.rapl_watts_raw[i] = watts;
             cpu_power.rapl_watts[i] += (watts - cpu_power.rapl_watts[i]) * 0.5;
         }
         cpu_power.rapl_energy[i] = energy;
@@ -1345,6 +1366,7 @@ fn readChips(now: i64) bool {
         c.failures = 0;
         const dt = if (c.last_read_ms == 0) 0 else @as(f32, @floatFromInt(now - c.last_read_ms)) / 1000;
         c.last_read_ms = now;
+        c.raw = reading.?;
         c.thermal.update(reading.?, dt);
         if (c.sleepy) pace(c, index, now);
     }
@@ -1432,6 +1454,17 @@ fn chipWatts(c: *const Chip) ?f32 {
     }
 }
 
+/// The CPU's power as the last half second read it, in watts: what the model works with.
+fn cpuWattsNow() ?f32 {
+    if (cpu_power.rapl_count == 0 or cpu_power.escalated) return null;
+    var milliwatts: f32 = 0;
+    for (0..cpu_power.rapl_count) |i| {
+        if (cpu_power.rapl_energy_fd[i] < 0) return null;
+        milliwatts += cpu_power.rapl_watts_raw[i];
+    }
+    return milliwatts / 1000;
+}
+
 /// The power a limit starts from, in watts, as the actuators work it out when they start.
 fn referenceWatts(c: *const Chip) f32 {
     switch (c.kind) {
@@ -1514,6 +1547,120 @@ fn setSilent(on: bool) void {
     silent_now = on;
 }
 
+// ---------------------------------------------------------------- the machine's model
+
+/// The heat of this machine as `zcool calibrate --long` measured it, refined as zcool runs.
+var model = thermal_model.Model{};
+var model_saved = thermal_model.Model{};
+var model_due_ms: i64 = 0;
+/// how long a burst must stay under the limit on its own: zcool's own power control is awake
+/// again within this
+const burst_seconds: f32 = 3;
+
+fn modelPath(buf: []u8) [:0]const u8 {
+    return sys.join(buf, &.{ sys.root, "/var/lib/zcool/model" });
+}
+
+fn loadModel() void {
+    var path_buf: [256]u8 = undefined;
+    var text: [1024]u8 = undefined;
+    model = thermal_model.parse(sys.readFile(modelPath(&path_buf), &text) orelse return);
+    model_saved = model;
+}
+
+/// Once a minute at most, and only when learning moved something.
+fn saveModel(now: i64, force: bool) void {
+    if (dry_run or !cfg.learn or !model.known()) return;
+    if (!force and now < model_due_ms) return;
+    model_due_ms = now + 60_000;
+    var moved = @abs(model.r_die - model_saved.r_die) >= 0.005;
+    for (model.g, model_saved.g) |a, b| {
+        if (@abs(a - b) >= 0.02) moved = true;
+    }
+    if (!moved) return;
+    var buf: [512]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    if (sys.replaceFile(modelPath(&path_buf), thermal_model.format(&model, &buf))) model_saved = model;
+}
+
+/// How hard the fans that cool the chip run now, as a duty of 255: Cooler Boost on is 255; a fan
+/// zcool does not hold runs at the firmware's speed, read from the EC.
+fn fanDutyFor(index: usize) f32 {
+    var duty: f32 = 0;
+    var any = false;
+    for (fans[0..nfans]) |*f| {
+        if (f.unusable or !fanServes(f, index)) continue;
+        any = true;
+        if (f.ec_boost) {
+            duty = @max(duty, if (f.managed and f.written == 1) 255 else ecFanDuty());
+        } else if (f.ec_curve) {
+            duty = @max(duty, if (f.managed) (if (f.boost_on) 255 else f.ctl.duty) else ecFanDuty());
+        } else {
+            duty = @max(duty, if (f.managed) f.ctl.duty else f.floor);
+        }
+    }
+    return if (any) duty else ecFanDuty();
+}
+
+fn ecFanDuty() f32 {
+    const r = ec.readings() orelse return 0;
+    return @as(f32, @floatFromInt(@min(@max(r.cpu_fan, r.gpu_fan), 100))) * 255 / 100;
+}
+
+/// What this tick taught the model: the die's jump when the power jumped, the cooler when the
+/// chip has stood steady for 20 s. Saved once a minute.
+fn learnOnline(c: *Chip, watts: f32, duty: f32, dt: f32) void {
+    if (c.last_watts >= 0) {
+        if (c.jump.update(c.raw, c.last_raw, watts, c.last_watts, dt)) |sample| {
+            if (model.learnJump(sample.d_die, sample.d_watts)) |r| model.r_die = r;
+        }
+        // steady: the die within half a degree of its 10 s average and the fans at one speed, for
+        // 15 s. The power may hunt meanwhile: what the cooler carried is its average over the same
+        // time. A tick that is not steady costs three, so one odd reading does not restart the clock.
+        if (c.watts_ema < 0) {
+            c.watts_ema = watts;
+            c.die_ema = c.raw;
+            c.die_dev = 0;
+            c.duty_ema = duty;
+        }
+        c.watts_ema += (watts - c.watts_ema) * dt / (dt + 10);
+        c.die_ema += (c.raw - c.die_ema) * dt / (dt + 10);
+        c.die_dev += (@abs(c.raw - c.die_ema) - c.die_dev) * dt / (dt + 10);
+        c.duty_ema += (duty - c.duty_ema) * dt / (dt + 10);
+        const steady = c.die_dev < 0.5 and @abs(duty - c.duty_ema) < 10;
+        c.steady_for = if (steady) c.steady_for + dt else @max(0, c.steady_for - 3 * dt);
+        if (c.steady_for >= 15) {
+            _ = model.learnSteady(c.die_ema, c.watts_ema, duty);
+            c.steady_for = 10;
+        }
+    }
+    c.last_watts = watts;
+    c.last_raw = c.raw;
+}
+
+fn describeModel() void {
+    if (!model.known()) return;
+    const t = &cal_line;
+    _ = t.add("model: the die ").tenth(model.r_die * 100).add(" C above the sink per 10 W, the room ").whole(model.ambient);
+    t.add(" C, the sink ").whole(model.mass).add(" J/C; the cooler carries per degree:").line();
+    _ = t.add(" ");
+    for (thermal_model.point_names, 0..) |name, i| {
+        if (model.g[i] > 0) _ = t.add(" ").add(name).add(" ").tenth(model.g[i] * 10).add("/10");
+    }
+    t.add(" W/C").line();
+    for (chips[0..nchips]) |*c| {
+        if (c.kind != .cpu or !c.controlled()) continue;
+        _ = t.add("  holds ").whole(model.holds(253, c.limit)).add(" W at ").whole(c.limit).add("C with the fans at full");
+        if (c.thermal.ready) {
+            const watts = chipWatts(c) orelse 0;
+            const sink = if (c.sink.ready) c.sink.sink else model.sink(c.thermal.temp, watts);
+            _ = t.add("; a burst from now may draw ").whole(model.burst(sink, 253, c.limit - 1, burst_seconds)).add(" W");
+        }
+        t.line();
+        break;
+    }
+}
+
 fn step(dt: f32) void {
     adaptFanMode(dt);
     if (boost_useless) {
@@ -1562,6 +1709,16 @@ fn step(dt: f32) void {
         const exhausted = noMoreCooling(index);
         // power starts at what the cooler is known to carry, once the fans have given all
         c.throttle.start = if (cfg.learn and exhausted and c.throttle.level >= 1) c.learned.startLevel(c.limit, referenceWatts(c)) else 1;
+        if (c.kind == .cpu and model.known() and cpu_power.rapl_count > 0) {
+            if (cpuWattsNow()) |watts| {
+                const duty = fanDutyFor(index);
+                const sink = c.sink.update(&model, c.raw, watts, duty, dt);
+                c.thermal.model_forecast = model.forecast(sink, watts, duty, thermal_model.fan_horizon);
+                // the burst the sink can take for the next seconds, a degree under the limit
+                modelCap(model.burst(sink, duty, c.limit - 1, burst_seconds));
+                if (cfg.learn and !dry_run) learnOnline(c, watts, duty, dt);
+            } else c.thermal.model_forecast = null;
+        }
         c.throttle.update(&c.thermal, c.limit, crit, exhausted or !loud[index], dt);
         if (cfg.learn and !dry_run) learn(c, nearlyNoMoreCooling(index), dt);
         report(c, loud[index]);
@@ -1765,9 +1922,30 @@ fn applyBurst(watts: ?u16) void {
     for (0..cpu_power.rapl_count) |i| {
         if (!cpu_power.pl2[i]) continue;
         const want: i64 = if (watts) |w| @as(i64, w) * 1_000_000 else cpu_power.pl2_original[i];
-        cpu_power.pl2_cap[i] = @min(want, cpu_power.pl2_original[i]);
+        cpu_power.pl2_setting[i] = @min(want, cpu_power.pl2_original[i]);
+        cpu_power.pl2_cap[i] = cpu_power.pl2_setting[i];
         // under a cut the next one writes it, already under the cap
         if (!dry_run and cpu_power.applied >= 1) setPl2(i, null);
+    }
+}
+
+/// The burst the machine's model allows right now: the setting, or less while the sink is warm.
+/// Written when it moved by 2 W, under a cut as well, since the cut's own write may be long past.
+fn modelCap(watts: f32) void {
+    for (0..cpu_power.rapl_count) |i| {
+        if (!cpu_power.pl2[i]) continue;
+        // never under the long-term limit: the short-term one is the burst above it
+        const floor: f32 = @floatFromInt(cpu_power.rapl_original[i]);
+        const allowed: i64 = @intFromFloat(@max(watts * 1_000_000, floor));
+        const cap = @min(cpu_power.pl2_setting[i], allowed);
+        if (@abs(cap - cpu_power.pl2_cap[i]) < 2_000_000) continue;
+        cpu_power.pl2_cap[i] = cap;
+        if (dry_run) continue;
+        if (cpu_power.applied >= 1) {
+            setPl2(i, null);
+        } else {
+            setPl2(i, @intFromFloat(cpu_power.rapl_reference[i] * cpu_power.applied));
+        }
     }
 }
 
@@ -1973,6 +2151,8 @@ fn runDaemon(selftest: bool) u8 {
     discover();
     if (cfg.learn) loadLearned();
     loadCalibration();
+    loadModel();
+    if (model.known()) describeModel();
     for (fans[0..nfans]) |*f| {
         // calibration found the fans turn as fast at 60% as at full: the EC does not follow the curve
         if (f.ec_curve and cal.curveFollowed() == false) {
@@ -2070,6 +2250,7 @@ fn runDaemon(selftest: bool) u8 {
         step(dt);
         followPowerSource(now);
         saveLearned(now, false);
+        saveModel(now, false);
         guard.tick(now);
         if (undervolted and now - started > 600_000) {
             undervolt.markStable();
@@ -2079,6 +2260,7 @@ fn runDaemon(selftest: bool) u8 {
     }
     if (undervolted) undervolt.markStable();
     saveLearned(sys.nowMs(), true);
+    saveModel(sys.nowMs(), true);
     guard.restore();
     nvidia.stop();
     emergencyRestore();
@@ -2189,6 +2371,13 @@ fn listPower() void {
         describeCalibration();
     } else {
         sys.print("\nnot calibrated: doas zcool calibrate, plugged in, a few minutes\n");
+    }
+    loadModel();
+    if (model.known()) {
+        sys.print("\n");
+        describeModel();
+    } else if (cal.known()) {
+        sys.print("no model of the machine's heat yet: doas zcool calibrate --long, plugged in, up to an hour\n");
     }
 }
 
@@ -2558,7 +2747,7 @@ const Calibration = struct {
     }
 };
 
-fn runCalibrate() u8 {
+fn runCalibrate(long: bool) u8 {
     if (std.os.linux.getuid() != 0 and sys.root.len == 0) {
         sys.print("calibration sets power limits and fans: doas zcool calibrate\n");
         return 1;
@@ -2618,8 +2807,8 @@ fn runCalibrate() u8 {
     const cores = if (sys.root.len > 0) @max(cpu_power.npolicies, 1) else sys.cpuCount();
     var run = Calibration{ .c = c, .cores = cores, .last = sys.nowMs() };
     run.result.limit = c.limit;
-    cal_line.add("calibrating ").add(c.name()).add(" at its ").whole(c.limit).add("C limit, for 3 to 8 minutes; Ctrl-C stops it and keeps nothing").line();
-    const ok = measure(&run);
+    cal_line.add("calibrating ").add(c.name()).add(" at its ").whole(c.limit).add("C limit, ").add(if (long) "up to an hour with the model" else "for 3 to 8 minutes").add("; Ctrl-C stops it and keeps nothing").line();
+    const ok = measure(&run) and (!long or measureLong(&run));
     run.load.stop();
     calibrationStep(0);
     // power, fans, everything back as it was
@@ -2689,6 +2878,159 @@ fn measure(run: *Calibration) bool {
     return true;
 }
 
+/// `--long`: the machine's heat as a model (model.zig). The die's jump per watt from steps of
+/// power with every fan at full; the steady state of each fan speed at two powers under what it
+/// carries, each until it settles; the room with the load off. It takes as long as it takes, up
+/// to about 40 minutes on a laptop; nothing is kept unless the fit holds together.
+fn measureLong(run: *Calibration) bool {
+    const c = run.c;
+    const carries_full = if (run.result.carries[1] > 0) run.result.carries[1] else run.result.carries[0];
+    if (carries_full <= 0 or cpu_power.rapl_count == 0) {
+        sys.print("no fan point was measured: nothing to model\n");
+        return true;
+    }
+    const base: f32 = @as(f32, @floatFromInt(cpu_power.rapl_base[0])) / 1e6;
+    sys.print("the machine's heat as a model: this takes as long as it takes\n");
+
+    // 1. the die's jump per watt: from a low power to the most the cooler carries, three times,
+    // every fan at full. Two ticks after the step, the linear part of the sink's rise cancels.
+    var jumps: [8]f32 = undefined;
+    var njumps: usize = 0;
+    const low_w = 0.2 * base;
+    const high_w = @min(0.95 * carries_full, 0.999 * base);
+    sys.print("  the die's jump when the power jumps, three times\n");
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        calibrationStep(run.cores);
+        if (!holdPower(low_w / base)) return false;
+        var settle = calibrate.Settle{};
+        var t: f32 = 0;
+        while (t < 60) {
+            t += run.tick(253, false, false) orelse return false;
+            settle.add(c.raw);
+            if (t >= 10 and settle.steady(0.01)) break;
+        }
+        const raw0 = c.raw;
+        if (!holdPower(high_w / base)) return false;
+        _ = run.tick(253, false, false) orelse return false;
+        const d1 = c.raw - raw0;
+        _ = run.tick(253, false, false) orelse return false;
+        const d2 = c.raw - raw0;
+        const jump = (2 * d1 - d2) / (high_w - low_w);
+        const line = &cal_line;
+        _ = line.add("    ").tenth(2 * d1 - d2).add(" C over ").whole(high_w - low_w).add(" W");
+        if (jump >= 0.02 and jump <= 0.6) {
+            jumps[njumps] = jump;
+            njumps += 1;
+            line.line();
+        } else line.add(": not a jump a die makes, left out").line();
+        // the rest of this step: the sink warms toward the high power, useful nowhere here
+    }
+
+    // 2. each fan speed at two powers under what it carries, until the die settles
+    var steadies: [8]thermal_model.Steady = undefined;
+    var nsteadies: usize = 0;
+    var raws: [1400]f32 = undefined;
+    var times: [1400]f32 = undefined;
+    sys.print("  each fan speed at two powers, each until it settles\n");
+    for ([_]usize{ 1, 2, 3 }) |p| {
+        const carries = run.result.carries[p];
+        if (carries <= 0) continue;
+        for ([_]f32{ 0.55, 0.9 }) |share| {
+            const w = carries * share;
+            calibrationStep(run.cores);
+            if (!holdPower(w / base)) return false;
+            var settle = calibrate.Settle{};
+            // the power over the same window: one sample of it is a tenth off on a fast counter
+            var watts_settle = calibrate.Settle{};
+            var n: usize = 0;
+            var t: f32 = 0;
+            var over = false;
+            while (t < 300 and n < raws.len) {
+                t += run.tick(thermal_model.point_duty[p], false, false) orelse return false;
+                raws[n] = c.raw;
+                times[n] = t;
+                n += 1;
+                settle.add(c.raw);
+                watts_settle.add(cpuWatts());
+                if (c.raw > c.limit - 0.5) {
+                    over = true;
+                    break;
+                }
+                if (t >= 20 and settle.steady(0.005)) break;
+            }
+            const line = &cal_line;
+            if (over or n < 40) {
+                line.add("    ").add(thermal_model.point_names[p]).add(" at ").whole(w).add(" W: the die reached the limit, left out").line();
+                continue;
+            }
+            const final = settle.mean();
+            // the sink's approach, from a second in (the die's own jump is over by then), and only
+            // on the second power at a point: on the first the fan is still coming down from the
+            // point before, which cools faster than this one does
+            var tau: f32 = 0;
+            if (share > 0.7) {
+                var start_i: usize = 0;
+                while (start_i < n and times[start_i] < 1) start_i += 1;
+                if (start_i < n) {
+                    const from = raws[start_i];
+                    const target = from + 0.63 * (final - from);
+                    var k = start_i + 1;
+                    while (k < n) : (k += 1) {
+                        const passed = if (final > from) raws[k] >= target else raws[k] <= target;
+                        if (!passed) continue;
+                        // between the two readings around the crossing
+                        const span = raws[k] - raws[k - 1];
+                        const part = if (@abs(span) > 1e-3) std.math.clamp((target - raws[k - 1]) / span, 0, 1) else 1;
+                        tau = times[k - 1] + (times[k] - times[k - 1]) * part - times[start_i];
+                        break;
+                    }
+                }
+            }
+            const watts = watts_settle.mean();
+            steadies[nsteadies] = .{ .point = p, .watts = watts, .die = final, .tau = tau };
+            nsteadies += 1;
+            _ = line.add("    ").add(thermal_model.point_names[p]).add(" at ").tenth(watts).add(" W: ").tenth(final).add(" C after ").whole(t).add(" s");
+            if (tau > 0) _ = line.add(", the sink takes ").whole(tau).add(" s to cover 63%");
+            line.line();
+        }
+    }
+
+    // 3. the room: the load off and every fan at full, until the die settles
+    sys.print("  the room: the load off, every fan at full\n");
+    calibrationStep(0);
+    if (sys.root.len == 0) run.load.stop();
+    if (!holdPower(0.999)) return false;
+    var settle = calibrate.Settle{};
+    var watts_settle = calibrate.Settle{};
+    var t: f32 = 0;
+    while (t < 180) {
+        t += run.tick(253, false, false) orelse return false;
+        settle.add(c.raw);
+        watts_settle.add(cpuWatts());
+        if (t >= 30 and settle.steady(0.005)) break;
+    }
+    const die_idle = settle.mean();
+    const watts_idle = watts_settle.mean();
+    const first = thermal_model.fit(steadies[0..nsteadies], jumps[0..njumps], null);
+    const ambient: ?f32 = if (first.known()) die_idle - watts_idle * (1 / first.conductance(253) + first.r_die) else null;
+    const fitted = thermal_model.fit(steadies[0..nsteadies], jumps[0..njumps], ambient);
+    if (!fitted.known()) {
+        sys.print("  too little settled for a model: nothing kept\n");
+        return true;
+    }
+    var buf: [512]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    if (!sys.replaceFile(modelPath(&path_buf), thermal_model.format(&fitted, &buf))) {
+        sys.print("  cannot write /var/lib/zcool/model\n");
+        return true;
+    }
+    model = fitted;
+    model_saved = fitted;
+    describeModel();
+    return true;
+}
+
 fn describeCalibration() void {
     if (!cal.known()) return;
     const t = &cal_line;
@@ -2738,6 +3080,7 @@ const usage =
     \\  zcool list                what is here: chips, limits, fans
     \\  zcool dump                the CPU's registers, clocks, power limits, GPUs, EC and sensors, read only
     \\  zcool calibrate           3 to 8 minutes of load that teach zcool its fans and power
+    \\  zcool calibrate --long    and up to an hour more for a model of the machine's heat
     \\  zcool menu                every setting on one screen; saving restarts the service
     \\  zcool run [--dry-run]     the daemon; --dry-run only says what it would do
     \\  zcool restore             puts back everything an earlier run changed
@@ -2790,7 +3133,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     if (std.mem.eql(u8, command, "calibrate")) {
         loadConfig(config_path);
-        return runCalibrate();
+        return runCalibrate(std.mem.eql(u8, sub, "--long"));
     }
     if (std.mem.eql(u8, command, "dump")) {
         dump.run();

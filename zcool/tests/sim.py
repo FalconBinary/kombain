@@ -2112,6 +2112,194 @@ def cooler_boost_only_where_it_earns_its_noise(r):
         m.close()
 
 
+def true_model(m, mass=None):
+    """The simulator's own chip as zcool's model would write it: the die 0.12 C/W over the sink,
+    the room 30 C, the cooler g_min + (g_max - g_min) * duty / 255 at each fan point."""
+    c = m.cpu
+    g = lambda duty: c.g_min + (c.g_max - c.g_min) * duty / 255
+    return (f"r_die {c.r_die:.3f}\nambient {c.ambient:.1f}\nmass {mass or c.mass:.1f}\n"
+            f"g boost {g(255):.3f}\ng 100% {g(253):.3f}\ng 80% {g(204):.3f}\ng 60% {g(153):.3f}\n")
+
+
+def model_file(m):
+    p = f"{m.root}/var/lib/zcool/model"
+    if not os.path.exists(p):
+        return {}
+    out = {}
+    for line in get(p).splitlines():
+        f = line.split()
+        if f[0] == "g":
+            out["g " + f[1]] = float(f[2])
+        else:
+            out[f[0]] = float(f[1])
+    return out
+
+
+@scenario
+def the_long_calibration_fits_the_machines_heat(r):
+    # a sink light enough to settle in half a minute: the real GF63's takes two to three
+    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=6, r_die=0.12), cpu_fan=False, ec=Ec(one_fan=True),
+                rapl_window=True, config="cpu0.max = 70\n", cal_full=90, pl1_watts=45, pl2_watts=107, psys=True)
+    m.service()
+    started = time.time()
+    m.start("--long", command="calibrate")
+    end = time.time() + 1500
+    while m.proc.poll() is None and time.time() < end:
+        m.advance(1, limit_cpu=70)
+    code = m.proc.poll()
+    took = time.time() - started
+    if code is None:
+        m.stop(signal.SIGKILL)
+    m.proc = None
+    log = m.text()
+    r.check(code == 0, f"exit {code}:\n" + log[-1500:])
+    mdl = model_file(m)
+    r.check(bool(mdl), "no model written:\n" + log[-800:])
+    if mdl:
+        r.check(0.09 <= mdl.get("r_die", 0) <= 0.15, f"r_die {mdl.get('r_die')}, the chip's is 0.12")
+        r.check(27 <= mdl.get("ambient", 0) <= 33, f"ambient {mdl.get('ambient')}, the room is 30")
+        r.check(3 <= mdl.get("mass", 0) <= 9, f"mass {mdl.get('mass')}, the sink's is 6")
+        r.check(abs(mdl.get("g 60%", 0) - 0.92) <= 0.14, f"g 60% {mdl.get('g 60%')}, the chip's is 0.92")
+        r.check(abs(mdl.get("g 100%", 0) - 1.19) <= 0.18, f"g 100% {mdl.get('g 100%')}, the chip's is 1.19")
+        r.note("model: " + " ".join(f"{k}={v}" for k, v in mdl.items()) + f"; took {took:.0f} s")
+    r.check("model: the die" in log, log[-600:])
+    r.check(m.cpu.peak <= 71, f"peak {m.cpu.peak:.1f}")
+    r.check(get(m.rapl_path) == "45000000" and get(m.pl2_path) == "107000000", "limits not given back")
+    m.close()
+
+
+@scenario
+def a_cold_burst_runs_free_and_a_warm_one_is_held(r):
+    m = gf63()
+    put(f"{m.root}/var/lib/zcool/model", true_model(m))
+    m.start()
+    m.advance(5, limit_cpu=70)
+    r.check("model: the die" in m.text(), m.text()[-400:])
+    # a four second burst from a cold machine: the work all done, no power taken. The short-term
+    # limit follows the sink down from the firmware's 107 W, and stays over what the burst draws.
+    m.cpu.load = 90
+    m.cpu.work = m.cpu.time = 0.0
+    lowest_pl2 = 300e6
+    for _ in range(8):
+        m.advance(0.5, limit_cpu=70)
+        lowest_pl2 = min(lowest_pl2, float(get(m.pl2_path)))
+    m.cpu.load = 5
+    log = m.text()
+    lost = (m.cpu.time - m.cpu.work) / m.cpu.time
+    r.check(lost <= 0.01, f"{lost * 100:.1f}% of the work lost on a cold burst; the short-term limit went to {lowest_pl2 / 1e6:.0f} W")
+    r.check(lowest_pl2 >= 90e6, f"the short-term limit went under the burst's 90 W: {lowest_pl2 / 1e6:.0f} W")
+    r.check("trimming power" not in log, "power taken for a four second burst from cold:\n" + log[-400:])
+    r.check(m.cpu.peak < 64, f"peak {m.cpu.peak:.1f} on the cold burst")
+    r.note(f"cold burst: peak {m.cpu.peak:.1f} C, {lost * 100:.1f}% lost, PL2 down to {lowest_pl2 / 1e6:.0f} W")
+    # a long load warms the sink; then a pause and the same burst again
+    m.advance(10, limit_cpu=70)
+    m.cpu.load = 90
+    m.advance(60, limit_cpu=70)
+    m.cpu.load = 5
+    m.advance(12, limit_cpu=70)
+    warm_before = m.cpu.peak
+    m.cpu.peak = m.cpu.reading
+    m.cpu.load = 90
+    highest_pl2 = 0
+    for _ in range(8):
+        m.advance(0.5, limit_cpu=70)
+        highest_pl2 = max(highest_pl2, float(get(m.pl2_path)))
+    m.cpu.load = 5
+    r.check(highest_pl2 <= 85e6, f"the short-term limit was {highest_pl2 / 1e6:.0f} W for a burst from a warm sink")
+    r.check(m.cpu.peak <= 70.5, f"peak {m.cpu.peak:.1f} on the warm burst")
+    r.note(f"warm burst: PL2 held to {highest_pl2 / 1e6:.0f} W, peak {m.cpu.peak:.1f} C (the long load before it peaked at {warm_before:.1f})")
+    m.stop()
+    r.check(get(m.pl2_path) == "107000000", "the short-term limit not given back")
+    m.close()
+
+
+@scenario
+def the_model_learns_as_zcool_runs(r):
+    m = gf63()
+    # a model that is wrong: the die's jump too small, the cooler at full too weak
+    put(f"{m.root}/var/lib/zcool/model", "r_die 0.060\nambient 30.0\nmass 30.0\ng boost 0.600\ng 100% 0.600\ng 80% 0.600\ng 60% 0.600\n")
+    m.start()
+    m.advance(4, limit_cpu=70)
+    # bursts teach the jump; a long hold at the limit with the fans at full teaches the cooler
+    for _ in range(4):
+        m.cpu.load = 90
+        m.advance(3, limit_cpu=70)
+        m.cpu.load = 5
+        m.advance(6, limit_cpu=70)
+    m.cpu.load = 90
+    m.advance(100, limit_cpu=70)
+    m.stop()
+    mdl = model_file(m)
+    r.check(0.09 <= mdl.get("r_die", 0) <= 0.16, f"r_die learned {mdl.get('r_die')}, from 0.06 toward 0.12")
+    r.check(mdl.get("g boost", 0) > 0.8 or mdl.get("g 100%", 0) > 0.8, f"the cooler at full learned {mdl.get('g boost')} / {mdl.get('g 100%')}, from 0.6 toward 1.2")
+    r.check(m.cpu.peak <= 71.5, f"peak {m.cpu.peak:.1f} with a wrong model to start from")
+    r.note("learned: " + " ".join(f"{k}={v}" for k, v in mdl.items()))
+    m.close()
+
+
+@scenario
+def many_load_patterns_stay_under_the_limit(r):
+    patterns = [
+        ("burst 2 s", [(90, 2)], 30),
+        ("burst 5 s", [(90, 5)], 30),
+        ("burst 15 s", [(90, 15)], 30),
+        ("pulses 3 s on 2 s off, eight times", [(90, 3), (5, 2)] * 8, 30),
+        ("ramp 20 to 90 W over 30 s", [(20 + 70 * i / 9, 3) for i in range(10)], 30),
+        ("sawtooth 30 to 90 W, 5 s steps, 40 s", [(30 + 60 * (i % 4) / 3, 5) for i in range(8)], 30),
+        ("medium 50 W for 60 s", [(50, 60)], 30),
+        ("sustained 60 s", [(90, 60)], 30),
+        ("10 s, 10 s rest, 10 s", [(90, 10), (5, 10), (90, 10)], 30),
+        # the model says the room is 30 C; it is 36, as nothing in the machine can tell
+        ("sustained 60 s in a 36 C room", [(90, 60)], 36),
+    ]
+    for name, steps, room in patterns:
+        m = gf63()
+        put(f"{m.root}/var/lib/zcool/model", true_model(m))
+        m.cpu.ambient = room
+        m.cpu.temp = m.cpu.reading = room + 10
+        m.start()
+        m.advance(4, limit_cpu=70)
+        m.cpu.peak = m.cpu.reading
+        m.cpu.work = m.cpu.time = 0.0
+        busy = sum(seconds for load, seconds in steps if load > 5)
+        for load, seconds in steps:
+            m.cpu.load = load
+            m.advance(seconds, limit_cpu=70)
+        m.cpu.load = 5
+        m.advance(3, limit_cpu=70)
+        log = m.text()
+        trimmed = "trimming power" in log
+        fans = "taking over" in log
+        # the work the pattern got done against the same seconds at full speed
+        lost = (m.cpu.time - m.cpu.work) / busy
+        r.check(m.cpu.peak <= 71, f"{name}: peak {m.cpu.peak:.1f}")
+        if busy <= 5:
+            r.check(lost <= 0.01, f"{name}: {lost * 100:.1f}% of the work lost on a burst a cold sink absorbs")
+        r.note(f"{name:<36} peak {m.cpu.peak:5.1f} C  {lost * 100:4.1f}% lost  {'power trimmed' if trimmed else 'full power   '}  {'fans taken' if fans else 'fans untouched'}")
+        m.stop()
+        m.close()
+
+
+@scenario
+def a_dusty_cooler_is_learned(r):
+    # the model is of the cooler when it was clean; dust has since taken a quarter of it
+    m = gf63()
+    put(f"{m.root}/var/lib/zcool/model", true_model(m))
+    m.cpu.g_min *= 0.75
+    m.cpu.g_max *= 0.75
+    m.start()
+    m.advance(4, limit_cpu=70)
+    m.cpu.load = 90
+    m.advance(180, limit_cpu=70)
+    m.stop()
+    mdl = model_file(m)
+    full = max(mdl.get("g boost", 0), mdl.get("g 100%", 0))
+    r.check(m.cpu.peak <= 71.5, f"peak {m.cpu.peak:.1f} with the model of a clean cooler")
+    r.check(full < 1.08, f"the cooler at full learned down to {full}, from 1.19 toward 0.89")
+    r.note(f"peak {m.cpu.peak:.1f} C; " + " ".join(f"{k}={v}" for k, v in mdl.items()))
+    m.close()
+
+
 def tcc_machine(config="cpu0.max = 85\n", cpuinfo="GenuineIntel", lockdown="[none] integrity confidentiality"):
     m = undervolt_machine(cpuinfo=cpuinfo, lockdown=lockdown, config=config)
     with open(f"{m.root}/dev/cpu/0/msr", "r+b") as f:
