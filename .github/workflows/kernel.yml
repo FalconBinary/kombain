@@ -124,7 +124,7 @@ jobs:
             fi
           fi
           {
-            echo "Linux $(sed -n 's/^kernel release: //p' BUILD) for kombain's GF63: Void's linux6.18 with sched_ext"
+            echo "Linux $(sed -n 's/^kernel release: //p' "$out/BUILD") for kombain's GF63: Void's linux6.18 with sched_ext"
             echo "(\`CONFIG_SCHED_CLASS_EXT=y\`), full preemption as the build default (\`preempt=\` still"
             echo "selects at boot) and \`-kombain\` in its name. The stock Void kernel stays installed as the fallback."
             echo
