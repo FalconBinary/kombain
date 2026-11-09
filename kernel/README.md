@@ -66,8 +66,9 @@ first (119 GB free after that) and allows six hours. The results go to a release
 
 The `-dbg` package is built (Void's template does) and not published. A push build always
 publishes; "Publish" off in the dispatch form keeps everything as a workflow artifact
-instead. The same tag again is refused unless the dispatch form's "Replace" is on: a new
-config is a new `revision`, so the rows keep telling the kernels apart.
+instead. The same tag again is refused in the run's first minute, before the build, unless
+the dispatch form's "Replace" is on: a new config is a new `revision`, so the rows keep
+telling the kernels apart.
 
 Before any of that, the config can be checked in minutes on any machine with Docker
 (x86_64, or Apple silicon through Rosetta):
