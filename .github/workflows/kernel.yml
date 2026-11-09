@@ -35,27 +35,50 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    name: What to build
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.tag.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The release tag
+        id: tag
+        # Before the two-hour build, not after it: the same tag again means the template's
+        # revision= was not bumped. A push then builds nothing (a fix to the script or the
+        # workflow needs no new kernel; the run shows a warning), a dispatch is refused, unless
+        # the form's "Replace" is on or "Publish" is off (nothing is published then).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+          REPLACE: ${{ inputs.replace }}
+        run: |
+          t=kernel/srcpkgs/linux6.18-kombain/template
+          tag="kernel-$(sed -n 's/^version=//p' "$t")-kombain-r$(sed -n 's/^revision=//p' "$t")"
+          build=yes
+          # a push has no inputs: it publishes, and replaces nothing
+          if [ "${PUBLISH:-true}" = true ] && [ "${REPLACE:-false}" != true ] &&
+             gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$GITHUB_EVENT_NAME" = push ]; then
+              echo "::warning::release $tag exists, so this push builds nothing; a new kernel needs revision= bumped in $t"
+              build=no
+            else
+              echo "::error::release $tag exists: bump revision= in $t, or run with replace"
+              exit 1
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "$tag: build=$build"
+
   build:
     name: linux6.18-kombain for x86_64
+    needs: check
+    if: needs.check.outputs.build == 'yes'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: The release tag is free
-        # Before the two-hour build, not after it: the same tag again means the template's
-        # revision= was not bumped. A dispatch with "Replace" on, or without "Publish", may go on.
-        if: (github.event_name == 'push' || inputs.publish) && !inputs.replace
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          t=kernel/srcpkgs/linux6.18-kombain/template
-          tag="kernel-$(sed -n 's/^version=//p' "$t")-kombain-r$(sed -n 's/^revision=//p' "$t")"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::release $tag exists: bump revision= in $t, or run with replace"
-            exit 1
-          fi
-          echo "$tag is free"
 
       - name: Room on the disk
         # A kernel with Void's config and debug info for BTF needs tens of GB while it builds.

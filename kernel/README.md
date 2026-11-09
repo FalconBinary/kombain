@@ -63,12 +63,14 @@ first (119 GB free after that) and allows six hours. The results go to a release
 - `linux6.18-kombain-headers-<version>_<revision>.x86_64.xbps`: what DKMS needs to build NVIDIA's modules
 - `config-<release>`: the kernel's final `.config`; `diffconfig-void-to-kombain.txt`: what differs from Void's
 - `BUILD`: the void-packages commit, the kombain commit, the compiler; `SHA256SUMS` over all of it
+  (r1's list also names `TAG`, a file of the build that is not published; `--ignore-missing` below skips it)
 
 The `-dbg` package is built (Void's template does) and not published. A push build always
 publishes; "Publish" off in the dispatch form keeps everything as a workflow artifact
-instead. The same tag again is refused in the run's first minute, before the build, unless
-the dispatch form's "Replace" is on: a new config is a new `revision`, so the rows keep
-telling the kernels apart.
+instead. A tag that exists already is noticed in the run's first minute, not after the build:
+a push then builds nothing (a fix to the script or the workflow needs no new kernel, and the
+run says so in a warning), a dispatch is refused unless the form's "Replace" is on. A new
+config is a new `revision`, so the rows keep telling the kernels apart.
 
 Before any of that, the config can be checked in minutes on any machine with Docker
 (x86_64, or Apple silicon through Rosetta):
