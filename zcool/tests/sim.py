@@ -1967,7 +1967,7 @@ def calibration_learns_the_fans_and_the_power_and_gives_everything_back(r):
         # the model carries 42 W at 70 C at full, 33 W at 60%
         r.check(35 < carries[0] < 50 and carries[3] < carries[1] - 3, f"carried {carries}")
         r.check(all(int(lines[p][4]) == 0 for p in lines), "the second fan does not turn here")
-        r.note("fans carry " + ", ".join(f"{p} {lines[p][2]} W" for p in ("boost", "100%", "80%", "60%")) + f" at 70 C; took {took:.0f} s")
+        r.note("fans carry " + ", ".join(f"{p} {lines[p][2]} W" for p in ("boost", "100%", "80%", "60%")) + f" at 70 C; peak {m.cpu.peak:.1f} C; took {took:.0f} s")
     power = [l.split() for l in cal.splitlines() if l.startswith("power ")]
     r.check(len(power) >= 4, cal)
     # steps of the firmware's 45 W long-term limit, from 30% of it

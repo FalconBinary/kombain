@@ -2649,7 +2649,10 @@ const Calibration = struct {
         const c = self.c;
         if (hold_limit) {
             c.throttle.update(&c.thermal, c.limit, c.crit, true, dt);
-            applyCpu(c.throttle.level);
+            // never all of it: that gives the firmware's short-term limit back, and the CPU bursts
+            // to it (107 W on the GF63) every time the hold eases, 5 C on the die at once, which
+            // is no steady state to measure and ran the die to 75 C on a slow test machine
+            applyCpu(@min(c.throttle.level, 0.999));
         }
         for (chips[0..nchips]) |*other| {
             if (!other.controlled() or !other.thermal.ready or other.asleep) continue;
