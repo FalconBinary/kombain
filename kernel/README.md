@@ -13,7 +13,7 @@ and `build` with the label `6.18.62-kombain_1/runit` beside the stock kernel's.
 
 The template is Void's `srcpkgs/linux6.18` from void-packages at the commit in
 [void-packages.commit](void-packages.commit), with Void's x86_64 config, `mv-debug` and
-patches byte for byte (CI checks that). The config changes are
+patches byte for byte, `mv-debug` executable as in Void's tree (CI checks both). The config changes are
 [srcpkgs/linux6.18-kombain/files/kombain.config](srcpkgs/linux6.18-kombain/files/kombain.config),
 every line with its reason:
 
@@ -50,9 +50,11 @@ kernel is built with): void-packages at the pinned commit, the template copied i
 container itself as xbps-src's chroot (`XBPS_CHROOT_CMD=ethereal`, no privileges needed; in that
 mode `binary-bootstrap` has nothing to do, which is why the plain `void-glibc-full` image, with
 no `patch` or `gcc`, cannot build it), `xlint`, then `./xbps-src -j4 pkg linux6.18-kombain`.
-Void's full config with debug info for BTF takes a few
-hours on the runner's four cores and tens of GB of disk; the workflow clears the runner's
-unused SDKs first and allows six hours. The results go to a release
+Void's full config with debug info for BTF takes about
+1 h 45 min on the runner's four cores (the first run: 1 h 43 min compiling, two minutes
+installing, under a minute each for the tools, the sources and the config) and tens of GB
+of disk; the workflow clears the runner's unused SDKs first (119 GB free after that) and
+allows six hours. The results go to a release
 `kernel-<version>-kombain-r<revision>` (the template's `version` and `revision`):
 
 - `linux6.18-kombain-<version>_<revision>.x86_64.xbps`: the kernel, its modules, `config-*`, `System.map`

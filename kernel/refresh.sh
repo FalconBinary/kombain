@@ -37,6 +37,7 @@ o = re.sub(r'\(void-packages [0-9a-f]{40}\)', f'(void-packages {commit})', o, co
 open(ours, 'w').write(o)
 PY
 cp "$tmp/x86_64-dotconfig" "$tmp/mv-debug" "$dir/files/"
+chmod +x "$dir/files/mv-debug" # as in Void's tree; curl does not carry the bit
 rm -f "$dir"/patches/*
 cp "$tmp"/patches/* "$dir/patches/"
 echo "$commit" > "$here/void-packages.commit"
