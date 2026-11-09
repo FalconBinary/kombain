@@ -108,6 +108,8 @@ jobs:
           # git keeps only the executable bit; do_install runs files/mv-debug, so Void's 755 must be ours too
           diff <(cd "$void" && find files/mv-debug files/x86_64-dotconfig patches -type f -perm -u+x | sort) \
                <(cd "$ours" && find files/mv-debug files/x86_64-dotconfig patches -type f -perm -u+x | sort)
+          # xbps-src finds a subpackage's template through srcpkgs/<subpackage> -> <package>, as void-packages has it
+          for sub in headers dbg; do test "$(readlink "$ours-$sub")" = linux6.18-kombain; done
           test "$(sed -n 's/^version=//p' "$void/template")" = "$(sed -n 's/^version=//p' "$ours/template")"
           diff <(sed -n '/^checksum=/,/^$/p' "$void/template") <(sed -n '/^checksum=/,/^$/p' "$ours/template")
       - name: The template, in void-packages at that commit
