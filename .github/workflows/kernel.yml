@@ -1,11 +1,20 @@
 name: kernel
 
 # Builds linux6.18-kombain (kernel/) in a Void container and publishes it as a release, so the
-# GF63 installs it from there. Started by hand: a kernel takes hours, and every release is a
-# variant kombain-bench will have rows for. The build itself is kernel/build.sh, the same
-# script that checks the config in a local container.
+# GF63 installs it from there. A kernel takes hours, and every release is a variant
+# kombain-bench will have rows for, so it runs only when the kernel itself changes: a push to
+# a kernel* branch that touches the template or the build script, or by hand from main (GitHub
+# dispatches only workflows that exist on the default branch). The build itself is
+# kernel/build.sh, the same script that checks the config in a local container.
 
 on:
+  push:
+    branches: ['kernel*']
+    paths:
+      - 'kernel/srcpkgs/**'
+      - 'kernel/build.sh'
+      - 'kernel/void-packages.commit'
+      - '.github/workflows/kernel.yml'
   workflow_dispatch:
     inputs:
       publish:
@@ -82,7 +91,8 @@ jobs:
           if-no-files-found: ignore
 
       - name: Release
-        if: inputs.publish
+        # every push build publishes; a dispatch can keep its result as an artifact only
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
           REPLACE: ${{ inputs.replace }}

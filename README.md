@@ -191,7 +191,7 @@ CI ([workflow](.github/workflows/ci.yml)) runs all of this on x86_64:
 - The kernel ([kernel/](kernel/)): `xlint` on the template, Void's config and patches compared byte for byte
   with void-packages at the pinned commit, the template's metadata read by `xbps-src` there, the workflows
   through `actionlint` and the scripts through `shellcheck`. The kernel itself is built by the `kernel` workflow
-  on request, hours on four cores, and published as a release.
+  when the template changes on a `kernel*` branch, or on request from `main`, hours on four cores, and published as a release.
 - Secure Boot: step 12 as written, in OVMF firmware that starts in Setup Mode. After the reboot
   Secure Boot is on and the kernel reports it, Dev still asks for both passphrases, a copy of Limine
   without the signature, which booted before step 12, is refused, and a kernel changed by one byte
