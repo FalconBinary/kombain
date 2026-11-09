@@ -67,7 +67,7 @@ echo "== the template"
 xlint "srcpkgs/$pkg/template"
 ./xbps-src show "$pkg"
 # each *_package() in the template is a subpackage; without its symlink the build fails after two hours, this fails now
-for sub in $(sed -n 's/^\([a-z0-9.+_-]*\)_package() {$/\1/p' "srcpkgs/$pkg/template"); do
+sed -n 's/^\([a-z0-9.+_-]*\)_package() {$/\1/p' "srcpkgs/$pkg/template" | while read -r sub; do
 	./xbps-src show "$sub" | grep -E '^(pkgname|short_desc):'
 done
 [ "$step" != show ] || exit 0
