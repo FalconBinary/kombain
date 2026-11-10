@@ -71,7 +71,35 @@ const MsrPort = struct {
     pub fn read(self: MsrPort) ?u64 {
         return readMsr(self.fd);
     }
+
+    /// The CPU answers at once; a register another process stands in for, in the tests, in a moment.
+    pub fn settle(_: MsrPort) void {
+        sys.sleepMs(3);
+    }
 };
+
+fn openMsr() ?i32 {
+    var msr_buf: [256]u8 = undefined;
+    return sys.openReadWrite(sys.join(&msr_buf, &.{ sys.root, "/dev/cpu/0/msr" }));
+}
+
+/// The offsets the CPU holds now, core and cache, or null without the register.
+pub fn offsets() ?[2]i32 {
+    if (!isIntel()) return null;
+    const fd = openMsr() orelse return null;
+    defer sys.close(fd);
+    const port = MsrPort{ .fd = fd };
+    return .{ code.readPlane(port, code.core_plane) orelse return null, code.readPlane(port, code.cache_plane) orelse return null };
+}
+
+/// Puts offsets back that held before, as a search puts back what it found applied. No journal:
+/// what held before needs none.
+pub fn restore(core_mv: i32, cache_mv: i32) bool {
+    if (lockdownActive()) return false;
+    const fd = openMsr() orelse return false;
+    defer sys.close(fd);
+    return setPlane(fd, code.core_plane, core_mv) and setPlane(fd, code.cache_plane, cache_mv);
+}
 
 fn setPlane(fd: i32, plane: u6, mv: i32) bool {
     return code.setPlane(MsrPort{ .fd = fd }, plane, mv);
@@ -165,8 +193,6 @@ pub fn report() void {
     };
     defer sys.close(fd);
     for ([_]u6{ code.core_plane, code.cache_plane }, [_][]const u8{ "core", "cache" }) |plane, name| {
-        if (writeMsr(fd, code.encodeRead(plane))) {
-            if (readMsr(fd)) |value| sys.printf("{s}: {d} mV\n", .{ name, code.decodeOffset(value) });
-        }
+        if (code.readPlane(MsrPort{ .fd = fd }, plane)) |mv| sys.printf("{s}: {d} mV\n", .{ name, mv });
     }
 }

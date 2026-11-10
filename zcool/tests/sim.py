@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ZCOOL = os.path.abspath(sys.argv[1])
@@ -1195,6 +1196,203 @@ def msr_value(m):
     with open(f"{m.root}/dev/cpu/0/msr", "rb") as f:
         f.seek(0x150)
         return struct.unpack("<Q", f.read(8))[0]
+
+
+def decode_offset(value):
+    field = (value >> 21) & 0x7ff
+    signed = field - 0x800 if field & 0x400 else field
+    return round(signed / 1.024)
+
+
+def encode_field(mv):
+    return ((round(mv * 1.024)) & 0x7ff) << 21
+
+
+class Mailbox(threading.Thread):
+    """MSR 0x150 as the CPU answers it: a write request stores a plane's offset, a read request
+    puts the stored offset in the register for the read that follows. A thread, because zcool
+    pauses a few milliseconds after each request before it reads; a plain file answers a request
+    with the request itself, which is what a locked CPU looks like. `on_offset(plane, mv)` runs
+    when a write lands: a scenario's chance to take the machine down or log a machine check."""
+
+    def __init__(self, m, on_offset=None, offsets=()):
+        super().__init__(daemon=True)
+        self.path = f"{m.root}/dev/cpu/0/msr"
+        self.on_offset = on_offset
+        self.offsets = {0: 0, 2: 0}
+        for plane, mv in offsets:
+            self.offsets[plane] = encode_field(mv)
+        self.stopping = False
+        self.writes = []
+        self.start()
+
+    def run(self):
+        fd = os.open(self.path, os.O_RDWR)
+        try:
+            while not self.stopping:
+                value = struct.unpack("<Q", os.pread(fd, 8, 0x150))[0]
+                if value >> 63:
+                    plane = (value >> 40) & 0x3f
+                    if (value >> 32) & 1:
+                        self.offsets[plane] = value & 0xFFE00000
+                        self.writes.append((plane, decode_offset(value)))
+                        if self.on_offset:
+                            self.on_offset(plane, decode_offset(value))
+                    os.pwrite(fd, struct.pack("<Q", self.offsets.get(plane, 0)), 0x150)
+                time.sleep(0.0003)
+        finally:
+            os.close(fd)
+
+    def stop(self):
+        self.stopping = True
+        self.join(timeout=2)
+
+    def offset(self, plane):
+        return decode_offset(self.offsets.get(plane, 0))
+
+
+def find_machine(mains=True, config="cpu0.max = 70\n", cpuinfo="GenuineIntel"):
+    """A laptop CPU for `zcool undervolt find`: the firmware's 45 and 107 W limits, a sink the
+    search's 60 W load warms to the 70 C limit, the register for offsets, and the kernel's log."""
+    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.6, mass=20, temp=45), config=config, cal_full=60,
+                pl1_watts=45, pl2_watts=107, rapl_window=True, mains=mains)
+    put(f"{m.root}/proc/cpuinfo", f"vendor_id : {cpuinfo}\n")
+    put(f"{m.root}/sys/kernel/security/lockdown", "[none] integrity confidentiality")
+    os.makedirs(f"{m.root}/dev/cpu/0")
+    with open(f"{m.root}/dev/cpu/0/msr", "wb") as f:
+        f.write(b"\0" * 0x200)
+    put(f"{m.root}/dev/kmsg", "")
+    return m
+
+
+def run_find(m, *args, seconds=300):
+    m.start("find", *args, command="undervolt")
+    end = time.time() + seconds
+    while m.proc.poll() is None and time.time() < end:
+        m.advance(1, limit_cpu=70)
+    code = m.proc.poll()
+    if code is None:
+        m.stop(signal.SIGKILL)
+    m.proc = None
+    return code
+
+
+def find_files(m):
+    return (f"{m.root}/var/lib/zcool/undervolt-find", f"{m.root}/var/lib/zcool/undervolt-pending", f"{m.root}/var/lib/zcool/undervolt-found")
+
+
+@scenario
+def undervolt_find_ends_two_steps_above_a_crash(r):
+    m = find_machine()
+    m.service()
+    crashed = []
+
+    def on_offset(plane, mv):
+        # the cache plane is written second: both planes hold -100 now, and the machine goes down
+        if mv == -100 and plane == 2 and not crashed:
+            crashed.append(mv)
+            m.proc.kill()
+
+    box = Mailbox(m, on_offset)
+    code = run_find(m, "--seconds", "12")
+    box.stop()
+    log = m.text()
+    state, pending, found = find_files(m)
+    r.check(crashed and code is not None and code != 0, f"the ladder should have reached -100 mV and died there (exit {code}):\n" + log[-900:])
+    r.check("searching for the deepest offset" in log and "-50 mV: held" in log and "-90 mV: held" in log, log[-900:])
+    text = get(state) if os.path.exists(state) else ""
+    r.check(text.startswith("step -100\n") and "good -90\n" in text, f"the step should be on disk for the next start: {text!r}")
+    r.check(os.path.exists(pending), "the offset's own journal should be left as well")
+    # the machine comes back: a reboot cleared the offsets, and the next search concludes the last
+    out = m.cmd("undervolt", "find")
+    r.check(out.returncode == 0 and "did not come back from -100 mV" in out.stdout, out.stdout)
+    r.check("undervolt: -80 mV found on 20" in out.stdout and "-90 mV held, -100 mV took the machine down; two steps above that" in out.stdout, out.stdout)
+    r.check(not os.path.exists(state) and not os.path.exists(pending), "the step and the journal should be gone once concluded")
+    kept = get(found).splitlines() if os.path.exists(found) else []
+    r.check(kept[:2] == ["mv -80", "why crash"] and "good -90" in kept and "bad -100" in kept, str(kept))
+    out = m.cmd("list").stdout
+    r.check("undervolt: -80 mV found on 20" in out and "not applied by itself" in out, out[-900:])
+    r.note(f"held -50 to -90, died at -100: -80 mV recommended; {len(box.writes)} offset writes")
+    m.close()
+
+
+@scenario
+def undervolt_find_stops_at_a_machine_check_and_puts_the_offsets_back(r):
+    m = find_machine()
+    m.service()
+
+    def on_offset(plane, mv):
+        if mv == -70 and plane == 2:
+            with open(f"{m.root}/dev/kmsg", "a") as f:
+                f.write("4,812,5000000,-;mce: [Hardware Error]: CPU 1: Machine Check: 0 Bank 2: b200000000000000\n")
+
+    # the BIOS set -20 mV before: the search works from none and puts -20 back
+    box = Mailbox(m, on_offset, offsets=((0, -20), (2, -20)))
+    code = run_find(m, "--seconds", "12")
+    log = m.text()
+    state, pending, found = find_files(m)
+    r.check(code == 0, f"exit {code}:\n" + log[-900:])
+    r.check("-60 mV: held" in log and "-70 mV: a machine check in the kernel's log" in log, log[-900:])
+    r.check("undervolt: -50 mV found on 20" in log and "-60 mV held, -70 mV logged a machine check; two steps above that" in log, log[-600:])
+    r.check(box.offset(0) == -20 and box.offset(2) == -20, f"the offsets should be back at -20 mV: {box.offset(0)}, {box.offset(2)}")
+    r.check(m.told == b"du", f"the service should stop and start again: {m.told!r}")
+    r.check(not os.path.exists(state) and not os.path.exists(pending), "nothing pending after a search that ended")
+    kept = get(found).splitlines() if os.path.exists(found) else []
+    r.check(kept[:2] == ["mv -50", "why mce"], str(kept))
+    out = m.cmd("undervolt")
+    r.check("undervolt: -50 mV found" in out.stdout and "core: -20 mV" in out.stdout and "cache: -20 mV" in out.stdout, out.stdout)
+    box.stop()
+    r.note("held -50 and -60, a machine check at -70: -50 mV recommended; -20 mV put back")
+    m.close()
+
+
+@scenario
+def undervolt_find_holds_to_the_end_and_refuses_when_it_should(r):
+    m = find_machine()
+    box = Mailbox(m)
+    code = run_find(m, "--from", "-110", "--to", "-125", "--seconds", "10")
+    box.stop()
+    log = m.text()
+    r.check(code == 0 and "-110 mV: held" in log and "-120 mV: held" in log, f"exit {code}:\n" + log[-900:])
+    r.check("undervolt: -110 mV found on 20" in log and "every step down to -120 mV held; one step above that" in log, log[-500:])
+    r.check(box.offset(0) == 0 and box.offset(2) == 0, f"no offset should be left applied: {box.offset(0)}, {box.offset(2)}")
+    out = m.cmd("undervolt", "find", "--seconds", "3")
+    r.check(out.returncode == 2 and "N at least 10" in out.stdout, out.stdout)
+    m.close()
+    # on battery, on a CPU that ignores offsets (a plain file answers like a locked one), on AMD
+    m = find_machine(mains=False)
+    out = m.cmd("undervolt", "find")
+    r.check(out.returncode == 1 and "on battery" in out.stdout, out.stdout)
+    m.close()
+    m = find_machine()
+    out = m.cmd("undervolt", "find")
+    r.check(out.returncode == 1 and "locked undervolting" in out.stdout, out.stdout)
+    r.check(not os.path.exists(find_files(m)[0]), "no step should be on disk after a refusal")
+    m.close()
+    m = find_machine(cpuinfo="AuthenticAMD")
+    out = m.cmd("undervolt", "find")
+    r.check(out.returncode == 1 and "Curve Optimizer" in out.stdout, out.stdout)
+    m.close()
+
+
+@scenario
+def the_daemon_concludes_a_search_that_did_not_come_back(r):
+    m = find_machine(config="cpu0.max = 70\nundervolt.core = -50\nundervolt.cache = -50\n")
+    state, pending, found = find_files(m)
+    put(state, "step -100\ngood -90\nfrom -50\nto -125\nseconds 420")
+    put(pending, "applied")
+    box = Mailbox(m)
+    m.start()
+    m.advance(3, limit_cpu=70)
+    log = m.text()
+    r.check("did not come back from -100 mV" in log and "undervolt: -80 mV found" in log, log[:1200])
+    r.check("undervolt: core -50 mV, cache -50 mV" in log, "the service's own offset applies once the search is concluded:\n" + log[:1200])
+    r.check(not os.path.exists(state), "the step should be gone once concluded")
+    kept = get(found) if os.path.exists(found) else ""
+    r.check("why crash" in kept and "bad -100" in kept, kept)
+    m.stop()
+    box.stop()
+    m.close()
 
 
 @scenario

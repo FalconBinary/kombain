@@ -15,4 +15,6 @@ test {
     _ = @import("dump.zig");
     _ = @import("text.zig");
     _ = @import("calibrate.zig");
+    _ = @import("verify.zig");
+    _ = @import("uvfind.zig");
 }

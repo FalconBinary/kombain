@@ -60,6 +60,8 @@
 # guard.memory = no
 
 # Undervolting, Intel only, and only with kernel lockdown off: read the README first.
+# `zcool undervolt find` searches for the deepest offset this CPU holds and shows it, an
+# hour of work with a known answer; put what it found here, or in the BIOS.
 # In the BIOS is the better place for it, on Intel and on AMD.
 # undervolt.core = -50
 # undervolt.cache = -50

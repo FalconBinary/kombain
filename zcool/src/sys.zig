@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const verify = @import("verify.zig");
 
 const at_fdcwd: usize = @bitCast(@as(isize, -100));
 
@@ -247,7 +248,9 @@ pub fn reap(pid: i32, ms: i64) bool {
 }
 
 /// A process that only burns one core, `cpu`, until it is killed, or zcool goes however it goes.
-pub fn forkWorker(cpu: usize) ?i32 {
+/// With `expected` set it computes verify.work again and again and ends with `wrong_answer` the
+/// moment an answer differs: a CPU under a voltage offset gives wrong answers before it crashes.
+pub fn forkWorker(cpu: usize, expected: u64) ?i32 {
     const parent = linux.getpid();
     const pid = ok(linux.fork()) orelse return null;
     if (pid != 0) return @intCast(pid);
@@ -259,11 +262,43 @@ pub fn forkWorker(cpu: usize) ?i32 {
         mask[cpu / bits] = @as(usize, 1) << @intCast(cpu % bits);
         _ = linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(mask)), @intFromPtr(&mask));
     }
+    if (expected != 0) {
+        while (true) {
+            if (verify.work(verify.seed) != expected) linux.exit_group(wrong_answer);
+        }
+    }
     var x: f64 = 1;
     while (true) {
         x = x * 1.0000001 + 0.000001;
         std.mem.doNotOptimizeAway(x);
     }
+}
+
+/// The exit code of a worker whose answer was wrong.
+pub const wrong_answer: u8 = 3;
+
+/// How a child ended, or null while it runs: its exit code, 128 plus the signal that ended it, or
+/// 255 when there is no such child to ask about.
+pub fn exited(pid: i32) ?u32 {
+    var status: i32 = 0;
+    const rc = ok(linux.wait4(pid, &status, linux.W.NOHANG, null)) orelse return 255;
+    if (rc == 0) return null;
+    const s: u32 = @bitCast(status);
+    if (linux.W.IFEXITED(s)) return linux.W.EXITSTATUS(s);
+    if (linux.W.IFSIGNALED(s)) return 128 + @as(u32, @backingInt(linux.W.TERMSIG(s)));
+    return 255;
+}
+
+/// Moves `fd` to its end: what is read next is what comes after now. /dev/kmsg takes this too.
+pub fn lseekEnd(fd: i32) void {
+    _ = linux.lseek(fd, 0, linux.SEEK.END);
+}
+
+/// Seconds since 1970, by the wall clock.
+pub fn unixSeconds() i64 {
+    var ts: Timespec = .{ .sec = 0, .nsec = 0 };
+    _ = linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts)); // CLOCK_REALTIME
+    return ts.sec;
 }
 
 /// The CPUs this process may run on.

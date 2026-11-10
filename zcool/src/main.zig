@@ -14,6 +14,8 @@ const control = @import("control.zig");
 const config = @import("config.zig");
 const journal = @import("journal.zig");
 const undervolt = @import("undervolt.zig");
+const uvfind = @import("uvfind.zig");
+const verify = @import("verify.zig");
 const sandbox = @import("sandbox.zig");
 const gpus = @import("gpus.zig");
 const nvidia = @import("nvidia.zig");
@@ -2196,6 +2198,8 @@ fn runDaemon(selftest: bool) u8 {
         }
     }
 
+    // a search that did not come back: said once, here, where the service's log keeps it
+    if (!dry_run) _ = concludeCrashedSearch();
     var undervolted = false;
     if (dry_run) {
         if (cfg.undervolt_core != 0 or cfg.undervolt_cache != 0) sys.print("dry run: undervolt not applied\n");
@@ -2361,6 +2365,7 @@ fn listPower() void {
     } else if (cfg.tcc and undervolt.isIntel() and std.os.linux.getuid() != 0) {
         sys.print("tcc: only root reads where the CPU throttles itself: doas zcool list\n");
     }
+    if (loadFound()) |f| describeFound(&f);
     loadLearned();
     var first = true;
     for (chips[0..nchips]) |*c| {
@@ -2872,6 +2877,306 @@ fn runCalibrate(long: bool) u8 {
     return 0;
 }
 
+// ---------------------------------------------------------------- zcool undervolt find
+
+fn findStatePath(buf: []u8) [:0]const u8 {
+    return sys.join(buf, &.{ sys.root, "/var/lib/zcool/undervolt-find" });
+}
+
+fn foundPath(buf: []u8) [:0]const u8 {
+    return sys.join(buf, &.{ sys.root, "/var/lib/zcool/undervolt-found" });
+}
+
+/// The kernel's log from now on, for machine checks: /dev/kmsg, read from its end.
+const Kmsg = struct {
+    fd: i32 = -1,
+
+    fn open() Kmsg {
+        var path_buf: [256]u8 = undefined;
+        const fd = sys.openRead(sys.join(&path_buf, &.{ sys.root, "/dev/kmsg" })) orelse return .{};
+        sys.lseekEnd(fd);
+        return .{ .fd = fd };
+    }
+
+    /// True when a machine check was logged since the last look.
+    fn sawMachineCheck(self: *Kmsg) bool {
+        if (self.fd < 0) return false;
+        var buf: [4096]u8 = undefined;
+        var seen = false;
+        var reads: usize = 0;
+        while (reads < 256) : (reads += 1) {
+            const n = sys.read(self.fd, &buf) orelse break;
+            if (n == 0) break;
+            if (uvfind.isMachineCheck(buf[0..n])) seen = true;
+        }
+        return seen;
+    }
+
+    fn close(self: *Kmsg) void {
+        if (self.fd >= 0) sys.close(self.fd);
+        self.fd = -1;
+    }
+};
+
+/// 2026-11-10, from seconds since 1970.
+fn addDate(t: *Text, unix: i64) void {
+    if (unix <= 0) return;
+    const day = (std.time.epoch.EpochSeconds{ .secs = @intCast(unix) }).getEpochDay().calculateYearDay();
+    const md = day.calculateMonthDay();
+    _ = t.num(day.year).add("-");
+    const month: i64 = md.month.numeric();
+    if (month < 10) _ = t.add("0");
+    _ = t.num(month).add("-");
+    const d: i64 = @as(i64, md.day_index) + 1;
+    if (d < 10) _ = t.add("0");
+    _ = t.num(d);
+}
+
+/// What a search found, as `zcool list`, `zcool undervolt` and the search itself say it.
+fn describeFound(f: *const uvfind.Found) void {
+    const t = &cal_line;
+    if (f.mv >= 0) {
+        _ = t.add("undervolt: none found");
+    } else {
+        _ = t.add("undervolt: ").num(f.mv).add(" mV found");
+    }
+    if (f.when > 0) {
+        _ = t.add(" on ");
+        addDate(t, f.when);
+    }
+    _ = t.add(": ");
+    if (f.why == .floor) {
+        _ = t.add("every step down to ").num(f.good orelse f.mv - uvfind.step_mv).add(" mV held; one step above that");
+    } else {
+        if (f.good) |g| _ = t.num(g).add(" mV held, ");
+        _ = t.num(f.bad orelse 0).add(switch (f.why) {
+            .crash => " mV took the machine down",
+            .mce => " mV logged a machine check",
+            else => " mV gave a wrong answer under load",
+        }).add("; two steps above that");
+    }
+    t.line();
+    t.add("  not applied by itself: undervolt.core and undervolt.cache in /etc/zcool.conf, or the BIOS").line();
+}
+
+fn loadFound() ?uvfind.Found {
+    var path_buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    return uvfind.Found.parse(sys.readFile(foundPath(&path_buf), &buf) orelse return null);
+}
+
+fn saveFound(f: *const uvfind.Found) bool {
+    var path_buf: [256]u8 = undefined;
+    var dir_buf: [256]u8 = undefined;
+    var buf: [256]u8 = undefined;
+    sys.mkdir(sys.join(&dir_buf, &.{ sys.root, "/var/lib/zcool" }));
+    return sys.replaceFile(foundPath(&path_buf), f.format(&buf));
+}
+
+/// A search that did not come back: its state file is still there, so the step it was on took the
+/// machine down. Concludes it, two steps above, and says so. True when there was one.
+fn concludeCrashedSearch() bool {
+    var path_buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const path = findStatePath(&path_buf);
+    const text = sys.readFile(path, &buf) orelse return false;
+    const state = uvfind.State.parse(text) orelse {
+        sys.unlink(path);
+        return false;
+    };
+    const found = uvfind.Found{ .mv = uvfind.recommend(state.step, state.step), .good = state.good, .bad = state.step, .why = .crash, .seconds = state.seconds, .when = sys.unixSeconds() };
+    _ = saveFound(&found);
+    sys.unlink(path);
+    // the search's own step took the machine down, not the offset the service applies
+    undervolt.markStable();
+    cal_line.add("the last undervolt search did not come back from ").num(state.step).add(" mV:").line();
+    describeFound(&found);
+    return true;
+}
+
+const StepResult = union(enum) { held, stopped, failed: uvfind.Why };
+
+/// What ended a step, looked at every tick: a worker whose answer was wrong, or a machine check.
+fn watchStep(run: *Calibration, kmsg: *Kmsg) ?uvfind.Why {
+    if (run.load.ended() != null) return .wrong_answer;
+    if (kmsg.sawMachineCheck()) return .mce;
+    return null;
+}
+
+/// One step of the ladder: work with a known answer on every core, the die held at its limit, for
+/// `hot_s`; then `cold_s` of three-second bursts on one core out of idle, the single-core turbo and
+/// the idle states the all-core work never visits, where a lowered voltage fails first.
+fn runStep(run: *Calibration, kmsg: *Kmsg, hot_s: f32, cold_s: f32) StepResult {
+    calibrationStep(run.cores);
+    if (sys.root.len == 0) run.load.set(run.cores);
+    var t: f32 = 0;
+    while (t < hot_s) {
+        t += run.tick(255, true, true) orelse return .stopped;
+        if (watchStep(run, kmsg)) |why| return .{ .failed = why };
+    }
+    var on = false;
+    var phase: f32 = 3;
+    t = 0;
+    while (t < cold_s) {
+        if (phase >= 3) {
+            on = !on;
+            phase = 0;
+            calibrationStep(if (on) 1 else 0);
+            if (sys.root.len == 0) run.load.set(if (on) 1 else 0);
+        }
+        const dt = run.tick(255, true, true) orelse return .stopped;
+        t += dt;
+        phase += dt;
+        if (watchStep(run, kmsg)) |why| return .{ .failed = why };
+    }
+    calibrationStep(0);
+    if (sys.root.len == 0) run.load.set(0);
+    return .held;
+}
+
+const Search = struct { good: ?i32 = null, bad: ?i32 = null, why: uvfind.Why = .floor, aborted: bool = false };
+
+/// The ladder from `from` down to `to`: each step on disk before its offset is written, applied
+/// through the same journal as the service's offset, run, and marked stable when it held.
+fn runLadder(run: *Calibration, kmsg: *Kmsg, from: i32, to: i32, seconds: u32) Search {
+    var s = Search{};
+    const hot_s: f32 = @floatFromInt(uvfind.hotSeconds(seconds));
+    const cold_s: f32 = @floatFromInt(seconds - uvfind.hotSeconds(seconds));
+    var path_buf: [256]u8 = undefined;
+    var state_buf: [128]u8 = undefined;
+    var mv: ?i32 = from;
+    while (mv) |rung| : (mv = uvfind.next(rung, to)) {
+        const state = uvfind.State{ .step = rung, .good = s.good, .from = from, .to = to, .seconds = seconds };
+        if (!sys.replaceFile(findStatePath(&path_buf), state.format(&state_buf))) {
+            sys.print("cannot write /var/lib/zcool/undervolt-find: an offset is never tried without a record of it\n");
+            s.aborted = true;
+            return s;
+        }
+        if (undervolt.apply(rung, rung)) |reason| {
+            cal_line.add("  ").num(rung).add(" mV: ").add(undervolt.explain(reason)).line();
+            s.aborted = true;
+            return s;
+        }
+        _ = cal_line.add("  ").num(rung).add(" mV: ");
+        switch (runStep(run, kmsg, hot_s, cold_s)) {
+            .stopped => {
+                cal_line.add("stopped").line();
+                s.aborted = true;
+                return s;
+            },
+            .held => {
+                cal_line.add("held").line();
+                s.good = rung;
+                undervolt.markStable();
+            },
+            .failed => |why| {
+                cal_line.add(if (why == .mce) "a machine check in the kernel's log" else "a wrong answer under load").line();
+                s.bad = rung;
+                s.why = why;
+                return s;
+            },
+        }
+    }
+    return s;
+}
+
+/// `zcool undervolt find`: the deepest voltage offset this CPU holds, found the only way it can
+/// be: by trying, from `from` down to `to` in steps, `seconds` a step, with the machine itself as
+/// the judge. The result is shown and kept, never applied.
+fn runFind(from: i32, to: i32, seconds: u32) u8 {
+    if (concludeCrashedSearch()) {
+        sys.print("that was the last search's end; `zcool undervolt find` again searches anew\n");
+        return 0;
+    }
+    if (std.os.linux.getuid() != 0 and sys.root.len == 0) {
+        sys.print("the search sets voltage offsets, power limits and fans: doas zcool undervolt find\n");
+        return 1;
+    }
+    if (dry_run) {
+        sys.print("the search has no dry run: it measures what the CPU does under an offset\n");
+        return 2;
+    }
+    if (openMains()) |fd| {
+        defer sys.close(fd);
+        if (sys.readIntFd(fd) == 0) {
+            sys.print("on battery: plug the charger in, the search runs the CPU at full power\n");
+            return 1;
+        }
+    }
+    if (!undervolt.probe()) return 1;
+    // the service runs the same fans and limits: it stops for the hour, and comes back
+    var stopped = false;
+    if (menu.serviceRunning()) {
+        sys.print("stopping the zcool service while the search runs\n");
+        stopped = menu.tellService("d") orelse false;
+        var waited: u32 = 0;
+        while (menu.serviceRunning() and waited < 50) : (waited += 1) sys.sleepMs(200);
+        if (menu.serviceRunning()) {
+            sys.print("the service did not stop: doas sv stop zcool, then try again\n");
+            return 1;
+        }
+    }
+    defer if (stopped) {
+        _ = menu.tellService("u");
+        sys.print("the zcool service runs again\n");
+    };
+    journal.prepare();
+    _ = journal.restore();
+    gpus.scan();
+    discover();
+    if (cfg.learn) loadLearned();
+    var cpu: ?*Chip = null;
+    for (chips[0..nchips]) |*c| {
+        if (c.kind == .cpu and c.controlled()) {
+            cpu = c;
+            break;
+        }
+    }
+    const c = cpu orelse {
+        sys.print("no CPU with a limit: the search holds the CPU at its limit, and cannot\n");
+        return 1;
+    };
+    if (cpu_power.rapl_count == 0) {
+        sys.print("this CPU shows no power limit (RAPL): the search holds the CPU at its limit, and cannot\n");
+        return 1;
+    }
+    installSignals();
+    if (cfg.tcc and undervolt.isIntel() and !undervolt.lockdownActive()) tcc.apply(c.base_limit, false);
+    var path_buf: [256]u8 = undefined;
+    sys.mkdir(sys.join(&path_buf, &.{ sys.root, "/var/lib/zcool" }));
+    // the offsets as they are now go back at the end; the known answer is computed at none
+    const before = undervolt.offsets() orelse .{ 0, 0 };
+    if (before[0] != 0 or before[1] != 0) _ = undervolt.restore(0, 0);
+    const expected = verify.work(verify.seed);
+    const cores = if (sys.root.len > 0) @max(cpu_power.npolicies, 1) else sys.cpuCount();
+    var run = Calibration{ .c = c, .cores = cores, .last = sys.nowMs() };
+    run.load.expected = expected;
+    const hot_s = uvfind.hotSeconds(seconds);
+    cal_line.add("searching for the deepest offset this CPU holds: ").num(from).add(" to ").num(to).add(" mV in steps of ").num(uvfind.step_mv).add("; a step is ").num(hot_s).add(" s of work with a known answer on every core at the ").whole(c.limit).add("C limit, then ").num(seconds - hot_s).add(" s of bursts on one core out of idle").line();
+    sys.print("a wrong answer, a machine check or the machine going down ends it: the last is read at the next start. Ctrl-C stops it and keeps nothing\n");
+    var kmsg = Kmsg.open();
+    defer kmsg.close();
+    var s = Search{ .aborted = true };
+    if (run.coolDown()) s = runLadder(&run, &kmsg, from, to, seconds);
+    run.load.stop();
+    calibrationStep(0);
+    // power, fans, everything back as it was, the offsets too
+    emergencyRestore();
+    restoring = false;
+    sys.unlink(findStatePath(&path_buf));
+    undervolt.markStable();
+    _ = undervolt.restore(before[0], before[1]);
+    if (s.aborted) {
+        sys.print("search stopped: nothing was kept, everything is back as it was\n");
+        return 1;
+    }
+    const found = uvfind.Found{ .mv = uvfind.recommend(s.bad, s.good orelse from), .good = s.good, .bad = s.bad, .why = s.why, .seconds = seconds, .when = sys.unixSeconds() };
+    if (!saveFound(&found)) sys.print("cannot write /var/lib/zcool/undervolt-found\n");
+    sys.print("\n");
+    describeFound(&found);
+    return 0;
+}
+
 fn measure(run: *Calibration) bool {
     sys.print("how fast it runs on one CPU, half of them and all\n");
     const counts = [calibrate.core_points]usize{ 1, @max(run.cores / 2, 1), run.cores };
@@ -3192,6 +3497,8 @@ const usage =
     \\  zcool undervolt off       clears them
     \\  zcool undervolt probe     whether firmware allows offsets: 1 mV, then back
     \\  zcool undervolt reset     forgets that a run with an offset did not end cleanly
+    \\  zcool undervolt find      the deepest offset this CPU holds, by a ladder of steps under work with a
+    \\                            known answer, hours; shown, never applied by itself. --from, --to, --seconds
     \\
     \\Limits and other settings live in /etc/zcool.conf, see the README.
     \\
@@ -3202,6 +3509,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     nvidia.setEnvironment(init.environ.block.slice.ptr);
     var command: []const u8 = "";
     var sub: []const u8 = "";
+    var extras: [8][]const u8 = undefined;
+    var nextras: usize = 0;
     var config_path: ?[:0]const u8 = null;
     var selftest = false;
     var i: usize = 1;
@@ -3219,8 +3528,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             config_path = std.mem.span(argv[i]);
         } else if (command.len == 0) {
             command = arg;
-        } else {
+        } else if (sub.len == 0) {
             sub = arg;
+        } else if (nextras < extras.len) {
+            extras[nextras] = arg;
+            nextras += 1;
         }
     }
 
@@ -3266,6 +3578,30 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             undervolt.markStable();
             return 0;
         }
+        if (std.mem.eql(u8, sub, "find")) {
+            loadConfig(config_path);
+            var from: i32 = uvfind.default_from;
+            var to: i32 = uvfind.floor_mv;
+            var seconds: u32 = uvfind.default_seconds;
+            var k: usize = 0;
+            while (k + 1 < nextras) : (k += 2) {
+                const value = std.fmt.parseInt(i32, extras[k + 1], 10) catch break;
+                if (std.mem.eql(u8, extras[k], "--from")) {
+                    from = value;
+                } else if (std.mem.eql(u8, extras[k], "--to")) {
+                    to = value;
+                } else if (std.mem.eql(u8, extras[k], "--seconds") and value >= 10) {
+                    seconds = @intCast(value);
+                } else break;
+            }
+            if (k != nextras or from > 0 or to < uvfind.floor_mv or from < to) {
+                sys.print("zcool undervolt find [--from MV] [--to MV] [--seconds N]: MV from 0 down to -125, N at least 10\n");
+                return 2;
+            }
+            return runFind(from, to, seconds);
+        }
+        _ = concludeCrashedSearch();
+        if (loadFound()) |f| describeFound(&f);
         undervolt.report();
         return 0;
     }

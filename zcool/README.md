@@ -404,6 +404,23 @@ Writing to the register has only been tested against a model of it, never on a C
 `zcool undervolt probe` tells whether firmware lets offsets through. It moves the core
 offset by 1 mV, reads it back, and puts back what was there.
 
+`zcool undervolt find` searches for the deepest offset this CPU holds, the only way it can be
+searched for: by trying, with the machine itself as the judge. From -50 mV down to -125 in
+steps of 10, core and cache together, each step held for seven minutes: five of work with a
+known answer on every core with the die held at its limit, then two of three-second bursts on
+one core out of idle, where the single-core turbo and the idle states live and a lowered
+voltage fails first. Three things end a step: a worker whose answer differs from the one
+computed at the CPU's own voltage (a wrong result comes before a crash does), a machine check
+in the kernel's log, and the machine going down, which the next start reads from the step left
+on disk before its offset was written. The result is two steps above the first offset that
+failed, 10 to 20 mV of margin to the edge it found, or one step above the deepest step when
+nothing failed. `zcool list` shows it with the date. It is never applied by itself: put it in
+the BIOS, or in `undervolt.core` and `undervolt.cache`. About an hour; keep nothing important
+open meanwhile, since a hang is one of the answers. `--seconds N` is a step's length, `--from`
+and `--to` the ladder's ends, the same value for both to check one offset. What held for seven
+minutes a step is a bound, not a proof: the margin is for that, and a search again after a BIOS
+update, or a year on, costs an hour.
+
 ## Checks
 
 ```sh

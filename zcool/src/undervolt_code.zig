@@ -30,13 +30,24 @@ pub fn decodeOffset(value: u64) i32 {
     return @intFromFloat(@round(@as(f32, @floatFromInt(signed)) / 1.024));
 }
 
-/// Writes an offset and asks the CPU what it now holds. `port` has write(u64) bool and read() ?u64.
-/// A CPU with undervolting locked accepts the write and keeps its old value.
+/// Writes an offset and asks the CPU what it now holds. `port` has write(u64) bool, read() ?u64 and
+/// settle(), a moment between asking and reading: the CPU's mailbox answers at once, a register
+/// another process stands in for (the tests') does not. A CPU with undervolting locked accepts the
+/// write and keeps its old value.
 pub fn setPlane(port: anytype, plane: u6, mv: i32) bool {
     if (!port.write(encodeWrite(plane, mv))) return false;
+    port.settle();
     if (!port.write(encodeRead(plane))) return false;
+    port.settle();
     const back = port.read() orelse return false;
     return decodeOffset(back) == mv;
+}
+
+/// The offset a plane holds now.
+pub fn readPlane(port: anytype, plane: u6) ?i32 {
+    if (!port.write(encodeRead(plane))) return null;
+    port.settle();
+    return decodeOffset(port.read() orelse return null);
 }
 
 pub const Probe = enum { open, locked, failed };
@@ -44,14 +55,12 @@ pub const Probe = enum { open, locked, failed };
 /// Whether the CPU takes offsets at all: moves the plane by 1 mV, reads it back and puts back
 /// what was there. `failed` when the register could not be read, or the old value not put back.
 pub fn probe(port: anytype, plane: u6) Probe {
-    if (!port.write(encodeRead(plane))) return .failed;
-    const now = decodeOffset(port.read() orelse return .failed);
+    const now = readPlane(port, plane) orelse return .failed;
     const step = if (now > max_offset_mv) now - 1 else now + 1;
     if (!setPlane(port, plane, step)) {
         // a locked CPU kept its value; anything else is a register that does not answer as expected
-        if (!port.write(encodeRead(plane))) return .failed;
-        const back = port.read() orelse return .failed;
-        return if (decodeOffset(back) == now) .locked else .failed;
+        const back = readPlane(port, plane) orelse return .failed;
+        return if (back == now) .locked else .failed;
     }
     return if (setPlane(port, plane, now)) .open else .failed;
 }
@@ -75,12 +84,16 @@ const FakeCpu = struct {
     fn read(self: *FakeCpu) ?u64 {
         return self.latch;
     }
+
+    fn settle(_: *FakeCpu) void {}
 };
 
 test "an offset that takes is confirmed by the CPU" {
     var cpu = FakeCpu{};
     try std.testing.expect(setPlane(&cpu, core_plane, -80));
     try std.testing.expect(setPlane(&cpu, cache_plane, -60));
+    try std.testing.expectEqual(@as(?i32, -80), readPlane(&cpu, core_plane));
+    try std.testing.expectEqual(@as(?i32, -60), readPlane(&cpu, cache_plane));
     try std.testing.expectEqual(@as(i32, -80), decodeOffset(cpu.offsets[core_plane]));
     try std.testing.expectEqual(@as(i32, -60), decodeOffset(cpu.offsets[cache_plane]));
     try std.testing.expect(setPlane(&cpu, core_plane, 0));

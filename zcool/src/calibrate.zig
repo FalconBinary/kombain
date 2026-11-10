@@ -282,10 +282,13 @@ pub fn tenths(text: []const u8) ?f32 {
 
 pub const max_workers = 256;
 
-/// Busy processes, one per core it loads. Each dies with zcool, however zcool ends.
+/// Busy processes, one per core it loads. Each dies with zcool, however zcool ends. With
+/// `expected` set (`zcool undervolt find`) each computes work with that known answer and ends the
+/// moment an answer differs.
 pub const Load = struct {
     pids: [max_workers]i32 = undefined,
     n: usize = 0,
+    expected: u64 = 0,
 
     pub fn set(self: *Load, want: usize) void {
         while (self.n > want) {
@@ -294,10 +297,19 @@ pub const Load = struct {
             _ = sys.reap(self.pids[self.n], 1000);
         }
         while (self.n < @min(want, max_workers)) {
-            const pid = sys.forkWorker(self.n) orelse return;
+            const pid = sys.forkWorker(self.n, self.expected) orelse return;
             self.pids[self.n] = pid;
             self.n += 1;
         }
+    }
+
+    /// How a worker ended, or null while all of them run. A worker ends on its own only with a
+    /// wrong answer (sys.wrong_answer); anything else that ended one is as telling.
+    pub fn ended(self: *const Load) ?u32 {
+        for (self.pids[0..self.n]) |pid| {
+            if (sys.exited(pid)) |code| return code;
+        }
+        return null;
     }
 
     pub fn stop(self: *Load) void {
