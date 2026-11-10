@@ -177,11 +177,14 @@ pub const Model = struct {
     }
 };
 
-/// A jump of the die seen as zcool runs. The die answers its power within a tick; the power
-/// reading is an average over half a second and shows the step whole only a tick or two later.
-/// So the step is seen on the die, its size taken from that tick less half a tick of the sink's
-/// new climb (the next tick shows the climb), and the power is read again three quarters of a
-/// second on, when a whole sample of the new power is in.
+/// A jump of the die seen as zcool runs. The die answers its power within a tick, but the sensor
+/// may not: the kernel hands out a coretemp reading for a second, so the jump shows up to four
+/// ticks after the power made it, in one piece or two. The power reading is an average over half
+/// a second and shows the step whole only a tick or two later. So the step is seen on the die,
+/// its size taken from that tick less half a tick of the sink's new climb (the next tick shows
+/// the climb), a second piece within a second and a half added to it, and the power is read a
+/// second and a quarter on, against the power a second and a half before the jump showed, which
+/// is from before the step whichever tick the jump showed on.
 pub const Jump = struct {
     d_die: f32 = 0,
     dt: f32 = 0,
@@ -190,20 +193,39 @@ pub const Jump = struct {
     age: f32 = 0,
     /// 0 nothing, 1 the die jumped this tick, 2 the climb after it is known
     state: u8 = 0,
+    /// the reading has not moved since the jump: a sensor refreshed once a second between its
+    /// refreshes, where a second piece of the jump may still come. A reading that climbs on is
+    /// a sensor that keeps up, and a second jump on it is a second step
+    flat: bool = false,
+    /// the power of the last ticks, newest first
+    recent: [6]f32 = @splat(-1),
 
     pub const Sample = struct { d_die: f32, d_watts: f32 };
 
     pub fn update(self: *Jump, die: f32, last_die: f32, watts: f32, last_watts: f32, dt: f32) ?Sample {
+        defer self.remember(watts);
         if (dt > 1.1) {
             self.state = 0;
             return null;
         }
         const d = die - last_die;
         if (@abs(d) >= 1.5) {
+            if (self.state != 0 and self.flat and self.age < 1.5 and (d > 0) == (self.d_die > 0)) {
+                // the rest of the same jump, a second's refresh later
+                self.d_die += d;
+                self.dt = dt;
+                self.die_at = die;
+                self.age = 0;
+                self.state = 1;
+                return null;
+            }
             // a new jump, or the first: a second one on top restarts the count
-            self.* = .{ .d_die = d, .dt = dt, .die_at = die, .watts_before = last_watts, .state = 1 };
+            const watts_before = self.before(last_watts);
+            const recent = self.recent;
+            self.* = .{ .d_die = d, .dt = dt, .die_at = die, .watts_before = watts_before, .state = 1, .flat = true, .recent = recent };
             return null;
         }
+        if (@abs(d) > 0.3) self.flat = false;
         switch (self.state) {
             0 => return null,
             1 => {
@@ -213,9 +235,24 @@ pub const Jump = struct {
             else => {},
         }
         self.age += dt;
-        if (self.age < 0.75) return null;
+        if (self.age < 1.1) return null;
         self.state = 0;
         return .{ .d_die = self.d_die, .d_watts = watts - self.watts_before };
+    }
+
+    /// The power a second and a half before this tick, or the oldest known, or `fallback`.
+    fn before(self: *const Jump, fallback: f32) f32 {
+        var i: usize = self.recent.len;
+        while (i > 0) : (i -= 1) {
+            if (self.recent[i - 1] >= 0) return self.recent[i - 1];
+        }
+        return fallback;
+    }
+
+    fn remember(self: *Jump, watts: f32) void {
+        var i: usize = self.recent.len - 1;
+        while (i > 0) : (i -= 1) self.recent[i] = self.recent[i - 1];
+        self.recent[0] = watts;
     }
 };
 
@@ -475,10 +512,49 @@ test "a jump is read off the die and the power a moment later" {
     try std.testing.expect(j.update(51.0, 40.0, 5, 5, 0.25) == null);
     try std.testing.expect(j.update(51.7, 51.0, 47, 5, 0.25) == null);
     try std.testing.expect(j.update(52.4, 51.7, 90, 47, 0.25) == null);
-    const s = j.update(53.1, 52.4, 90, 90, 0.25).?;
+    try std.testing.expect(j.update(53.1, 52.4, 90, 90, 0.25) == null);
+    try std.testing.expect(j.update(53.8, 53.1, 90, 90, 0.25) == null);
+    const s = j.update(54.5, 53.8, 90, 90, 0.25).?;
     // 11.0 less half a tick of the climb at 2.8 C/s: about 10.65
     try std.testing.expectApproxEqAbs(@as(f32, 10.65), s.d_die, 0.05);
     try std.testing.expectApproxEqAbs(@as(f32, 85), s.d_watts, 0.01);
     // nothing more from the same jump
-    try std.testing.expect(j.update(53.8, 53.1, 90, 90, 0.25) == null);
+    try std.testing.expect(j.update(55.2, 54.5, 90, 90, 0.25) == null);
+}
+
+test "a jump the sensor shows a second late is read against the power before the step" {
+    // the power steps 5 to 90 W; coretemp, refreshed once a second, says 40 C for three more
+    // ticks, when the power reading is long at 90, then 51 at once
+    var j = Jump{};
+    try std.testing.expect(j.update(40, 40, 5, 5, 0.25) == null);
+    try std.testing.expect(j.update(40, 40, 47, 5, 0.25) == null);
+    try std.testing.expect(j.update(40, 40, 90, 47, 0.25) == null);
+    try std.testing.expect(j.update(40, 40, 90, 90, 0.25) == null);
+    try std.testing.expect(j.update(51, 40, 90, 90, 0.25) == null);
+    var i: usize = 0;
+    while (i < 4) : (i += 1) try std.testing.expect(j.update(51, 51, 90, 90, 0.25) == null);
+    const late = j.update(51, 51, 90, 90, 0.25).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 11), late.d_die, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 85), late.d_watts, 0.01);
+    // a sensor that keeps up and shows the sink's steep climb after the jump: a second jump on
+    // it is a second step, not the rest of the first (restarts, as before)
+    j = Jump{};
+    try std.testing.expect(j.update(40, 40, 5, 5, 0.25) == null);
+    try std.testing.expect(j.update(51, 40, 5, 5, 0.25) == null);
+    try std.testing.expect(j.update(52.4, 51, 90, 5, 0.25) == null);
+    try std.testing.expect(j.update(53.8, 52.4, 90, 90, 0.25) == null);
+    try std.testing.expect(j.update(55.4, 53.8, 90, 90, 0.25) == null);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.6), j.d_die, 0.01);
+    // the jump in two pieces, a refresh apart: one jump of 11 C
+    j = Jump{};
+    try std.testing.expect(j.update(40, 40, 5, 5, 0.25) == null);
+    try std.testing.expect(j.update(46, 40, 90, 5, 0.25) == null);
+    i = 0;
+    while (i < 3) : (i += 1) try std.testing.expect(j.update(46, 46, 90, 90, 0.25) == null);
+    try std.testing.expect(j.update(51, 46, 90, 90, 0.25) == null);
+    i = 0;
+    while (i < 4) : (i += 1) try std.testing.expect(j.update(51, 51, 90, 90, 0.25) == null);
+    const split = j.update(51, 51, 90, 90, 0.25).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 11), split.d_die, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 85), split.d_watts, 0.01);
 }

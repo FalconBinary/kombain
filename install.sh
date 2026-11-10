@@ -187,7 +187,7 @@ if [ "$zcool" -eq 1 ]; then
 		echo "kept /etc/zcool.conf"
 	else
 		install -m 644 "$here/zcool/zcool.conf.example" /etc/zcool.conf
-		echo "created /etc/zcool.conf"
+		echo "created /etc/zcool.conf: set cpu0.max in it before zcool calibrate"
 	fi
 	echo "zcool is installed but not running. Start with: zcool list, then zcool run --dry-run (see zcool/README.md)"
 fi

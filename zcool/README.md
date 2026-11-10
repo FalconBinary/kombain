@@ -112,6 +112,11 @@ die at the limit and on a sink still warm from the last load that measures power
 CPU's speed (a run right after another on the GF63 read 2500 MHz on six CPUs at 13 W, against
 3647 MHz at 33 W from cold).
 
+Set the limit first (`cpu0.max` in `/etc/zcool.conf`; left out, a CPU's is 10 C under its
+critical point, 90 C on most Intel laptops): everything below is measured at the limit, and a
+changed limit wants a new calibration. A fresh conf after a reinstall put the GF63's second
+calibration at 90 C where its first had been at 70.
+
 - **How fast it runs** on one CPU, on half of them and on all, held at its limit: the clocks of
   the CPUs it loads, not of the idle ones.
 - **How fast it runs at each power,** from 30% of the firmware's long-term limit (PL1) to all
@@ -142,14 +147,20 @@ stops it: nothing is kept and everything is put back. It goes to `/var/lib/zcool
 the short calibration's own minutes): zcool measures four things and keeps them in
 `/var/lib/zcool/model`:
 
-- how far the die sits above its heat sink per watt, from the jump a sensor shows the moment
-  power steps up (three steps, every fan at full);
-- the sink's own time, from the climb after the last of those steps: how long the die takes to
-  cover 63% of the way to where it settles;
+- how far the die sits above its heat sink per watt: 45 s at a low power, then a step to 90%
+  of what the cooler carries, every fan at full, three times; a line through the readings of
+  seconds 2 to 7 after each step, where the die's own jump is over and the sink's climb still
+  nearly straight, taken back to the step, against the power measured before and after it;
+- the sink's own time, from the climb after the last step, which stays at 80% of what the
+  cooler carries until it settles: how long the die takes, from 2.5 s in, to cover 63% of the
+  way to where it settles. A climb that goes over the limit, sits at it or never settles tells
+  nothing, and the steady states below are held 90 s to five minutes;
 - what the cooler carries per degree over the room at each fan speed, from the steady state of
-  each speed at two powers under what it carries, each held for four of the sink's times (a
-  minute at least, ten of them at most) and until the mean of the last 45 s agrees with the mean
-  of the 45 s before within 0.3 C; the sink's thermal mass comes from how long each settling took;
+  each speed at two powers under what it carries, each held for four of the sink's times (90 s
+  at least, ten of them at most) and until the mean of the last 45 s agrees with the mean of the
+  45 s before within 0.3 C; the sink's thermal mass comes from how long each settling took. A
+  state whose die goes over the limit after its first 15 s, or settles within a degree of it, is
+  the CPU's own throttle holding it, not the cooler, and is left out;
 - the room's temperature, read with the load off and every fan at full, held as long as a steady
   state; when it comes out warmer than the room the lines through the steady states meet at, the
   sink was still warm, and the lines win.
@@ -162,7 +173,12 @@ first long calibration on the GF63 taught all of this: a reading that stood stil
 had passed for a steady state while the sink, which takes minutes, still climbed (coretemp counts
 whole degrees, so a die can sit on one for half a minute), and the fit had the cooler carrying
 more at 80% than at full, the room at 38 C off a sink still warm, and the fans at full holding
-24 W where they had just carried 30.
+24 W where they had just carried 30. The second, at 90 C, taught the rest: the kernel hands out
+a coretemp reading for a second, so a jump read two ticks after the step came out -18, 0 and 9 C
+over the same 30 W; the climb to 95% of a carry measured minutes before, on a sink still warming,
+reached the limit, and its "7 s", counted from a reading still from before the jump, had every
+steady state held a minute; and three states begun at the limit, the die still coming down from
+the phase before, were thrown out as over it before their power had done anything.
 
 With the model zcool knows where the temperature goes, instead of extrapolating where it was
 going. It follows the sink's temperature by the model's own account, corrected by the reading:
@@ -178,8 +194,9 @@ long it lasts: a burst of a few seconds from rest costs nothing, a sustained loa
 power the cooler holds. `burst.ac` stays the ceiling.
 
 The model keeps learning as zcool runs. A power step of 25 W or more shows on the die within a
-tick; its jump, less half a tick of the sink's climb, against the power read a moment later when a
-whole sample of the new power is in, teaches the die's offset. Every 15 s of the die holding
+tick, or up to a second later and in two pieces where the kernel hands out a reading for a second
+(coretemp); its jump, less half a tick of the sink's climb, against the power a second and a
+half before it showed and the power a second and a quarter after, teaches the die's offset. Every 15 s of the die holding
 level at one fan speed teaches what the cooler carries there, from the power averaged over that
 time (it may hunt meanwhile); the other speeds move by the same factor, since dust slows one
 cooler at every speed alike, so a cooler that dust has slowed is learned down at every speed.

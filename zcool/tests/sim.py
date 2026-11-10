@@ -38,7 +38,8 @@ class Chip:
     """One chip with a heat load, a thermal mass and a conductance that depends on its fan,
     and for a GPU in a case a little on the case fan too."""
 
-    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0, r_die=0.0, whole_degrees=False):
+    def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0, r_die=0.0, whole_degrees=False,
+                 cache_s=0.0):
         self.load, self.g_min, self.g_max, self.mass, self.g_case = load, g_min, g_max, mass, g_case
         self.temp, self.ambient = temp, ambient
         # a laptop CPU's die sits above its heat sink by what flows through it: its sensor jumps
@@ -47,6 +48,9 @@ class Chip:
         # coretemp reports whole degrees (how the DTS rounds within one is not documented: the
         # nearest here): a reading can sit still for a minute while the sink moves
         self.whole_degrees = whole_degrees
+        # and the kernel hands out the same coretemp reading for a second (coretemp.c refreshes
+        # it after HZ jiffies): a jump shows up to a second late, in one piece or two
+        self.cache_s = cache_s
         self.reading = temp
         self.now_perf = 1.0
         self.work = 0.0
@@ -137,6 +141,7 @@ class Machine:
         # that average reaches it the CPU may draw up to the short-term limit
         self.rapl_window, self.window_avg = rapl_window, 0.0
         self.energy = 0.0
+        self.cpu_published = 0.0
         self.freq, self.cores = freq, cores
         # under calibration the load is what zcool asks for in /run/zcool/calibration: this much on every core
         self.cal_full = cal_full
@@ -393,9 +398,12 @@ class Machine:
                 os.pwrite(fd, struct.pack(">H", period), Ec.FAN_RPM[i])
                 os.close(fd)
         if self.cpu:
-            reading = round(self.cpu.reading) if self.cpu.whole_degrees else self.cpu.reading
-            self._write_temp(f"{self.cpu_dir}/temp1_input", reading)
-            self._write_temp(f"{self.cpu_dir}/temp2_input", reading + 1)
+            now = time.time()
+            if now - self.cpu_published >= self.cpu.cache_s:
+                self.cpu_published = now
+                reading = round(self.cpu.reading) if self.cpu.whole_degrees else self.cpu.reading
+                self._write_temp(f"{self.cpu_dir}/temp1_input", reading)
+                self._write_temp(f"{self.cpu_dir}/temp2_input", reading + 1)
             if self.freq:
                 # the clocks a CPU-bound load runs at: what its power allows of the 5 GHz top
                 khz = int(5000000 * max(0.16, min(1, self.cpu.now_perf))) if self.cpu.load > 5 else 800000
@@ -2386,12 +2394,15 @@ def model_file(m):
 @scenario
 @long
 def the_long_calibration_fits_the_machines_heat(r):
-    # as the GF63 reads: a die that counts whole degrees, 0.2 C/W over a sink that takes its time.
-    # 15 J/C against 1.2 W/C at full is 13 s; the laptop's takes minutes. The calibration measures
-    # that time off the climb after a power step and holds each steady state for four of it, so
-    # this runs about a quarter of an hour where the laptop takes up to an hour. Whole degrees
-    # put each steady state up to half a degree off, two of them 11 C apart: a tenth on g.
-    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=15, r_die=0.2, whole_degrees=True), cpu_fan=False, ec=Ec(one_fan=True),
+    # as the GF63 reads: a die that counts whole degrees, refreshed once a second by the kernel,
+    # 0.2 C/W over a sink that takes its time. 15 J/C against 1.2 W/C at full is 13 s; the
+    # laptop's sink takes 20 s and its chassis minutes. The calibration measures that time off
+    # the climb after a power step and holds each steady state for four of it, so this runs
+    # about twenty minutes where the laptop takes up to an hour. Whole degrees put each steady
+    # state up to half a degree off, two of them 11 C apart: a tenth on g. The second's refresh
+    # is what broke the GF63's jump reading: two ticks after the step saw the reading from before
+    # it, or the same reading twice.
+    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=15, r_die=0.2, whole_degrees=True, cache_s=1.0), cpu_fan=False, ec=Ec(one_fan=True),
                 rapl_window=True, config="cpu0.max = 70\n", cal_full=90, pl1_watts=45, pl2_watts=107, psys=True)
     m.service()
     started = time.time()

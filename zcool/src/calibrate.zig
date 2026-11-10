@@ -211,6 +211,39 @@ pub const Trend = struct {
     }
 };
 
+/// A straight line through readings: `value = intercept + slope * time`.
+pub const Line = struct { intercept: f32, slope: f32 };
+
+/// Least squares through the samples taken between `from` and `to` seconds: the die in the
+/// seconds after a power step, where its own jump is over and the sink's climb is still nearly
+/// straight, so the line taken back to the step is the jump alone. Null with fewer than four
+/// samples or less than two seconds of them: a sensor that counts whole degrees and is refreshed
+/// once a second (coretemp) needs both before a line means anything.
+pub fn fitLine(times: []const f32, values: []const f32, from: f32, to: f32) ?Line {
+    var n: f32 = 0;
+    var st: f32 = 0;
+    var sv: f32 = 0;
+    var stt: f32 = 0;
+    var stv: f32 = 0;
+    var first: ?f32 = null;
+    var last: f32 = 0;
+    for (times, values) |t, v| {
+        if (t < from or t > to) continue;
+        if (first == null) first = t;
+        last = t;
+        n += 1;
+        st += t;
+        sv += v;
+        stt += t * t;
+        stv += t * v;
+    }
+    if (n < 4 or last - (first orelse return null) < 2) return null;
+    const det = n * stt - st * st;
+    if (@abs(det) < 1e-6) return null;
+    const slope = (n * stv - st * sv) / det;
+    return .{ .intercept = (sv - slope * st) / n, .slope = slope };
+}
+
 // ---------------------------------------------------------------- on disk
 
 /// `limit 70`, then `fans boost 31.2 4500 0`, `power 13.5 1600`, `cores 1 21.0 4300` lines.
@@ -380,6 +413,29 @@ test "a reading settles once it stops moving" {
     i = 0;
     while (i < 40) : (i += 1) s.add(31 + @as(f32, @floatFromInt(i % 3)) * 0.1);
     try std.testing.expect(s.steady(0.05));
+}
+
+test "a line through the seconds after a step finds the die's jump under the sink's climb" {
+    // the die 9 C up within half a second, the sink climbing 1.5 C/s: read exactly
+    var times: [40]f32 = undefined;
+    var values: [40]f32 = undefined;
+    for (&times, &values, 0..) |*t, *v, i| {
+        t.* = @as(f32, @floatFromInt(i)) * 0.25;
+        v.* = 50 + 9 * (1 - @exp(-t.* / 0.5)) + 1.5 * t.*;
+    }
+    const exact = fitLine(&times, &values, 2, 7).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 59), exact.intercept, 0.3);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), exact.slope, 0.05);
+    // the same die read as the GF63's: whole degrees, and the kernel hands out the same reading
+    // for a second (coretemp refreshes once a second), so the line lags half a second
+    for (&times, &values) |t, *v| {
+        const refreshed = @floor(t);
+        v.* = @round(50 + 9 * (1 - @exp(-refreshed / 0.5)) + 1.5 * refreshed);
+    }
+    const cached = fitLine(&times, &values, 2, 7).?;
+    try std.testing.expect(cached.intercept > 57.5 and cached.intercept < 60.5);
+    // two ticks after the step, the GF63's way until now, is no line at all
+    try std.testing.expect(fitLine(times[0..6], values[0..6], 0, 1) == null);
 }
 
 test "a trend is steady when two windows agree, whatever a whole-degree sensor does within them" {

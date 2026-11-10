@@ -2,6 +2,9 @@
 # Lines left out use the default, which stays well below each chip's critical point.
 
 # The most each chip may reach, in degrees C. A value above its safe range is lowered.
+# Set the CPU's before `zcool calibrate`: everything it measures, it measures at the limit, and a
+# changed limit wants a new calibration. Left out, a CPU's limit is 10 C under its critical
+# point, 90 C on most Intel laptops.
 # cpu0.max = 85
 # gpu0.max = 80
 # nvme0.max = 65
