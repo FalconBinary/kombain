@@ -10,6 +10,7 @@ const config = @import("config.zig");
 
 pub const max_chips = 16;
 pub const max_fans = 16;
+pub const max_runlevels = 4;
 
 pub const ChipInfo = struct {
     name: [24]u8 = undefined,
@@ -45,6 +46,10 @@ pub const Info = struct {
     /// the CPU has a short-term power limit zcool can hold
     has_burst: bool = false,
     undervolt_note: []const u8 = "",
+    /// runit's runlevels, as /etc/runit/runsvdir names them: each may move every limit
+    runlevels: [max_runlevels][16]u8 = undefined,
+    runlevel_lens: [max_runlevels]u8 = undefined,
+    nrunlevels: usize = 0,
 };
 
 /// Fills in what is true now; called once a second.
@@ -91,6 +96,9 @@ const turbo_choices = [_][]const u8{ "as the firmware has it", "yes", "no" };
 const noise_choices = [_][]const u8{ "normal", "quiet" };
 const mode_choices = [_][]const u8{ "as the firmware has it", "eco", "comfort", "sport", "turbo" };
 const yes_first = [_][]const u8{ "yes", "no" };
+const ceiling_choices = [_][]const u8{ "soft", "hard" };
+/// the runlevel headers, built when the items are: a label is a slice and must outlive the build
+var runlevel_headers: [max_runlevels][40]u8 = undefined;
 
 const max_items = 80;
 var items: [max_items]Item = undefined;
@@ -173,6 +181,20 @@ fn buildItems(info: *const Info) void {
             .help = "The EC's own profile: how much power the firmware allows and how it runs the fans. eco on battery saves the most.",
         }, joined(&key, "mode", suffix));
     }
+    for (0..info.nrunlevels) |i| {
+        const name = info.runlevels[i][0..info.runlevel_lens[i]];
+        header(joined(&runlevel_headers[i], "In runlevel ", name));
+        var key: [48]u8 = undefined;
+        add(.{
+            .kind = .number,
+            .label = "Every limit moves by",
+            .min = -config.max_shift,
+            .max = config.max_shift,
+            .unit = " C",
+            .unset = 0,
+            .help = "Every chip's limit while runit runs this runlevel: +10 in gaming lets the heat climb for its frames, -10 keeps it cooler.",
+        }, joined(&key, "limits.", name));
+    }
     header("Battery");
     add(.{
         .kind = .number,
@@ -211,10 +233,16 @@ fn buildItems(info: *const Info) void {
     }, "guard.memory");
     add(.{
         .kind = .choice,
-        .label = "CPU's own throttle at limit+3",
+        .label = "CPU's own throttle near the limit",
         .choices = &yes_first,
-        .help = "Intel: the CPU throttles itself in microseconds 3 C above the limit, catching spikes too fast for any program.",
+        .help = "Intel: the CPU throttles itself in microseconds 3 C above the limit, at it with a hard ceiling, catching spikes too fast for any program.",
     }, "tcc");
+    add(.{
+        .kind = .choice,
+        .label = "The limit is a ceiling",
+        .choices = &ceiling_choices,
+        .help = "hard: the CPU's own throttle sits at the limit, zcool works a degree under it, and no burst goes above the firmware's long-term power limit until a model of the heat (calibrate --long) says the sink takes more. Cooler, a little slower.",
+    }, "ceiling");
     if (info.ec) add(.{
         .kind = .choice,
         .label = "zcool runs the fans",

@@ -28,6 +28,8 @@
 # noise.battery = quiet
 # Every limit lower by this many degrees.
 # limits.battery = -10
+# And by runit's runlevel, named as its runsvdir directory is: higher for the frames, or lower.
+# limits.gaming = 10
 
 # MSI laptops: the EC's own power profile (eco, comfort, sport, turbo) per power source,
 # and `ec = no` to keep zcool away from the EC altogether. See the README.
@@ -53,6 +55,11 @@
 
 # Intel: the CPU's own thermal throttle 3 C above the limit, catching what comes too fast.
 # tcc = no
+
+# The limit as a ceiling the die must not cross: the CPU's own throttle at it, zcool a degree
+# under, no burst above the long-term power limit until a model of the heat allows one.
+# Cooler, a little slower.
+# ceiling = hard
 
 # Under work heavier than the machine can do: jobs yield the CPU to the desktop, and a
 # process about to starve memory is ended before the system stalls. See the README.

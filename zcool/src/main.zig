@@ -484,10 +484,16 @@ fn finishChip(c: *Chip) void {
 
 /// The power source moves every limit by this, 0 or lower.
 var shift_now: f32 = 0;
+/// and by runit's current runlevel, when the config names it (`limits.gaming = 10`)
+var runlevel_shift: f32 = 0;
+var runlevel_due_ms: i64 = 0;
+var runlevel_name: [16]u8 = undefined;
+var runlevel_len: u8 = 0;
+var runlevel_known = false;
 
 fn setLimit(c: *Chip, limit: f32) void {
     c.base_limit = limit;
-    c.limit = if (limit > 0) @max(30, limit + shift_now) else 0;
+    c.limit = if (limit > 0) @max(30, limit + shift_now + runlevel_shift) else 0;
 }
 
 fn discoverCpuPower() void {
@@ -1684,7 +1690,7 @@ fn step(dt: f32) void {
     var wants: [max_chips]f32 = undefined;
     for (chips[0..nchips], 0..) |*c, index| {
         const quiet = quiet_now and c.controlled() and hasPowerLever(c);
-        loud[index] = c.quiet.update(quiet, &c.thermal, c.limit, c.throttle.level, c.emergency, dt);
+        loud[index] = c.quiet.update(quiet, &c.thermal, controlLimit(c), c.throttle.level, c.emergency, dt);
         wants[index] = 0;
         if (!c.controlled() or !c.thermal.ready or c.asleep) continue;
         if (!loud[index]) {
@@ -1692,7 +1698,7 @@ fn step(dt: f32) void {
             continue;
         }
         c.drive.need = calibratedNeed(c, index);
-        const d = c.drive.update(&c.thermal, c.limit, dt);
+        const d = c.drive.update(&c.thermal, controlLimit(c), dt);
         // a chip going through its critical point gets everything at once, and one whose power
         // is taken keeps every fan until it has it all back: power first, then quiet. Fans
         // that came down while it was cut went off and on again on the GF63.
@@ -1714,18 +1720,22 @@ fn step(dt: f32) void {
         const crit = if (c.emergency) c.thermal.temp + 1 else c.crit;
         const exhausted = noMoreCooling(index);
         // power starts at what the cooler is known to carry, once the fans have given all
-        c.throttle.start = if (cfg.learn and exhausted and c.throttle.level >= 1) c.learned.startLevel(c.limit, referenceWatts(c)) else 1;
+        c.throttle.start = if (cfg.learn and exhausted and c.throttle.level >= 1) c.learned.startLevel(controlLimit(c), referenceWatts(c)) else 1;
         if (c.kind == .cpu and model.known() and cpu_power.rapl_count > 0) {
             if (cpuWattsNow()) |watts| {
                 const duty = fanDutyFor(index);
                 const sink = c.sink.update(&model, c.raw, watts, duty, dt);
                 c.thermal.model_forecast = model.forecast(sink, watts, duty, thermal_model.fan_horizon);
                 // the burst the sink can take for the next seconds, a degree under the limit
-                modelCap(model.burst(sink, duty, c.limit - 1, burst_seconds));
+                modelCap(model.burst(sink, duty, controlLimit(c) - 1, burst_seconds));
                 if (cfg.learn and !dry_run) learnOnline(c, watts, duty, dt);
             } else c.thermal.model_forecast = null;
+        } else if (c.kind == .cpu and cfg.hard and cpu_power.rapl_count > 0) {
+            // a hard ceiling with no model of the heat: no burst above the firmware's long-term
+            // limit, since nothing can say what the sink would take
+            modelCap(0);
         }
-        c.throttle.update(&c.thermal, c.limit, crit, exhausted or !loud[index], dt);
+        c.throttle.update(&c.thermal, controlLimit(c), crit, exhausted or !loud[index], dt);
         if (cfg.learn and !dry_run) learn(c, nearlyNoMoreCooling(index), dt);
         report(c, loud[index]);
         switch (c.kind) {
@@ -1753,7 +1763,7 @@ fn nearlyNoMoreCooling(index: usize) bool {
 
 fn learn(c: *Chip, near_full: bool, dt: f32) void {
     const watts = chipWatts(c) orelse return;
-    c.learned.observe(watts, &c.thermal, c.limit, near_full and c.throttle.level < 1 and !c.no_actuator, dt);
+    c.learned.observe(watts, &c.thermal, controlLimit(c), near_full and c.throttle.level < 1 and !c.no_actuator, dt);
     if (c.learned.known() and !c.learned_logged) {
         c.learned_logged = true;
         sys.printf("{s}: learned that the cooler carries {d:.0} W at {d:.0}C with every fan at full\n", .{ c.name(), c.learned.watts, c.learned.at });
@@ -1896,9 +1906,7 @@ fn applySource(mains: bool) void {
     const src = cfg.source(mains);
     const source: []const u8 = if (mains) "on mains" else "on battery";
     shift_now = @floatFromInt(src.shift);
-    for (chips[0..nchips]) |*c| {
-        if (c.base_limit > 0) c.limit = @max(30, c.base_limit + shift_now);
-    }
+    recomputeLimits();
     quiet_now = src.quiet;
     var buf: [200]u8 = undefined;
     var n: usize = 0;
@@ -1916,6 +1924,70 @@ fn applySource(mains: bool) void {
     applyTurbo(src.turbo);
     applyBurst(src.burst);
     if (ec_modes) applyEcMode(src.mode, source);
+}
+
+/// Every chip's limit: what the config sets, moved by the power source and the runlevel.
+fn recomputeLimits() void {
+    for (chips[0..nchips]) |*c| {
+        if (c.base_limit > 0) c.limit = @max(30, c.base_limit + shift_now + runlevel_shift);
+    }
+}
+
+/// runit's current runlevel, by the name of the directory /run/runit/runsvdir/current points at.
+fn currentRunlevel(buf: *[256]u8) ?[]const u8 {
+    var path_buf: [256]u8 = undefined;
+    const target = sys.readLink(sys.join(&path_buf, &.{ sys.root, "/run/runit/runsvdir/current" }), buf) orelse return null;
+    const trimmed = std.mem.trimEnd(u8, target, "/");
+    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return trimmed;
+    return trimmed[slash + 1 ..];
+}
+
+/// Every two seconds, when the config names a runlevel: the limits follow it. Only the link is
+/// read, which the sandbox lets through.
+fn followRunlevel(now: i64) void {
+    if (cfg.nrunlevels == 0 or now < runlevel_due_ms) return;
+    runlevel_due_ms = now + 2000;
+    var buf: [256]u8 = undefined;
+    const name = currentRunlevel(&buf) orelse return;
+    if (runlevel_known and std.mem.eql(u8, name, runlevel_name[0..runlevel_len])) return;
+    const was_known = runlevel_known;
+    runlevel_known = true;
+    runlevel_len = @intCast(@min(name.len, runlevel_name.len));
+    @memcpy(runlevel_name[0..runlevel_len], name[0..runlevel_len]);
+    const shift = cfg.runlevelShift(name);
+    runlevel_shift = @floatFromInt(shift);
+    recomputeLimits();
+    if (shift > 0) {
+        sys.printf("runlevel {s}: limits {d}C higher\n", .{ name, shift });
+    } else if (shift < 0) {
+        sys.printf("runlevel {s}: limits {d}C lower\n", .{ name, -shift });
+    } else if (was_known) sys.printf("runlevel {s}: limits as set\n", .{name});
+}
+
+/// With a hard ceiling zcool works this far under the limit, and the CPU's own throttle sits at it.
+fn hardMargin() f32 {
+    return if (cfg.hard) 1 else 0;
+}
+
+/// The temperature the fans and the power hold a chip at: the limit, or a degree under a hard ceiling.
+fn controlLimit(c: *const Chip) f32 {
+    return c.limit - hardMargin();
+}
+
+fn describeCeiling() void {
+    sys.printf("ceiling: hard: the CPU's own throttle at the limit, zcool a degree under it, {s}\n", .{if (model.known()) "bursts as the model of the heat allows" else "no burst above the firmware's long-term limit until a model of the heat says the sink takes more (zcool calibrate --long)"});
+}
+
+fn describeRunlevel() void {
+    if (cfg.nrunlevels == 0) return;
+    var buf: [256]u8 = undefined;
+    const name = currentRunlevel(&buf) orelse return;
+    const shift = cfg.runlevelShift(name);
+    if (shift > 0) {
+        sys.printf("runlevel: {s}, limits {d}C higher\n", .{ name, shift });
+    } else if (shift < 0) {
+        sys.printf("runlevel: {s}, limits {d}C lower\n", .{ name, -shift });
+    } else sys.printf("runlevel: {s}, limits as set\n", .{name});
 }
 
 fn generalSettings(src: *const config.Source) bool {
@@ -2188,6 +2260,7 @@ fn runDaemon(selftest: bool) u8 {
     }
     applyChargeLimit();
     findMains();
+    followRunlevel(sys.nowMs());
     installSignals();
     // started before the sandbox, which allows no programs to run
     if (hasNvidia()) {
@@ -2222,10 +2295,11 @@ fn runDaemon(selftest: bool) u8 {
             sys.print("tcc: kernel lockdown blocks MSR writes, the CPU's own throttle stays at TjMax\n");
         } else for (chips[0..nchips]) |*c| {
             if (c.kind != .cpu or !c.controlled()) continue;
-            tcc.apply(c.base_limit, dry_run);
+            tcc.apply(c.base_limit, dry_run, if (cfg.hard) 0 else tcc.above_limit);
             break;
         }
     }
+    if (cfg.hard) describeCeiling();
     const sandboxed = applySandbox();
     sys.printf("sandbox: {s}\n", .{@tagName(sandboxed)});
     if (selftest) {
@@ -2257,6 +2331,7 @@ fn runDaemon(selftest: bool) u8 {
         sampleCpuPower(now);
         step(dt);
         followPowerSource(now);
+        followRunlevel(now);
         saveLearned(now, false);
         saveModel(now, false);
         guard.tick(now);
@@ -2366,6 +2441,8 @@ fn listPower() void {
         sys.print("tcc: only root reads where the CPU throttles itself: doas zcool list\n");
     }
     if (loadFound()) |f| describeFound(&f);
+    if (cfg.hard) describeCeiling();
+    describeRunlevel();
     loadLearned();
     var first = true;
     for (chips[0..nchips]) |*c| {
@@ -2539,6 +2616,19 @@ fn menuInfo(info: *menu.Info) void {
     }
     info.has_epp = hasEpp();
     info.has_turbo = turbo.len > 0;
+    info.nrunlevels = 0;
+    var levels_buf: [256]u8 = undefined;
+    var levels = sys.Dir.open(sys.join(&levels_buf, &.{ sys.root, "/etc/runit/runsvdir" }));
+    if (levels) |*dir| {
+        defer dir.close();
+        while (dir.next()) |entry| {
+            if (info.nrunlevels == menu.max_runlevels) break;
+            if (std.mem.eql(u8, entry, "current") or std.mem.eql(u8, entry, "single") or entry.len > 16) continue;
+            @memcpy(info.runlevels[info.nrunlevels][0..entry.len], entry);
+            info.runlevel_lens[info.nrunlevels] = @intCast(entry.len);
+            info.nrunlevels += 1;
+        }
+    }
     info.undervolt_note = if (undervolt.lockdownActive()) "kernel lockdown is on: refused" else "";
 }
 
@@ -2841,7 +2931,7 @@ fn runCalibrate(long: bool) u8 {
         return 1;
     }
     installSignals();
-    if (cfg.tcc and undervolt.isIntel() and !undervolt.lockdownActive()) tcc.apply(c.base_limit, false);
+    if (cfg.tcc and undervolt.isIntel() and !undervolt.lockdownActive()) tcc.apply(c.base_limit, false, if (cfg.hard) 0 else tcc.above_limit);
     var path_buf: [256]u8 = undefined;
     sys.mkdir(sys.join(&path_buf, &.{ sys.root, "/var/lib/zcool" }));
 
@@ -3141,7 +3231,7 @@ fn runFind(from: i32, to: i32, seconds: u32) u8 {
         return 1;
     }
     installSignals();
-    if (cfg.tcc and undervolt.isIntel() and !undervolt.lockdownActive()) tcc.apply(c.base_limit, false);
+    if (cfg.tcc and undervolt.isIntel() and !undervolt.lockdownActive()) tcc.apply(c.base_limit, false, if (cfg.hard) 0 else tcc.above_limit);
     var path_buf: [256]u8 = undefined;
     sys.mkdir(sys.join(&path_buf, &.{ sys.root, "/var/lib/zcool" }));
     // the offsets as they are now go back at the end; the known answer is computed at none

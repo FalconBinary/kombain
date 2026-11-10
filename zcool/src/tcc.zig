@@ -14,7 +14,8 @@ const sys = @import("sys.zig");
 const journal = @import("journal.zig");
 
 pub const msr: u32 = 0x1a2;
-/// above zcool's limit, so the TCC only acts on what zcool cannot catch in time
+/// above zcool's limit, so the TCC only acts on what zcool cannot catch in time; with a hard
+/// ceiling it sits at the limit itself and zcool works a degree under it
 pub const above_limit: u8 = 3;
 
 const max_cpus = 64;
@@ -57,14 +58,15 @@ fn msrPath(buf: []u8, cpu: []const u8) [:0]const u8 {
 }
 
 /// Before the sandbox: every CPU's register stays open, so it can go back when zcool stops.
-pub fn apply(limit: f32, dry_run: bool) void {
+/// `above` is how far above the limit the throttle sits: `above_limit`, or 0 for a hard ceiling.
+pub fn apply(limit: f32, dry_run: bool, above: u8) void {
     var dir_buf: [128]u8 = undefined;
     var dir = sys.Dir.open(sys.join(&dir_buf, &.{ sys.root, "/dev/cpu" })) orelse {
         sys.print("tcc: /dev/cpu/0/msr is missing, the CPU's own throttle stays at TjMax\n");
         return;
     };
     defer dir.close();
-    const point: u8 = @intFromFloat(std.math.clamp(limit, 30, 120) + above_limit);
+    const point: u8 = @intFromFloat(std.math.clamp(limit, 30, 120) + @as(f32, @floatFromInt(above)));
     while (dir.next()) |entry| {
         if (ncpus == max_cpus) break;
         const cpu = std.fmt.parseInt(u16, entry, 10) catch continue;
@@ -93,7 +95,7 @@ pub fn apply(limit: f32, dry_run: bool) void {
     if (offsetOf(wanted) == offsetOf(first)) return close();
     const at = max - offsetOf(wanted);
     if (dry_run) {
-        sys.printf("tcc: would have the CPU throttle itself from {d}C, {d} above the limit (TjMax {d}C)\n", .{ at, above_limit, max });
+        sys.printf("tcc: would have the CPU throttle itself from {d}C, {s} (TjMax {d}C)\n", .{ at, where(above), max });
         return close();
     }
     for (0..ncpus) |i| {
@@ -113,7 +115,17 @@ pub fn apply(limit: f32, dry_run: bool) void {
         restore();
         return close();
     }
-    sys.printf("tcc: the CPU throttles itself from {d}C, {d} above the limit (TjMax {d}C)\n", .{ at, above_limit, max });
+    sys.printf("tcc: the CPU throttles itself from {d}C, {s} (TjMax {d}C)\n", .{ at, where(above), max });
+}
+
+fn where(above: u8) []const u8 {
+    return switch (above) {
+        0 => "at the limit",
+        1 => "1 above the limit",
+        2 => "2 above the limit",
+        3 => "3 above the limit",
+        else => "above the limit",
+    };
 }
 
 fn close() void {

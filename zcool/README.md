@@ -230,6 +230,28 @@ which cannot harm a chip; firmware that ignores the offset is noticed and left a
 `zcool list` shows where it acts. Intel only, the `msr` module (the service loads it) and no
 kernel lockdown; `tcc = no` leaves it at TjMax. Unlike undervolting, firmware rarely locks it.
 
+## A hard ceiling
+
+`cpu0.max = 70` is a limit zcool holds with as little speed lost as it can: fans first, then
+power, and the CPU's own throttle 3 C above it for what comes too fast for a program. `ceiling =
+hard` makes the same number a ceiling the die must not cross:
+
+- the CPU's own throttle (TCC) sits at the limit itself, in hardware, in microseconds;
+- zcool works a degree under it, so that the hardware only ever catches spikes;
+- no burst goes above the firmware's long-term power limit until a model of the heat
+  (`zcool calibrate --long`) says what the sink can take at this moment; with the model, bursts
+  follow it, as always.
+
+What it costs: a cooler carries less at a lower temperature (on the GF63 about 22 W at 60 C
+against 30 at 70), so long loads run slower; what a ceiling buys and costs is in `kombain-bench`
+rows, not here. What it cannot do: a die that jumps 0.2 C per watt within a millisecond and a
+sensor that counts whole degrees leave the last degree to the hardware, which is why the TCC is
+there; a GPU has no throttle to move, so its ceiling is held by fans and clocks as before.
+
+`limits.gaming = 10` moves every limit while runit's current runlevel is the one named, as the
+install guide's Gaming is: 10 C hotter for its frames, or `-10` cooler. zcool reads the link
+`/run/runit/runsvdir/current` every two seconds, and `zcool list` says which runlevel it sees.
+
 ## Under heavy work
 
 Heat is one way a machine stops answering; a CPU that every job wants at once, and memory

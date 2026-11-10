@@ -127,7 +127,7 @@ class Machine:
     def __init__(self, cpu=None, gpu=None, rapl=True, rapl_enforced=True, rapl_writable=True, freq=True, cpu_fan=True, pump=False, config="",
                  cores=4, nvme_temp=None, bogus_sensor=False, nvidia=None, gpu_driver="amdgpu", ec=None,
                  epp=None, turbo=None, mains=None, rapl_window=False, pl2=True, cal_full=None, pl1_watts=300, pl2_watts=300,
-                 psys=False):
+                 psys=False, runlevel=None, runlevels=("default", "gaming")):
         self.root = tempfile.mkdtemp(prefix="zcool-")
         self.cpu, self.gpu, self.nv, self.gpu_driver, self.ec = cpu, gpu, nvidia, gpu_driver, ec
         self.first_case = self.first_own_full = self.first_boost = self.first_trim = self.first_cap = None
@@ -235,6 +235,13 @@ class Machine:
             put(f"{r}/sys/class/power_supply/BAT1/type", "Battery")
         put(f"{r}/etc/zcool.conf", config)
         os.makedirs(f"{r}/var/lib", exist_ok=True)
+        # runit's runlevels: directories under /etc/runit/runsvdir, and the current one linked
+        self.runlevel_link = f"{r}/run/runit/runsvdir/current"
+        if runlevel:
+            for name in runlevels:
+                os.makedirs(f"{r}/etc/runit/runsvdir/{name}", exist_ok=True)
+            os.makedirs(os.path.dirname(self.runlevel_link), exist_ok=True)
+            self.set_runlevel(runlevel)
         if nvidia:
             self.pci(nvidia.bus, "0x030000" if nvidia.boot else "0x030200", "0x10de", nvidia.boot, "nvidia", nvidia.control, nvidia.status)
             if not nvidia.boot:
@@ -257,6 +264,12 @@ class Machine:
                 put(f"{n}/fan{i}", 30)
                 put(f"{n}/fan{i}_mode", "auto")
         self.publish()
+
+    def set_runlevel(self, name):
+        """As runsvchdir does it: the link to the runlevel's directory replaced in one step."""
+        tmp = self.runlevel_link + ".new"
+        os.symlink(f"{self.root}/etc/runit/runsvdir/{name}", tmp)
+        os.rename(tmp, self.runlevel_link)
 
     def pci(self, bus, cls, vendor, boot, driver, control, status):
         d = f"{self.root}/sys/bus/pci/devices/{bus}"
@@ -2583,6 +2596,90 @@ def the_cpus_own_throttle_sits_just_above_the_limit(r):
             r.check(said in m.text(), m.text()[-200:])
         m.stop()
         m.close()
+
+
+def hard_machine(config, **kw):
+    """A CPU whose config makes the limit a hard ceiling, with the throttle register of tcc_machine."""
+    m = Machine(config=config, **kw)
+    put(f"{m.root}/proc/cpuinfo", "vendor_id : GenuineIntel\n")
+    put(f"{m.root}/sys/kernel/security/lockdown", "[none] integrity confidentiality")
+    os.makedirs(f"{m.root}/dev/cpu/0")
+    with open(f"{m.root}/dev/cpu/0/msr", "wb") as f:
+        f.write(b"\0" * 0x200)
+    with open(f"{m.root}/dev/cpu/0/msr", "r+b") as f:
+        f.seek(0x1a2)
+        f.write(struct.pack("<Q", (100 << 16) | (0x0a << 8) | (1 << 31)))
+    return m
+
+
+@scenario
+def a_hard_ceiling_puts_the_cpus_throttle_at_the_limit_and_works_a_degree_under(r):
+    m = hard_machine("cpu0.max = 85\nceiling = hard\n", cpu=Chip(load=280, g_max=3.4))
+    m.start()
+    m.advance(30, limit_cpu=85)
+    log = m.text()
+    r.check(tcc_offset(m) == 15, f"85 C is 15 below TjMax: offset {tcc_offset(m)}")
+    r.check("tcc: the CPU throttles itself from 85C, at the limit" in log, log[:900])
+    r.check("ceiling: hard: the CPU's own throttle at the limit, zcool a degree under it" in log, log[:900])
+    temps = []
+    for _ in range(20):
+        m.advance(0.5, limit_cpu=85)
+        temps.append(m.cpu.temp)
+    # the controller works at 84: the last degree is the hardware's, which the simulator has not
+    r.check(max(temps) <= 85.3, f"the die should stay under the ceiling: settled at {min(temps):.1f}..{max(temps):.1f}")
+    r.check(min(temps) >= 80, f"and not far under it: {min(temps):.1f}")
+    r.note(f"85 C ceiling: settled {min(temps):.1f}..{max(temps):.1f} C, peak {m.cpu.peak:.1f}, speed {m.cpu.perf * 100:.1f}%")
+    m.stop()
+    r.check(tcc_offset(m) == 0, f"the throttle goes back to TjMax: offset {tcc_offset(m)}")
+    m.close()
+    # with no model of the heat no burst goes above the long-term limit; with one, as it allows
+    m = gf63(config="cpu0.max = 70\nceiling = hard\n")
+    m.start()
+    m.advance(3, limit_cpu=70)
+    r.check(get(m.pl2_path) == "45000000", f"PL2 should sit at the firmware's long-term 45 W without a model: {get(m.pl2_path)}")
+    r.check("no burst above the firmware's long-term limit" in m.text(), m.text()[:900])
+    m.stop()
+    r.check(get(m.pl2_path) == "107000000", f"PL2 given back: {get(m.pl2_path)}")
+    m.close()
+    m = gf63(config="cpu0.max = 70\nceiling = hard\n")
+    put(f"{m.root}/var/lib/zcool/model", true_model(m))
+    m.start()
+    m.advance(3, limit_cpu=70)
+    r.check(int(get(m.pl2_path)) > 45000000, f"with a model a cold sink allows a burst: PL2 {get(m.pl2_path)}")
+    r.check("bursts as the model of the heat allows" in m.text(), m.text()[:900])
+    m.stop()
+    m.close()
+
+
+@scenario
+def the_runlevel_moves_every_limit(r):
+    m = Machine(cpu=Chip(load=280, g_max=3.4), config="cpu0.max = 70\nlimits.gaming = 10\n", runlevel="default")
+    m.start()
+    m.advance(30, limit_cpu=70)
+    temps = []
+    for _ in range(16):
+        m.advance(0.5, limit_cpu=70)
+        temps.append(m.cpu.temp)
+    r.check(max(temps) <= 72.5, f"in default the limit is 70: settled at {min(temps):.1f}..{max(temps):.1f}")
+    out = m.cmd("list").stdout
+    r.check("runlevel: default, limits as set" in out, out[-600:])
+    m.set_runlevel("gaming")
+    m.advance(25, limit_cpu=80)
+    r.check("runlevel gaming: limits 10C higher" in m.text(), m.text()[-400:])
+    r.check(m.cpu.temp > 74, f"in gaming the die may go to 80: {m.cpu.temp:.1f}")
+    out = m.cmd("list").stdout
+    r.check("runlevel: gaming, limits 10C higher" in out, out[-600:])
+    m.set_runlevel("default")
+    m.advance(45, limit_cpu=70)
+    r.check("runlevel default: limits as set" in m.text(), m.text()[-400:])
+    temps = []
+    for _ in range(16):
+        m.advance(0.5, limit_cpu=70)
+        temps.append(m.cpu.temp)
+    r.check(max(temps) <= 72.5, f"back in default the limit is 70 again: settled at {min(temps):.1f}..{max(temps):.1f}")
+    r.note(f"default {min(temps):.1f}..{max(temps):.1f} C at a 70 C limit, gaming let it reach {m.cpu.peak:.1f}")
+    m.stop()
+    m.close()
 
 
 def run_one(fn):

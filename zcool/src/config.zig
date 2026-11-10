@@ -15,6 +15,8 @@
 //!     guard.memory = no      never end a process that starves memory
 //!     tcc = no               leave the CPU's own throttle at TjMax
 //!     ec = no                leave an MSI laptop's EC alone
+//!     ceiling = hard         the limit is a ceiling: the CPU's own throttle at it, zcool a degree under
+//!     limits.gaming = 10     every limit 10 C higher in the runlevel named gaming
 //!
 //! And per power source, with `.ac` or `.battery` after the name:
 //!
@@ -33,6 +35,19 @@ pub const max_excludes = 16;
 
 pub const Limit = struct { id: [24]u8 = undefined, len: usize = 0, value: f32 = 0 };
 pub const Exclude = struct { id: [40]u8 = undefined, len: usize = 0 };
+
+pub const max_runlevels = 4;
+/// Every limit moves by `shift` while runit's current runlevel is `name`: the install guide's
+/// Gaming may run hotter for its frames, or cooler.
+pub const RunlevelShift = struct {
+    name: [16]u8 = undefined,
+    len: u8 = 0,
+    shift: i8 = 0,
+
+    pub fn id(self: *const RunlevelShift) []const u8 {
+        return self.name[0..self.len];
+    }
+};
 
 /// The CPU's energy preference (intel_pstate and amd-pstate): how readily it climbs to high clocks.
 pub const Epp = enum { default, performance, balance_performance, balance_power, power };
@@ -82,6 +97,11 @@ pub const Config = struct {
     guard_memory: bool = true,
     /// Intel: the CPU's own throttle just above the limit
     tcc: bool = true,
+    /// the limit is a ceiling the die must not cross: the CPU's own throttle at it, zcool a degree
+    /// under, no burst above the long-term limit until a model of the heat says the sink takes more
+    hard: bool = false,
+    runlevels: [max_runlevels]RunlevelShift = undefined,
+    nrunlevels: usize = 0,
     bad_lines: u32 = 0,
 
     pub fn limitFor(self: *const Config, id: []const u8) ?f32 {
@@ -100,6 +120,14 @@ pub const Config = struct {
 
     pub fn source(self: *const Config, mains: bool) *const Source {
         return if (mains) &self.ac else &self.battery;
+    }
+
+    /// How far every limit moves in the runlevel `name`: 0 for one the config does not name.
+    pub fn runlevelShift(self: *const Config, name: []const u8) i8 {
+        for (self.runlevels[0..self.nrunlevels]) |*r| {
+            if (std.mem.eql(u8, r.id(), name)) return r.shift;
+        }
+        return 0;
     }
 };
 
@@ -164,6 +192,37 @@ fn apply(c: *Config, key: []const u8, value: []const u8) bool {
     }
     if (std.mem.eql(u8, key, "tcc")) {
         c.tcc = yesNo(value) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "ceiling")) {
+        if (std.mem.eql(u8, value, "hard")) {
+            c.hard = true;
+        } else if (std.mem.eql(u8, value, "soft")) {
+            c.hard = false;
+        } else return false;
+        return true;
+    }
+    if (std.mem.startsWith(u8, key, "limits.") and perSource(c, key) == null) {
+        // a runlevel's name, as runit's runsvdir directory is called
+        const name = key[7..];
+        if (name.len == 0 or name.len > 16) return false;
+        for (name) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return false;
+        }
+        const shift = std.fmt.parseInt(i8, value, 10) catch return false;
+        if (shift > max_shift or shift < -max_shift) return false;
+        for (c.runlevels[0..c.nrunlevels]) |*r| {
+            if (std.mem.eql(u8, r.id(), name)) {
+                r.shift = shift;
+                return true;
+            }
+        }
+        if (c.nrunlevels == max_runlevels) return false;
+        const r = &c.runlevels[c.nrunlevels];
+        @memcpy(r.name[0..name.len], name);
+        r.len = @intCast(name.len);
+        r.shift = shift;
+        c.nrunlevels += 1;
         return true;
     }
     if (std.mem.eql(u8, key, "guard.memory")) {
@@ -412,6 +471,28 @@ test "what changes with the power source" {
     try std.testing.expect(c.fan_silent and c.guard_cpu and c.guard_memory and c.fan_curve);
     try std.testing.expect(c.ac.any() and c.battery.any());
     try std.testing.expect(c.source(false) == &c.battery);
+}
+
+test "a hard ceiling and a runlevel's shift are read, nonsense is counted" {
+    const c = parse(
+        \\ceiling = hard
+        \\limits.gaming = 10
+        \\limits.default = -5
+        \\limits.gaming = 15
+        \\limits.battery = -10
+        \\limits.Gam!ing = 3
+        \\limits.gaming = 40
+        \\ceiling = firm
+    );
+    try std.testing.expect(c.hard);
+    try std.testing.expectEqual(@as(usize, 2), c.nrunlevels);
+    try std.testing.expectEqual(@as(i8, 15), c.runlevelShift("gaming"));
+    try std.testing.expectEqual(@as(i8, -5), c.runlevelShift("default"));
+    try std.testing.expectEqual(@as(i8, 0), c.runlevelShift("single"));
+    try std.testing.expectEqual(@as(i8, -10), c.battery.shift);
+    try std.testing.expectEqual(@as(u32, 3), c.bad_lines);
+    const d = parse("ceiling = soft\n");
+    try std.testing.expect(!d.hard and d.nrunlevels == 0 and d.bad_lines == 0);
 }
 
 test "set replaces a line, takes back a commented one, or adds one" {
