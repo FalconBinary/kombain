@@ -150,17 +150,20 @@ the short calibration's own minutes): zcool measures four things and keeps them 
 - how far the die sits above its heat sink per watt: 45 s at a low power, then a step to 90%
   of what the cooler carries, every fan at full, three times; a line through the readings of
   seconds 2 to 7 after each step, where the die's own jump is over and the sink's climb still
-  nearly straight, taken back to the step, against the power measured before and after it;
-- the sink's own time, from the climb after the last step, which stays at 80% of what the
+  nearly straight, taken back to the step, against the power measured before and after it. A
+  die sits 0.02 to 1 C per watt over its sink: 0.1 is a desktop chip under a big cooler, the
+  GF63's 0.7 a laptop with the factory paste;
+- the sink's own time, from the climb after the last step, which stays at 75% of what the
   cooler carries until it settles: how long the die takes, from 2.5 s in, to cover 63% of the
   way to where it settles. A climb that goes over the limit, sits at it or never settles tells
   nothing, and the steady states below are held 90 s to five minutes;
 - what the cooler carries per degree over the room at each fan speed, from the steady state of
-  each speed at two powers under what it carries, each held for four of the sink's times (90 s
-  at least, ten of them at most) and until the mean of the last 45 s agrees with the mean of the
-  45 s before within 0.3 C; the sink's thermal mass comes from how long each settling took. A
-  state whose die goes over the limit after its first 15 s, or settles within a degree of it, is
-  the CPU's own throttle holding it, not the cooler, and is left out;
+  each speed at half and at three quarters of what it carries, each held for four of the sink's
+  times (90 s at least, ten of them at most) and until the mean of the last 45 s agrees with the
+  mean of the 45 s before within 0.3 C; the sink's thermal mass comes from how long each
+  settling took. A state whose die goes over the limit after its first 15 s, or settles within
+  a degree of it, is the CPU's own throttle holding it, not the cooler, and is left out; the
+  three-quarter state is then tried once more at 60%;
 - the room's temperature, read with the load off and every fan at full, held as long as a steady
   state; when it comes out warmer than the room the lines through the steady states meet at, the
   sink was still warm, and the lines win.
@@ -178,7 +181,13 @@ a coretemp reading for a second, so a jump read two ticks after the step came ou
 over the same 30 W; the climb to 95% of a carry measured minutes before, on a sink still warming,
 reached the limit, and its "7 s", counted from a reading still from before the jump, had every
 steady state held a minute; and three states begun at the limit, the die still coming down from
-the phase before, were thrown out as over it before their power had done anything.
+the phase before, were thrown out as over it before their power had done anything. The third,
+at 70 C, taught three more: the GF63's die sits 0.7 C per watt over its sink, three steps agreeing
+within 10%, and a ceiling of 0.6 had thrown every one of them out; the carry is measured on a
+chassis still cool, which warms 3 C in its first ten minutes, so 90% of it sat at the limit at
+every fan speed twenty minutes on; and the speeds read 13 W on six and twelve CPUs because the
+throttle, asked for a moment's cut by the hottest core's jump as one CPU started, cut from what
+the chip drew just then and never came back, cooled first or not.
 
 With the model zcool knows where the temperature goes, instead of extrapolating where it was
 going. It follows the sink's temperature by the model's own account, corrected by the reading:

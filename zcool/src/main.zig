@@ -2764,11 +2764,11 @@ const Calibration = struct {
         return dt;
     }
 
-    /// A calibration starts cold. The speed phase holds the die at its limit for ten seconds, and
-    /// on a sink still warm from the last load that is power cut, not the CPU's speed: a --long
-    /// run right after the short one on the GF63 read 2500 MHz on six CPUs at 13 W, against
-    /// 3647 MHz at 33 W from cold. So first every fan at full and no load, until the die is 20 C
-    /// under its limit, up to ten minutes. False when calibration has to stop.
+    /// A calibration starts cold: the fan points measure what the cooler carries at the limit,
+    /// and a sink still warm from the last load puts the first of them low, the speeds held at
+    /// the limit with it. So first every fan at full and no load, until the die is 20 C under
+    /// its limit, up to ten minutes. (The 13 W a --long run right after the short one read on
+    /// six CPUs was not the warm sink's doing: see measure.) False when calibration has to stop.
     fn coolDown(self: *Calibration) bool {
         const c = self.c;
         const target = @max(c.limit - 20, 40);
@@ -3268,6 +3268,15 @@ fn runFind(from: i32, to: i32, seconds: u32) u8 {
 }
 
 fn measure(run: *Calibration) bool {
+    // from the firmware's long-term limit, the short-term one held to it: when the hold at the
+    // limit below has to cut, it cuts from here. Left to its first cut, the throttle starts from
+    // what the chip drew at that moment, the daemon's rule for a limit far above the draw, and
+    // on the GF63 that was the one CPU's 13 W: the hottest core's jump as that CPU's load began,
+    // read by the forecast as a climb to the limit, asked for a moment's cut; the level came
+    // back to 0.99 as the die stayed cool and stayed there, since calibration never asks for
+    // more than 0.999 and a change under 0.01 is not written. Six and twelve CPUs then read
+    // 13 W, twice, cooled first or not
+    if (!holdPower(0.999)) return false;
     sys.print("how fast it runs on one CPU, half of them and all\n");
     const counts = [calibrate.core_points]usize{ 1, @max(run.cores / 2, 1), run.cores };
     for (counts, 0..) |n, i| {
@@ -3454,10 +3463,10 @@ fn measureLong(run: *Calibration) bool {
     var njumps: usize = 0;
     const low_w = 0.2 * base;
     const step_w = @min(0.9 * carries_full, 0.999 * base);
-    // at 95% the GF63's climb reached the limit: the carry had been measured minutes before
-    // on a sink still warming, and a whole-degree sensor rounds up to the limit from half a
-    // degree under. At 80% it settles ten degrees under
-    const climb_w = @min(0.8 * carries_full, 0.999 * base);
+    // at 95% the GF63's climb reached the limit and at 80% it settled only 4 C under: the carry
+    // is measured minutes before, on a chassis still cool, and the GF63's chassis warms 3 C in
+    // its first ten minutes. At 75% it has room to settle, and the states below stay under it
+    const climb_w = @min(0.75 * carries_full, 0.999 * base);
     var sink_tau: f32 = 0;
     sys.print("  the die's jump when the power jumps, three times\n");
     var round: usize = 0;
@@ -3483,7 +3492,7 @@ fn measureLong(run: *Calibration) bool {
             const jump = if (d_watts > 0) d_die / d_watts else 0;
             if (d_watts < 5) {
                 line.add(": the power did not step, left out").line();
-            } else if (jump >= 0.02 and jump <= 0.6) {
+            } else if (jump >= thermal_model.min_r_die and jump <= thermal_model.max_r_die) {
                 jumps[njumps] = jump;
                 njumps += 1;
                 line.line();
@@ -3516,10 +3525,16 @@ fn measureLong(run: *Calibration) bool {
     for ([_]usize{ 1, 2, 3 }) |p| {
         const carries = run.result.carries[p];
         if (carries <= 0) continue;
-        // 55% then 90% of what the speed carries, the other way round at the next speed, so that
-        // every hold starts a small step from the one before
-        const shares: [2]f32 = if (p % 2 == 1) [2]f32{ 0.55, 0.9 } else [2]f32{ 0.9, 0.55 };
-        for (shares, 0..) |share, k| {
+        // half, then three quarters of what the speed carries, in that order at every speed: the
+        // chassis is still settling from the state before when a state is taken, and the same
+        // order puts the same bias on every speed's pair, so the fit's g keep their order. Not
+        // more: the carry was measured on a chassis still cool, and on the GF63 90% of it sat at
+        // the limit at every speed twenty minutes on. A high state the CPU holds is tried once
+        // more, at 60%
+        var shares = [3]f32{ 0.5, 0.75, 0 };
+        var k: usize = 0;
+        while (k < shares.len and shares[k] > 0) : (k += 1) {
+            const share = shares[k];
             const w = carries * share;
             calibrationStep(run.cores);
             if (!holdPower(w / base)) return false;
@@ -3527,20 +3542,22 @@ fn measureLong(run: *Calibration) bool {
             if (!hold.run(run, thermal_model.point_duty[p], hold_min, hold_max, c.limit)) return false;
             const line = &cal_line;
             _ = line.add("    ").add(thermal_model.point_names[p]).add(" at ").tenth(hold.meanWatts()).add(" W: ");
-            if (hold.over or hold.n < 40) {
-                line.add("the die went over the limit, left out").line();
-                continue;
-            }
-            if (hold.atLimit(c.limit)) {
-                line.add("the die sits at the limit, left out").line();
+            const over = hold.over or hold.n < 40;
+            if (over or hold.atLimit(c.limit)) {
+                _ = line.add(if (over) "the die went over the limit" else "the die sits at the limit").add(", left out");
+                if (share == 0.75) {
+                    shares[2] = 0.6;
+                    _ = line.add("; once more at 60%");
+                }
+                line.line();
                 continue;
             }
             const final = hold.final();
             _ = line.tenth(final).add(" C after ").whole(hold.t).add(" s");
             if (!hold.settled) _ = line.add(" (still moving)");
-            // the sink's approach, on the second power at a speed only: on the first the fan is
+            // the sink's approach, from the second state at a speed on: at the first the fan is
             // still coming down from the speed before, which cools faster than this one does
-            const tau = if (k == 1) hold.tau() else 0;
+            const tau = if (k >= 1) hold.tau() else 0;
             if (tau > 0) _ = line.add(", the sink takes ").whole(tau).add(" s to cover 63%");
             line.line();
             steadies[nsteadies] = .{ .point = p, .watts = hold.meanWatts(), .die = final, .tau = tau };

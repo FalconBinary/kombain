@@ -16,7 +16,8 @@ jobs:
   tests:
     name: Tests on x86_64
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    # the zcool simulator's long calibration alone runs 25 minutes, the whole step about 36
+    timeout-minutes: 50
     container:
       image: ghcr.io/void-linux/void-glibc-full:latest
       options: --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined

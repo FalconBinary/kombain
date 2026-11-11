@@ -24,6 +24,12 @@ pub const point_duty = [_]f32{ 255, 253, 204, 153 };
 /// to spin up. The slope's forecast needs twice that, since it cannot know where a climb bends.
 pub const fan_horizon: f32 = 2;
 
+/// Where a die's jump per watt is believed: 0.02 C/W is a desktop chip under a big cooler, 1 C/W
+/// a laptop with tired paste. The GF63 reads 0.7 with the factory's: its three steps agreed
+/// within 10%, and a ceiling of 0.6 threw every one of them out, twice.
+pub const min_r_die: f32 = 0.02;
+pub const max_r_die: f32 = 1.0;
+
 /// The sink's temperature, followed through the model and corrected by what the die shows.
 /// The die's reading jumps the moment power does, while the power's own reading is an average
 /// over the last half second: taken at face value the two put the sink ten degrees off for a
@@ -145,8 +151,8 @@ pub const Model = struct {
     pub fn learnJump(self: *const Model, d_die: f32, d_watts: f32) ?f32 {
         if (@abs(d_watts) < 25) return null;
         const sample = d_die / d_watts;
-        if (sample < 0.02 or sample > 0.6) return null;
-        return std.math.clamp(self.r_die + (sample - self.r_die) * 0.2, 0.02, 0.6);
+        if (sample < min_r_die or sample > max_r_die) return null;
+        return std.math.clamp(self.r_die + (sample - self.r_die) * 0.2, min_r_die, max_r_die);
     }
 
     /// Steady at `die` and `watts` with the fans at `duty`, for a while: what the cooler carries
@@ -273,7 +279,7 @@ pub fn fit(steadies: []const Steady, jumps: []const f32, ambient_read: ?f32) Mod
         const n = @min(jumps.len, sorted.len);
         @memcpy(sorted[0..n], jumps[0..n]);
         std.mem.sort(f32, sorted[0..n], {}, std.sort.asc(f32));
-        m.r_die = std.math.clamp(sorted[n / 2], 0.02, 0.6);
+        m.r_die = std.math.clamp(sorted[n / 2], min_r_die, max_r_die);
     }
     // the room: read directly when it was, else the median intercept of the lines below
     var intercepts: [point_duty.len]f32 = undefined;
@@ -467,6 +473,9 @@ test "learning on the way: a jump teaches r_die slowly, a steady state the coole
     const learned = m.learnJump(3.6, 30).?;
     try std.testing.expect(learned > 0.08 and learned < 0.12);
     try std.testing.expect(m.learnJump(1.0, 10) == null);
+    // 0.7 C/W is the GF63's die on the factory paste, and believed; 1.2 is no die
+    try std.testing.expect(m.learnJump(21, 30) != null);
+    try std.testing.expect(m.learnJump(36, 30) == null);
     // steady at 60 C and 30 W with the fans at 80%: the cooler carries 30 / (60 - 3.6 - 30) = 1.14
     m = gf63();
     m.g[2] = 0.8;
@@ -476,6 +485,12 @@ test "learning on the way: a jump teaches r_die slowly, a steady state the coole
     // the other points moved by the same factor
     try std.testing.expectApproxEqAbs(full_was * m.g[2] / 0.8, m.g[1], 0.001);
     try std.testing.expect(m.learnSteady(60, 30, 100) == null);
+}
+
+test "a die 0.7 C per watt over its sink is a die: the GF63's three steps" {
+    const m = fit(&.{}, &.{ 0.74, 0.67, 0.67 }, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.67), m.r_die, 0.001);
+    try std.testing.expect(!m.known());
 }
 
 test "the model goes to disk and comes back" {

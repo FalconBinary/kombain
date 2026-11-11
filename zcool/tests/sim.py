@@ -39,12 +39,21 @@ class Chip:
     and for a GPU in a case a little on the case fan too."""
 
     def __init__(self, load=0, g_min=0.8, g_max=4.0, mass=25, temp=40, ambient=30, g_case=0.0, r_die=0.0, whole_degrees=False,
-                 cache_s=0.0):
+                 cache_s=0.0, hotspot=0.0, chassis_mass=0.0, chassis_g=0.0):
         self.load, self.g_min, self.g_max, self.mass, self.g_case = load, g_min, g_max, mass, g_case
         self.temp, self.ambient = temp, ambient
         # a laptop CPU's die sits above its heat sink by what flows through it: its sensor jumps
         # with the power at once, while the sink takes its time
         self.r_die = r_die
+        # the package reading is the hottest core's: one loaded core out of twelve reads hotter
+        # per watt than all of them together, by `hotspot` more when alone, less as more share it
+        self.hotspot = hotspot
+        self.spot = 1.0
+        # a laptop's sink hangs in a chassis that warms over minutes (the GF63's by 3 C in its
+        # first ten), which moves every steady state up on a carry measured before it did:
+        # `chassis_mass` joules per degree, losing `chassis_g` watts per degree to the room
+        self.chassis_mass, self.chassis_g = chassis_mass, chassis_g
+        self.chassis = ambient
         # coretemp reports whole degrees (how the DTS rounds within one is not documented: the
         # nearest here): a reading can sit still for a minute while the sink moves
         self.whole_degrees = whole_degrees
@@ -74,8 +83,12 @@ class Chip:
             self.prochot_time += dt
         g = self.g_min + (self.g_max - self.g_min) * duty / 255 + self.g_case * case_duty / 255
         self.power = power * speed ** 2.5
-        self.temp += (self.power - (self.temp - self.ambient) * g) * dt / self.mass
-        self.reading = self.temp + self.power * self.r_die
+        if self.chassis_mass > 0:
+            self.chassis += ((self.temp - self.chassis) * g - (self.chassis - self.ambient) * self.chassis_g) * dt / self.chassis_mass
+        else:
+            self.chassis = self.ambient
+        self.temp += (self.power - (self.temp - self.chassis) * g) * dt / self.mass
+        self.reading = self.temp + self.power * self.r_die * self.spot
         self.now_perf = perf
         self.work += perf * dt
         self.time += dt
@@ -558,8 +571,10 @@ class Machine:
         if step.startswith("cores "):
             share = min(1, int(step.split()[1]) / self.cores)
             self.cpu.load = 5 + (self.cal_full - 5) * share ** 0.8
+            self.cpu.spot = 1 + self.cpu.hotspot * (1 - share)
         elif step.startswith("idle"):
             self.cpu.load = 5
+            self.cpu.spot = 1.0
 
     def stop(self, sig=signal.SIGTERM):
         if self.proc and self.proc.poll() is None:
@@ -2225,11 +2240,17 @@ def calibration_learns_the_fans_and_the_power_and_gives_everything_back(r):
 @scenario
 @long
 def a_calibration_cools_the_machine_first(r):
-    # right after a long load the sink is warm, and the speed phase, which holds the die at its
-    # limit, would measure power cut instead of the CPU's speed: the GF63 read 2500 MHz on six
-    # CPUs at 13 W that way. Every fan at full and no load first, until the die is 20 C under.
-    m = gf63()
-    m.cpu.temp = m.cpu.reading = 66
+    # right after a long load the sink is warm: every fan at full and no load first, until the
+    # die is 20 C under its limit. Then the speeds, from the firmware's full power. As the GF63
+    # reads: a die 0.7 C/W over its sink whose one loaded core reads twice as hot per watt as all
+    # twelve together, so at the one CPU's start the forecast crosses the limit from 50 C and
+    # the throttle cuts for a moment. Cutting from what the chip drew just then, the one CPU's
+    # 13 W, and never coming back (calibration asks for 0.999 at most, and a change under 0.01
+    # is not written) read six and twelve CPUs at 13 W, twice, cooled first or not.
+    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=30, r_die=0.7, hotspot=1.0), cpu_fan=False, ec=Ec(one_fan=True),
+                rapl_window=True, config="cpu0.max = 70\n", cal_full=90, pl1_watts=45, pl2_watts=107, psys=True, cores=12)
+    # the sink at 62: the die reads 3.5 C over it on its idle 5 W
+    m.cpu.temp = m.cpu.reading = 62
     m.service()
     code = calibrate(m)
     log = m.text()
@@ -2238,12 +2259,15 @@ def a_calibration_cools_the_machine_first(r):
     cooled = re.search(r"\n  (4\d|50)C after (\d+) s\n", log)
     r.check(cooled is not None, "the cooling should end under 50 C:\n" + log[:600])
     path = f"{m.root}/var/lib/zcool/calibration"
-    cores = [l.split() for l in get(path).splitlines() if l.startswith("cores 1 ")] if os.path.exists(path) else []
-    # one CPU's 33 W never reaches the limit from cold: the CPU's own 5000 MHz, on all of its power
-    r.check(cores and float(cores[0][2]) >= 30 and float(cores[0][3]) >= 4900,
-            f"one CPU from cold should run at full speed on its 33 W: {cores}")
+    cores = {int(l.split()[1]): (float(l.split()[2]), float(l.split()[3])) for l in get(path).splitlines()
+             if l.startswith("cores ")} if os.path.exists(path) else {}
+    one, twelve = cores.get(1, (0, 0)), cores.get(12, (0, 0))
+    # one CPU's 17 W never reaches the limit: the CPU's own 5000 MHz, on all of its power
+    r.check(one[0] >= 15 and one[1] >= 4900, f"one CPU should run at full speed on its 17 W: {cores}")
+    # all twelve draw what the cooler carries at the limit, 26 W, not what the one CPU did
+    r.check(twelve[0] >= 1.4 * one[0], f"twelve CPUs should draw what the cooler carries, not the one CPU's power: {cores}")
     r.check(m.told == b"du", f"the service should stop and start again: {m.told!r}")
-    r.note(f"cooled in {cooled.group(2) if cooled else '?'} s; one CPU {cores[0][3] if cores else '?'} MHz at {cores[0][2] if cores else '?'} W")
+    r.note(f"cooled in {cooled.group(2) if cooled else '?'} s; one CPU {one[1]:.0f} MHz at {one[0]:.1f} W, twelve {twelve[1]:.0f} MHz at {twelve[0]:.1f} W")
     m.close()
 
 
@@ -2395,19 +2419,21 @@ def model_file(m):
 @long
 def the_long_calibration_fits_the_machines_heat(r):
     # as the GF63 reads: a die that counts whole degrees, refreshed once a second by the kernel,
-    # 0.2 C/W over a sink that takes its time. 15 J/C against 1.2 W/C at full is 13 s; the
-    # laptop's sink takes 20 s and its chassis minutes. The calibration measures that time off
-    # the climb after a power step and holds each steady state for four of it, so this runs
-    # about twenty minutes where the laptop takes up to an hour. Whole degrees put each steady
-    # state up to half a degree off, two of them 11 C apart: a tenth on g. The second's refresh
-    # is what broke the GF63's jump reading: two ticks after the step saw the reading from before
-    # it, or the same reading twice.
-    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=15, r_die=0.2, whole_degrees=True, cache_s=1.0), cpu_fan=False, ec=Ec(one_fan=True),
-                rapl_window=True, config="cpu0.max = 70\n", cal_full=90, pl1_watts=45, pl2_watts=107, psys=True)
+    # 0.7 C/W over a sink that takes its time, in a chassis that warms 3 C over minutes. 15 J/C
+    # against 1.2 W/C at full is 13 s; the laptop's sink takes 20 to 60 s and its chassis
+    # minutes. The calibration measures that time off the climb after a power step and holds
+    # each steady state for four of it, so this runs about twenty minutes where the laptop takes
+    # up to an hour. Whole degrees put each steady state up to half a degree off, two of them
+    # 10 C apart: a tenth on g. The second's refresh is what broke the GF63's jump reading: two
+    # ticks after the step saw the reading from before it, or the same reading twice. Its 0.7
+    # was then thrown out by a ceiling of 0.6, and 90% of a carry measured on the cool chassis
+    # sat at the limit once the chassis had warmed.
+    m = Machine(cpu=Chip(load=5, g_min=0.5, g_max=1.2, mass=15, r_die=0.7, whole_degrees=True, cache_s=1.0, chassis_mass=1600, chassis_g=9),
+                cpu_fan=False, ec=Ec(one_fan=True), rapl_window=True, config="cpu0.max = 70\n", cal_full=90, pl1_watts=45, pl2_watts=107, psys=True)
     m.service()
     started = time.time()
     m.start("--long", command="calibrate")
-    end = time.time() + 1700
+    end = time.time() + 2000
     while m.proc.poll() is None and time.time() < end:
         m.advance(1, limit_cpu=70)
     code = m.proc.poll()
@@ -2420,16 +2446,27 @@ def the_long_calibration_fits_the_machines_heat(r):
     mdl = model_file(m)
     r.check(bool(mdl), "no model written:\n" + log[-1500:])
     if mdl:
-        r.check(0.15 <= mdl.get("r_die", 0) <= 0.26, f"r_die {mdl.get('r_die')}, the chip's is 0.2")
-        r.check(28 <= mdl.get("ambient", 0) <= 32, f"ambient {mdl.get('ambient')}, the room is 30")
-        r.check(11 <= mdl.get("mass", 0) <= 19, f"mass {mdl.get('mass')}, the sink's is 15")
+        r.check(0.6 <= mdl.get("r_die", 0) <= 0.8, f"r_die {mdl.get('r_die')}, the chip's is 0.7")
+        r.check(28 <= mdl.get("ambient", 0) <= 33, f"ambient {mdl.get('ambient')}, the room is 30")
+        r.check(10 <= mdl.get("mass", 0) <= 19, f"mass {mdl.get('mass')}, the sink's is 15")
+        r_die, ambient = mdl.get("r_die", 0), mdl.get("ambient", 0)
         for name, duty in (("100%", 253), ("80%", 204), ("60%", 153)):
-            truth = 0.5 + 0.7 * duty / 255
-            r.check(abs(mdl.get(f"g {name}", 0) - truth) <= 0.14, f"g {name} {mdl.get(f'g {name}')}, the chip's is {truth:.2f}")
+            # what the daemon takes from the model: the power this speed holds at the limit, against
+            # the machine's with its chassis warm. The split into g and room is softer: whole
+            # degrees put each steady state up to half a degree off, and the chassis is still
+            # settling when a state is taken, so a pair's line comes out a tenth or two steep
+            g = mdl.get(f"g {name}", 0)
+            says = (70 - ambient) / (1 / g + r_die) if g > 0 else 0
+            truth = (70 - 30) / (1 / (0.5 + 0.7 * duty / 255) + 1 / 9 + 0.7)
+            r.check(abs(says - truth) <= 0.12 * truth, f"at {name} the model holds {says:.1f} W at the limit, the machine {truth:.1f}")
+        g100, g80, g60 = (mdl.get(f"g {n}", 0) for n in ("100%", "80%", "60%"))
+        # through the chassis the cooler carries 1.05, 0.90 and 0.84 W/C; the fit's keep that order
+        r.check(0.6 <= g60 <= g80 * 1.1 and g80 <= g100 * 1.1 and g100 <= 1.6, f"g 100% {g100} 80% {g80} 60% {g60}")
         r.note("model: " + " ".join(f"{k}={v}" for k, v in mdl.items()) + f"; took {took:.0f} s")
     r.check("the sink takes" in log and "each held" in log, log[-1500:])
     r.check("model: the die" in log and "nothing kept" not in log, log[-800:])
-    r.check(m.cpu.peak <= 71, f"peak {m.cpu.peak:.1f}")
+    # the power ladder's last step lands a 0.7 C/W die a degree or two over before it is cut
+    r.check(m.cpu.peak <= 73, f"peak {m.cpu.peak:.1f}")
     r.check(get(m.rapl_path) == "45000000" and get(m.pl2_path) == "107000000", "limits not given back")
     m.close()
 
